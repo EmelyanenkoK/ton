@@ -27,8 +27,6 @@
 #include <cassert>
 #include "common/bitstring.h"
 
-#include "openssl/bignum.h"
-
 #include "td/utils/bits.h"
 #include "td/utils/Span.h"
 #include "td/utils/uint128.h"
@@ -248,8 +246,7 @@ class AnyIntView {
   bool mul_add_short_any(word_t y, word_t z);
   bool add_mul_any(const AnyIntView& yp, const AnyIntView& zp);
   void add_mul_trunc_any(const AnyIntView& yp, const AnyIntView& zp);
-  bool mod_div_any_small_divisor(const AnyIntView& divisor, AnyIntView& quot, int round_mode);
-  bool mod_div_any_big_divisor(const AnyIntView& divisor, const AnyIntView& divisor_abs, AnyIntView& quot, int round_mode);
+  bool mod_div_any(const AnyIntView& yp, AnyIntView& quot, int round_mode);
   bool mod_pow2_any(int exponent);
   bool mod_pow2_any(int exponent, int round_mode);
   bool rshift_any(int exponent, int round_mode = -1);
@@ -269,6 +266,9 @@ class AnyIntView {
   double top_double() const {
     return size() > 1 ? (double)digits[size() - 1] + (double)digits[size() - 2] * (1.0 / Tr::Base)
                       : (double)digits[size() - 1];
+  }
+  bool is_odd_any() const {
+    return size() > 0 && (digits[0] & 1);
   }
   word_t to_long_any() const;
   int parse_hex_any(const char* str, int str_len, int* frac = nullptr);
@@ -512,34 +512,13 @@ class BigIntG {
 
   template <int len2, int len3>
   bool mod_div_bool(const BigIntG<len2, Tr>& y, BigIntG<len3, Tr>& quot, int round_mode = -1) {
-    if (y.as_any_int().size() == 1) {
-      auto q = quot.as_any_int();
-      return as_any_int().mod_div_any_small_divisor(y.as_any_int(), q, round_mode);
-    } else {
-      BigIntG<len2, Tr> copy_this = *this;
-      auto q = quot.as_any_int();
-      BigIntG<len2, Tr> y_abs = y;
-      y_abs.mul_short(y_abs.sgn_un());
-      y_abs.normalize();
-      const auto result = as_any_int().mod_div_any_big_divisor(y.as_any_int(), y_abs.as_any_int(), q, round_mode);
-      if (!result) {
-        return false;
-      }
-      BigIntG<len2, Tr> check = *this;
-      check.add_mul(y, quot);
-      check.normalize();
-      return check == copy_this;
-    }
+    auto q = quot.as_any_int();
+    return as_any_int().mod_div_any(y.as_any_int(), q, round_mode);
   }
 
   template <int len2, int len3>
   BigIntG& mod_div(const BigIntG<len2, Tr>& y, BigIntG<len3, Tr>& quot, int round_mode = -1) {
-    const bool result = mod_div_bool(y, quot, round_mode);
-    if (!result) {
-      invalidate();
-      quot.invalidate();
-    }
-    return *this;
+    return invalidate_unless(mod_div_bool(y, quot, round_mode));
   }
 
   int divmod_tiny(int y) {
@@ -681,6 +660,15 @@ class BigIntG {
   }
   word_t to_long() const {
     return as_any_int().to_long_any();
+  }
+  bool is_odd() const {
+    return n > 0 && (digits[0] & 1);
+  }
+  bool is_even() const {
+    return n > 0 && !(digits[0] & 1);
+  }
+  word_t mod_pow2_short(int pow) const {
+    return n > 0 ? digits[0] & ((1 << pow) - 1) : 0;
   }
 
  private:
@@ -1276,172 +1264,150 @@ bool AnyIntView<Tr>::mul_add_short_any(word_t y, word_t z) {
 }
 
 template <class Tr>
-bool AnyIntView<Tr>::mod_div_any_small_divisor(const AnyIntView<Tr>& divisor, AnyIntView<Tr>& quot, int round_mode) {
+bool AnyIntView<Tr>::mod_div_any(const AnyIntView<Tr>& yp, AnyIntView<Tr>& quot, int round_mode) {
   quot.invalidate();
   if (!is_valid()) {
     return false;
   }
-  if (divisor.size() != 1) {
-    return false;
-  }
-  word_t yv = divisor.digits[0];
-  if (!yv) {
-    return false;
-  }
-  word_t rem = divmod_short_any(yv);
-  if (!round_mode) {
-    if ((yv > 0 && rem * 2 >= yv) || (yv < 0 && rem * 2 <= yv)) {
+  if (yp.size() == 1) {
+    word_t yv = yp.digits[0];
+    if (!yv) {
+      return false;
+    }
+    word_t rem = divmod_short_any(yv);
+    if (!round_mode) {
+      if ((yv > 0 && rem * 2 >= yv) || (yv < 0 && rem * 2 <= yv)) {
+        rem -= yv;
+        digits[0]++;
+      }
+    } else if (round_mode > 0 && rem) {
       rem -= yv;
       digits[0]++;
     }
-  } else if (round_mode > 0 && rem) {
-    rem -= yv;
-    digits[0]++;
+    if (!normalize_bool_any()) {
+      return false;
+    }
+    if (size() > quot.max_size()) {
+      return false;
+    }
+    quot.set_size(size());
+    std::memcpy(quot.digits.data(), digits.data(), size() * sizeof(word_t));
+    *this = rem;
+    return true;
   }
-  if (!normalize_bool_any()) {
-    return false;
-  }
-  if (size() > quot.max_size()) {
-    return false;
-  }
-  quot.set_size(size());
-  std::memcpy(quot.digits.data(), digits.data(), size() * sizeof(word_t));
-  *this = rem;
-  return true;
-}
-
-template <class Tr>
-bool AnyIntView<Tr>::mod_div_any_big_divisor(const AnyIntView<Tr>& divisor, const AnyIntView<Tr>& divisor_abs, AnyIntView<Tr>& quot, int round_mode) {
-  quot.invalidate();
-  if (!is_valid()) {
-    return false;
-  }
-  if (!divisor.is_valid()) {
+  if (!yp.is_valid()) {
     return invalidate_bool();
   }
- 
-  const auto to_bignum = [](const auto& src, arith::Bignum& dst) {
-    const size_t bytes = (src.bit_size_any(false) + 7) / 8;
-    std::array<unsigned char, 256 / 8 + 1> binary;
-    if (bytes > binary.size()) {
-      return false;
-    }
-    src.export_bytes_any(binary.data(), bytes, false);
-    dst.import_msb(binary.data(), bytes);
-    return true;
-  };
-  
-  const auto from_bignum = [](const arith::Bignum& src, AnyIntView<Tr>& dst) {
-    const size_t bytes = src.num_bytes();
-    std::array<unsigned char, 256 / 8 + 1> binary;
-    if (bytes > binary.size()) {
-      return false;
-    }
-    src.export_msb(binary.data(), bytes);
-    const bool res = dst.import_bytes_any(binary.data(), bytes, false);
-    return res;
-  };
-  
-  AnyIntView<Tr>& remainder = *this;
-  const int sign_dividend = this->sgn_un_any();
-  const int sign_divisor = divisor.sgn_un_any();
-  if (!this->mul_add_short_any(sign_dividend, 0)) {
-    return false;
+
+  double y_top = yp.top_double();
+  if (y_top == 0) {
+    // division by zero
+    return invalidate_bool();
   }
-  if (!this->normalize_bool_any()) {
-    return false;
-  }
-  try {
-    arith::Bignum dividend_bn;
-    arith::Bignum divisor_bn;
-    if (!to_bignum(*this, dividend_bn)) {
-      return false;
-    }
-    if (!to_bignum(divisor_abs, divisor_bn)) {
-      return false;
-    }
-    const arith::Bignum remainder_bn = dividend_bn.divmod(divisor_bn);
-    const arith::Bignum& quot_bn = dividend_bn;
-    if (!from_bignum(remainder_bn, remainder)) {
-      return false;
-    }
-    if (!from_bignum(quot_bn, quot)) {
-      return false;
-    }
-  } catch (...) {
-    return false;
-  }
-  
-  if (round_mode == 0) {
-    // nearest
-    remainder.mul_add_short_any(sign_dividend, 0);
-    if (sign_divisor < 0) {
-      quot.mul_add_short_any(-1 * sign_dividend, 0);
+  double y_inv = (double)Tr::Base / y_top;
+
+  int k = size() - yp.size();
+  if (k >= 0) {
+    if (std::abs(top_word()) * 2 <= std::abs(yp.top_word())) {
+      if (k > quot.max_size()) {
+        return invalidate_bool();
+      }
+      quot.set_size(max(k,1));
+      for(int qi=0; qi< max(k,1); qi++) {
+        quot.digits[qi]=0;
+      }
     } else {
-      quot.mul_add_short_any(sign_dividend, 0);
-    }
-    if (!remainder.eq_any(0)) {
-      AnyIntView<Tr>& r_x2 = remainder;
-      const int sgn_r_x2 = r_x2.sgn_un_any();
-      r_x2.mul_add_short_any(sgn_r_x2 * 2, 0);
-      const int cmp_result = r_x2.cmp_un_any(divisor_abs);
-      r_x2.divmod_short_any(sgn_r_x2 * 2);
-      const bool is_not_negative = sign_dividend == sign_divisor;
-      if (cmp_result > 0 || (cmp_result == 0 && is_not_negative)) {
-        if (sign_divisor == remainder.sgn_un_any()) {
-          remainder.sub_any(divisor);
-        } else {
-          remainder.add_any(divisor);
-        }
-        if (is_not_negative) {
-          quot.mul_add_short_any(1, 1);
-        } else {
-          quot.mul_add_short_any(1, -1);
-        }
+      if (k >= quot.max_size()) {
+        return invalidate_bool();
       }
-    }
-  } else if (round_mode == -1) {
-    // FloorToNegativeInfinity
-    if (sign_dividend >= 0 && sign_divisor > 0) {
-      // empty
-    } else if (sign_dividend >= 0 && sign_divisor < 0) {
-      if (remainder.eq_any(0)) {
-        quot.mul_add_short_any(-1, 0);
-      } else {
-        quot.mul_add_short_any(-1, -1);
-        remainder.add_any(divisor);
+      quot.set_size(k + 1);
+      double x_top = top_double();
+      word_t q = std::llrint(x_top * y_inv * Tr::InvBase);
+      quot.digits[k] = q;
+      int i = yp.size() - 1;
+      word_t hi = 0;
+      Tr::sub_mul(&hi, &digits[k + i], q, yp.digits[i]);
+      while (--i >= 0) {
+        Tr::sub_mul(&digits[k + i + 1], &digits[k + i], q, yp.digits[i]);
       }
-    } else if (sign_dividend < 0 && sign_divisor > 0) {
-      if (remainder.eq_any(0)) {
-        quot.mul_add_short_any(-1, 0);
-      } else {
-        quot.mul_add_short_any(-1, -1);
-        remainder.mul_add_short_any(-1, 0);
-        remainder.add_any(divisor);
-      }
-    } else if (sign_dividend < 0 && sign_divisor < 0) {
-      remainder.mul_add_short_any(-1, 0);
+      digits[size() - 1] += (hi << word_shift);
     }
-  } else if (round_mode == 1) {
-    // ceil
-    remainder.mul_add_short_any(sign_dividend, 0);
-    if (sign_divisor < 0) {
-      quot.mul_add_short_any(-1 * sign_dividend, 0);
+  } else {
+    quot.set_size(1);
+    quot.digits[0] = 0;
+  }
+  while (--k >= 0) {
+    double x_top = top_double();
+    word_t q = std::llrint(x_top * y_inv);
+    quot.digits[k] = q;
+    for (int i = yp.size() - 1; i >= 0; --i) {
+      Tr::sub_mul(&digits[k + i + 1], &digits[k + i], q, yp.digits[i]);
+    }
+    dec_size();
+    digits[size() - 1] += (digits[size()] << word_shift);
+  }
+  if (size() >= yp.size()) {
+    assert(size() == yp.size());
+    double x_top = top_double();
+    double t = x_top * y_inv * Tr::InvBase;
+    if (round_mode >= 0) {
+      t += (round_mode ? 1 : 0.5);
+    }
+    word_t q = std::llrint(std::floor(t));
+    if (q) {
+      for (int i = 0; i < size(); i++) {
+        digits[i] -= q * yp.digits[i];
+      }
+      quot.digits[0] += q;
+    }
+  }
+
+  int q_adj = 0, sy = (y_inv > 0 ? 1 : -1);
+  if (round_mode < 0) {
+    // floor: must have 0 <= rem < y or 0 >= rem > y
+    int sr = sgn_un_any();
+    if (sr * sy < 0) {
+      q_adj = -1;
     } else {
-      quot.mul_add_short_any(sign_dividend, 0);
+      sr = cmp_un_any<TransformId<word_t>>(yp);
+      if (sr * sy >= 0) {
+        q_adj = 1;
+      }
     }
-    if (!remainder.eq_any(0) && remainder.sgn_un_any() == sign_divisor) {
-      remainder.sub_any(divisor);
-      if (sign_dividend == sign_divisor) {
-        quot.mul_add_short_any(1, 1);
-      } else {
-        quot.mul_add_short_any(1, -1);
+  } else if (round_mode > 0) {
+    // ceil: must have -y < rem <= 0 or -y > rem >= 0
+    int sr = sgn_un_any();
+    if (sr * sy > 0) {
+      q_adj = 1;
+    } else {
+      sr = cmp_un_any<TransformNegate<word_t>>(yp);  // -rem ?? y
+      if (sr * sy >= 0) {
+        q_adj = -1;
       }
     }
   } else {
-    return false;
+    // round: must have -y <= 2*rem < y or -y >= 2*rem > y
+    int sr = sgn_un_any();
+    if (sr * sy > 0) {
+      // y and rem same sign, check 2*rem < y or 2*rem > y
+      sr = cmp_un_any<TransformMul<word_t, 2>>(yp);
+      if (sr * sy >= 0) {
+        q_adj = 1;
+      }
+    } else {
+      // y and rem different sign, check 2*rem >= -y or 2*rem <= -y
+      sr = cmp_un_any<TransformMul<word_t, -2>>(yp);
+      if (sr * sy > 0) {
+        q_adj = -1;
+      }
+    }
   }
-    
+  if (q_adj) {
+    quot.digits[0] += q_adj;
+    if (q_adj < 0 ? !add_any(yp) : !sub_any(yp)) {
+      return invalidate_bool();
+    }
+  }
   return normalize_bool_any();
 }
 
