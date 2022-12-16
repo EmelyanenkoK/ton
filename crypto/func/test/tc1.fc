@@ -73,6 +73,10 @@ int get_y(int x, int y) {
   throw_unless(504, get_y(3, 4) == -1);
 }
 
+((int, int, int, int), ()) ~helper_changer((int, int, int, int) x, int a, int b, int c, int d) impure {
+  return ((a, b, c, d), ());
+}
+
 _ test5() impure {
   int v000 = 0x000;  int v001 = 0x004;  int v002 = 0x028;  int v003 = 0x090;
   int v004 = 0x208;  int v005 = 0x400;  int v006 = 0x684;  int v007 = 0x078;
