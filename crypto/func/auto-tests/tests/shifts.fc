@@ -5,7 +5,7 @@ int lshift() {
 }
 
 int rshift() {
-  return (1 << 0) == 1;
+  return (1 >> 0) == 1;
 }
 
 int lshift_var(int i) {
@@ -13,7 +13,7 @@ int lshift_var(int i) {
 }
 
 int rshift_var(int i) {
-  return (1 << i) == 1;
+  return (1 >> i) == 1;
 }
 
 int main(int x) {
