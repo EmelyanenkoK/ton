@@ -5,6 +5,7 @@ set(OVERLAY_SOURCE
   overlay-fec-broadcast.cpp
   overlay-broadcast.cpp
   overlay-peers.cpp
+  twostep-overlay.cpp
 
   overlay-fec.hpp
   overlay-broadcast.hpp
@@ -13,6 +14,7 @@ set(OVERLAY_SOURCE
   overlay.h
   overlay.hpp
   overlays.h
+  twostep-overlay.hpp
 )
 
 add_library(overlay STATIC ${OVERLAY_SOURCE})
