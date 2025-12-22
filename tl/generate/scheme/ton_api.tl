@@ -281,6 +281,14 @@ overlay.getBroadcastList list:overlay.broadcastList = overlay.BroadcastList;
 
 ---types---
 
+twostepOverlay.broadcastSimple transfer_id:int256 flags:int data:bytes = twostepOverlay.Broadcast;
+twostepOverlay.broadcastFec transfer_id:int256 flags:int data_size:int part:int symbol:bytes = twostepOverlay.Broadcast;
+twostepOverlay.broadcastInner send_as:int256 data:bytes = twostepOverlay.BroadcastInner;
+
+---functions---
+
+---types---
+
 overlay.db.nodesV2 nodes:overlay.nodesV2 = overlay.db.Nodes;
 overlay.db.nodes nodes:overlay.nodes = overlay.db.Nodes;
 overlay.db.key.nodes local_id:int256 overlay:int256 = overlay.db.Key;
