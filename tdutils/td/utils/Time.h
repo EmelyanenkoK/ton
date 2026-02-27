@@ -44,6 +44,14 @@ class Time {
 
   // Used for testing. After jump_in_future(at) is called, now() >= at.
   static void jump_in_future(double at);
+
+  static void allow_freezes();  // must be sequenced before any now / jump_in_future call.
+
+  // Freeze time: now() returns a fixed value that only changes via jump_in_future.
+  static void freeze();
+  static void unfreeze();
+
+  static double system_now();
 };
 
 inline void relax_timeout_at(double *timeout, double new_timeout) {
@@ -71,7 +79,7 @@ class Timestamp {
     return Timestamp{timeout};
   }
   static Timestamp at_unix(double timeout) {
-    return Timestamp{timeout - Clocks::system() + Time::now()};
+    return Timestamp{timeout - Time::system_now() + Time::now()};
   }
 
   static Timestamp in(double timeout, td::Timestamp now = td::Timestamp::now_cached()) {
@@ -93,7 +101,7 @@ class Timestamp {
     return at_;
   }
   double at_unix() const {
-    return at_ + Clocks::system() - Time::now();
+    return at_ + Time::system_now() - Time::now();
   }
 
   double in() const {
@@ -134,12 +142,12 @@ inline double operator-(const Timestamp &a, const Timestamp &b) {
 
 template <class StorerT>
 void store(const Timestamp &timestamp, StorerT &storer) {
-  storer.store_binary(timestamp.at() - Time::now() + Clocks::system());
+  storer.store_binary(timestamp.at() - Time::now() + Time::system_now());
 }
 
 template <class ParserT>
 void parse(Timestamp &timestamp, ParserT &parser) {
-  timestamp = Timestamp::in(parser.fetch_double() - Clocks::system());
+  timestamp = Timestamp::in(parser.fetch_double() - Time::system_now());
 }
 
 }  // namespace td
