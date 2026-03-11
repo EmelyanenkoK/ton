@@ -197,6 +197,7 @@ set(BLOCK_SOURCE
   block/block-db.cpp
   block/block-parse.cpp
   block/check-proof.cpp
+  block/fixtures.cpp
   block/mc-config.cpp
   block/output-queue-merger.cpp
   block/transaction.cpp
