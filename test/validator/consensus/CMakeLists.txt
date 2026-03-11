@@ -23,3 +23,15 @@ target_link_libraries(test-block-validator PRIVATE
     validator
     td-test-main
 )
+
+add_executable(test-block-producer test-block-producer.cpp)
+target_link_libraries(test-block-producer PRIVATE
+    adnl
+    overlay
+    tdactor
+    tdutils
+    tl_api
+    ton_validator
+    validator
+    td-test-main
+)
