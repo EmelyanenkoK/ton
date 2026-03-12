@@ -285,5 +285,28 @@ struct PersistsLeaderWindowCheckpointAcrossRestart : SimplexDbTest {
 };
 REGISTER_TEST(SimplexDb, PersistsLeaderWindowCheckpointAcrossRestart);
 
+struct RetriesBroadcastVoteAfterSetFailure : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the durable local-vote semantics behind simplex Rule 4 and Rule 5:
+    // if the backing db write fails, the same vote must remain retryable instead of being treated
+    // as already durably stored.
+    co_await start_actor();
+
+    auto vote = simplex::Vote{simplex::NotarizeVote{make_candidate_id(13, 1313)}};
+    db().fail_next_sets(1);
+
+    auto first = co_await handle_.publish<simplex::BroadcastVote>(vote).wrap();
+    auto retry = co_await handle_.publish<simplex::BroadcastVote>(vote).wrap();
+
+    ASSERT_TRUE(first.is_error());
+    ASSERT_TRUE(retry.is_ok());
+    EXPECT_EQ(db().size(), static_cast<size_t>(1));
+    EXPECT_EQ(stored_our_vote_seqno(db(), vote), static_cast<td::int64>(0));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexDb, RetriesBroadcastVoteAfterSetFailure);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
