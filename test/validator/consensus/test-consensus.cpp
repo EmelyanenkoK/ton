@@ -67,6 +67,7 @@ enum class TestCase {
   Smoke,
   NoDoubleNotar,
   NotarRequiresParentNotar,
+  EmptyCandidatesConsensus,
   FinalRequiresOwnNotar,
   NoSkipFinalConflict,
   CertificateRequiresQuorum,
@@ -85,6 +86,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "notar-requires-parent-notar") {
     return TestCase::NotarRequiresParentNotar;
+  }
+  if (s == "empty-candidates-consensus") {
+    return TestCase::EmptyCandidatesConsensus;
   }
   if (s == "final-requires-own-notar") {
     return TestCase::FinalRequiresOwnNotar;
@@ -241,6 +245,13 @@ struct CandidateGeneratedTraceRecord {
   BlockIdExt block_id;
 };
 
+struct AcceptedBlockTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  BlockIdExt block_id;
+};
+
 struct MisbehaviorTraceRecord {
   double ts = 0.0;
   size_t node_idx = 0;
@@ -272,6 +283,7 @@ struct TraceSnapshot {
   std::vector<NotarizationObservedTraceRecord> notarizations_observed;
   std::vector<FinalizationObservedTraceRecord> finalizations_observed;
   std::vector<CandidateGeneratedTraceRecord> candidates_generated;
+  std::vector<AcceptedBlockTraceRecord> accepted_blocks;
   std::vector<MisbehaviorTraceRecord> misbehavior_reports;
   std::vector<NetworkToggleTraceRecord> network_toggles;
   std::vector<LifecycleTraceRecord> lifecycle;
@@ -369,6 +381,80 @@ td::Status verify_notar_requires_parent_notar(const TraceSnapshot& snapshot) {
   }
   if (!saw_candidate_before_parent_notar) {
     return td::Status::Error("scenario did not deliver any child candidate before its parent notarization");
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_empty_candidates_consensus(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md §4.4:
+  // empty candidates are still notarized and finalized, they point to an already-accepted block,
+  // and consensus continues past the empty slot.
+  std::map<CandidateId, BlockIdExt> empty_block_by_candidate;
+  for (const auto& record : snapshot.candidates_generated) {
+    if (record.is_empty) {
+      empty_block_by_candidate.emplace(record.candidate_id, record.block_id);
+    }
+  }
+  if (empty_block_by_candidate.empty()) {
+    return td::Status::Error("scenario did not produce any empty candidates");
+  }
+
+  std::set<CandidateId> notarized_empty_candidates;
+  for (const auto& record : snapshot.notarizations_observed) {
+    if (empty_block_by_candidate.contains(record.id)) {
+      notarized_empty_candidates.insert(record.id);
+    }
+  }
+  if (notarized_empty_candidates.empty()) {
+    return td::Status::Error("no generated empty candidate was notarized");
+  }
+
+  std::map<CandidateId, double> finalized_empty_ts;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (notarized_empty_candidates.contains(record.id)) {
+      auto [it, inserted] = finalized_empty_ts.emplace(record.id, record.ts);
+      if (!inserted) {
+        it->second = std::min(it->second, record.ts);
+      }
+    }
+  }
+  if (finalized_empty_ts.empty()) {
+    return td::Status::Error("no notarized empty candidate was finalized");
+  }
+
+  std::map<BlockIdExt, double> first_accepted_ts_by_block;
+  for (const auto& record : snapshot.accepted_blocks) {
+    auto [it, inserted] = first_accepted_ts_by_block.emplace(record.block_id, record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+  }
+
+  bool saw_later_finalized_descendant = false;
+  for (const auto& [empty_id, finalization_ts] : finalized_empty_ts) {
+    auto block_it = empty_block_by_candidate.find(empty_id);
+    CHECK(block_it != empty_block_by_candidate.end());
+    auto accepted_it = first_accepted_ts_by_block.find(block_it->second);
+    if (accepted_it == first_accepted_ts_by_block.end()) {
+      return td::Status::Error(PSTRING() << "referenced block " << block_it->second.to_str()
+                                         << " for finalized empty candidate " << empty_id
+                                         << " was never accepted");
+    }
+    if (accepted_it->second > finalization_ts + 1e-9) {
+      return td::Status::Error(PSTRING() << "empty candidate " << empty_id
+                                         << " finalized before its referenced block " << block_it->second.to_str()
+                                         << " was accepted");
+    }
+    for (const auto& record : snapshot.finalizations_observed) {
+      if (record.id.slot > empty_id.slot && record.ts >= finalization_ts - 1e-9) {
+        saw_later_finalized_descendant = true;
+        break;
+      }
+    }
+  }
+
+  if (!saw_later_finalized_descendant) {
+    return td::Status::Error("scenario did not finalize any descendant after an empty candidate");
   }
   return td::Status::OK();
 }
@@ -598,6 +684,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_no_double_notar(snapshot);
     case TestCase::NotarRequiresParentNotar:
       return verify_notar_requires_parent_notar(snapshot);
+    case TestCase::EmptyCandidatesConsensus:
+      return verify_empty_candidates_consensus(snapshot);
     case TestCase::FinalRequiresOwnNotar:
       return verify_finalize_requires_own_notar(snapshot);
     case TestCase::NoSkipFinalConflict:
@@ -730,6 +818,15 @@ class TestTraceSink : public td::actor::Actor {
     });
   }
 
+  void record_accepted_block(size_t node_idx, size_t instance_idx, BlockIdExt block_id) {
+    accepted_blocks_.push_back(AcceptedBlockTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .block_id = std::move(block_id),
+    });
+  }
+
   void record_misbehavior(size_t node_idx, size_t instance_idx, PeerValidatorId offender) {
     misbehavior_reports_.push_back(MisbehaviorTraceRecord{
         .ts = td::Time::now_unadjusted(),
@@ -767,6 +864,7 @@ class TestTraceSink : public td::actor::Actor {
     notarizations_observed_.clear();
     finalizations_observed_.clear();
     candidates_generated_.clear();
+    accepted_blocks_.clear();
     misbehavior_reports_.clear();
     network_toggles_.clear();
     lifecycle_.clear();
@@ -783,6 +881,7 @@ class TestTraceSink : public td::actor::Actor {
         .notarizations_observed = notarizations_observed_,
         .finalizations_observed = finalizations_observed_,
         .candidates_generated = candidates_generated_,
+        .accepted_blocks = accepted_blocks_,
         .misbehavior_reports = misbehavior_reports_,
         .network_toggles = network_toggles_,
         .lifecycle = lifecycle_,
@@ -799,6 +898,7 @@ class TestTraceSink : public td::actor::Actor {
   std::vector<NotarizationObservedTraceRecord> notarizations_observed_;
   std::vector<FinalizationObservedTraceRecord> finalizations_observed_;
   std::vector<CandidateGeneratedTraceRecord> candidates_generated_;
+  std::vector<AcceptedBlockTraceRecord> accepted_blocks_;
   std::vector<MisbehaviorTraceRecord> misbehavior_reports_;
   std::vector<NetworkToggleTraceRecord> network_toggles_;
   std::vector<LifecycleTraceRecord> lifecycle_;
@@ -1589,6 +1689,7 @@ class TestConsensus : public td::actor::Actor {
     }
     Instance &inst = nodes_[node_idx].instances[instance_idx];
     inst.last_accepted_block = std::max(inst.last_accepted_block, seqno);
+    td::actor::send_closure(trace_sink_, &TestTraceSink::record_accepted_block, node_idx, instance_idx, block_id);
     if (last_accepted_block_.seqno() < seqno && signatures->is_final()) {
       last_accepted_block_ = block_id;
       last_accepted_block_leader_idx_ = creator_idx;
@@ -1680,11 +1781,26 @@ class TestConsensus : public td::actor::Actor {
         NET_PING = {0.25, 0.3};
       }
     }
+    if (TEST_CASE == TestCase::EmptyCandidatesConsensus) {
+      SHARD = ShardIdFull{masterchainId};
+      FIRST_PARENT.id.workchain = masterchainId;
+      FIRST_PARENT.id.shard = shardIdAll;
+      MIN_MC_BLOCK_ID = FIRST_PARENT;
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 3.0;
+      }
+    }
   }
 
   td::actor::Task<> run_test_case_scenario() {
     co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
-    if (TEST_CASE == TestCase::NotarRequiresParentNotar) {
+    if (TEST_CASE == TestCase::NotarRequiresParentNotar || TEST_CASE == TestCase::EmptyCandidatesConsensus) {
       co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
     }
     co_return td::Unit{};
