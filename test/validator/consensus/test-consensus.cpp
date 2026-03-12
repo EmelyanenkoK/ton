@@ -68,6 +68,7 @@ enum class TestCase {
   NoDoubleNotar,
   FinalRequiresOwnNotar,
   NoSkipFinalConflict,
+  CertificateRequiresQuorum,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -82,6 +83,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "no-skip-final-conflict") {
     return TestCase::NoSkipFinalConflict;
+  }
+  if (s == "certificate-requires-quorum") {
+    return TestCase::CertificateRequiresQuorum;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -351,6 +355,32 @@ td::Status verify_no_skip_final_conflict(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_certificate_requires_quorum(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 7 (certificate formation):
+  // a certificate may be formed only after votes with total weight at least q have been received.
+  constexpr td::uint64 validator_weight = 11;
+  td::uint64 total_weight = validator_weight * N_NODES;
+  td::uint64 quorum_weight = (2 * total_weight) / 3 + 1;
+
+  if (snapshot.protocol_certificates.empty()) {
+    return td::Status::Error("scenario did not produce any certificates");
+  }
+
+  for (const auto& record : snapshot.protocol_certificates) {
+    std::set<size_t> unique_signers;
+    for (PeerValidatorId signer : record.signers) {
+      unique_signers.insert(signer.value());
+    }
+    td::uint64 signer_weight = validator_weight * unique_signers.size();
+    if (signer_weight < quorum_weight) {
+      return td::Status::Error(PSTRING() << "certificate for " << record.vote
+                                         << " had insufficient signer weight: got=" << signer_weight
+                                         << ", quorum=" << quorum_weight);
+    }
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -361,6 +391,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_finalize_requires_own_notar(snapshot);
     case TestCase::NoSkipFinalConflict:
       return verify_no_skip_final_conflict(snapshot);
+    case TestCase::CertificateRequiresQuorum:
+      return verify_certificate_requires_quorum(snapshot);
   }
   UNREACHABLE();
 }
