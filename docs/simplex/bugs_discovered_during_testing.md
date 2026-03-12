@@ -13,3 +13,10 @@
 - Observed behavior: when a node is stopped, its simplex DB is cleared, and the node is started again inside `test/validator/consensus/test-consensus.cpp`, the final shutdown can hang while stopping that restarted node. The log shows repeated detached-task failures with `Actor destroyed` during teardown.
 - Trigger: a restart/storage-loss scenario intended to exercise candidate resolution.
 - Testing impact: this currently blocks a stable `test-consensus` scenario for Rule 2 recovery after restart and DB loss. The blocker needs to be understood before a non-hanging candidate-resolution integration test can be committed.
+
+## Mid-run standstill scenarios can wedge orderly `test-consensus` teardown
+
+- Documentation / expectation: Rule 8 standstill-resolution testing needs the harness to stop or isolate part of the validator set mid-run, wait for rebroadcasts, and then shut down normally.
+- Observed behavior: after inducing a standstill by stopping or isolating validators inside `test/validator/consensus/test-consensus.cpp`, the subsequent global `finalize()` shutdown can hang while stopping the remaining live nodes. The logs again show repeated detached-task failures such as `Actor destroyed` during teardown.
+- Trigger: a standstill-resolution scenario that removes quorum after at least one finalization has already happened.
+- Testing impact: the Rule 8 test currently has to verify its trace and let the process exit immediately, instead of waiting for orderly actor teardown. The shutdown instability remains visible here and should be understood separately from the protocol assertion.

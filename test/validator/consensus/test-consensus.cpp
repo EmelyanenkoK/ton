@@ -68,6 +68,7 @@ enum class TestCase {
   NoDoubleNotar,
   NotarRequiresParentNotar,
   EmptyCandidatesConsensus,
+  StandstillRebroadcastContents,
   FinalRequiresOwnNotar,
   NoSkipFinalConflict,
   CertificateRequiresQuorum,
@@ -89,6 +90,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "empty-candidates-consensus") {
     return TestCase::EmptyCandidatesConsensus;
+  }
+  if (s == "standstill-rebroadcast-contents") {
+    return TestCase::StandstillRebroadcastContents;
   }
   if (s == "final-requires-own-notar") {
     return TestCase::FinalRequiresOwnNotar;
@@ -143,6 +147,7 @@ double DURATION = 60.0;
 td::uint32 TARGET_RATE_MS = 1000;
 td::uint32 SLOTS_PER_LEADER_WINDOW = 4;
 TestCase TEST_CASE = TestCase::Smoke;
+double STANDSTILL_TIMEOUT_S = 10.0;
 
 std::pair<double, double> GREMLIN_PERIOD = {-1.0, -1.0};
 std::pair<double, double> GREMLIN_DOWNTIME = {1.0, 1.0};
@@ -288,6 +293,9 @@ struct TraceSnapshot {
   std::vector<NetworkToggleTraceRecord> network_toggles;
   std::vector<LifecycleTraceRecord> lifecycle;
 };
+
+std::string certificate_trace_key(const ProtocolCertificateTraceRecord& record);
+std::string vote_trace_key(const simplex::Vote& vote);
 
 td::Status verify_no_double_notar(const TraceSnapshot& snapshot) {
   // Covers simplex_docs.md §1.4 local Notar uniqueness and Lemma 2.2:
@@ -459,6 +467,90 @@ td::Status verify_empty_candidates_consensus(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_standstill_rebroadcast_contents(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 8:
+  // after finalization stalls, a validator rebroadcasts its highest final cert, all later certs,
+  // and all of its later votes on each standstill-resolution attempt.
+  constexpr size_t node_idx = 0;
+  constexpr size_t instance_idx = 0;
+
+  double last_finalization_ts = -1.0;
+  CandidateId last_finalized_id;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == node_idx && record.instance_idx == instance_idx && record.ts > last_finalization_ts) {
+      last_finalization_ts = record.ts;
+      last_finalized_id = record.id;
+    }
+  }
+  if (last_finalization_ts < 0.0) {
+    return td::Status::Error("scenario did not produce any finalization on validator #0.0");
+  }
+
+  double first_standstill_attempt_ts = last_finalization_ts + STANDSTILL_TIMEOUT_S * 0.75;
+
+  bool saw_highest_final_cert_after_standstill = false;
+  std::set<std::string> later_cert_keys_before_standstill;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (record.src_node_idx != node_idx || record.src_instance_idx != instance_idx) {
+      continue;
+    }
+    auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote);
+    if (final != nullptr && final->id == last_finalized_id && record.ts >= first_standstill_attempt_ts) {
+      saw_highest_final_cert_after_standstill = true;
+    }
+    if (record.ts < first_standstill_attempt_ts && record.vote.referenced_slot() > last_finalized_id.slot) {
+      later_cert_keys_before_standstill.insert(certificate_trace_key(record));
+    }
+  }
+  if (!saw_highest_final_cert_after_standstill) {
+    return td::Status::Error(PSTRING() << "validator #0.0 did not rebroadcast its highest final certificate for "
+                                       << last_finalized_id << " after standstill timeout");
+  }
+
+  std::set<std::string> later_vote_keys_before_standstill;
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx != node_idx || record.src_instance_idx != instance_idx) {
+      continue;
+    }
+    if (record.ts < first_standstill_attempt_ts && record.vote.referenced_slot() > last_finalized_id.slot) {
+      later_vote_keys_before_standstill.insert(vote_trace_key(record.vote));
+    }
+  }
+  if (later_vote_keys_before_standstill.empty()) {
+    return td::Status::Error("scenario did not produce any later own votes before the first standstill attempt");
+  }
+
+  std::set<std::string> rebroadcast_cert_keys;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (record.src_node_idx == node_idx && record.src_instance_idx == instance_idx &&
+        record.ts >= first_standstill_attempt_ts) {
+      rebroadcast_cert_keys.insert(certificate_trace_key(record));
+    }
+  }
+  for (const auto& key : later_cert_keys_before_standstill) {
+    if (!rebroadcast_cert_keys.contains(key)) {
+      return td::Status::Error(PSTRING() << "validator #0.0 did not rebroadcast later certificate " << key
+                                         << " after standstill timeout");
+    }
+  }
+
+  std::set<std::string> rebroadcast_vote_keys;
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx == node_idx && record.src_instance_idx == instance_idx &&
+        record.ts >= first_standstill_attempt_ts) {
+      rebroadcast_vote_keys.insert(vote_trace_key(record.vote));
+    }
+  }
+  for (const auto& key : later_vote_keys_before_standstill) {
+    if (!rebroadcast_vote_keys.contains(key)) {
+      return td::Status::Error(PSTRING() << "validator #0.0 did not rebroadcast later own vote " << key
+                                         << " after standstill timeout");
+    }
+  }
+
+  return td::Status::OK();
+}
+
 td::Status verify_finalize_requires_own_notar(const TraceSnapshot& snapshot) {
   // Covers simplex_docs.md Rule 5(1):
   // an honest validator may vote Final(s, h) only after it has voted Notar(s, h) itself.
@@ -577,6 +669,10 @@ std::string certificate_trace_key(const ProtocolCertificateTraceRecord& record) 
   return key;
 }
 
+std::string vote_trace_key(const simplex::Vote& vote) {
+  return PSTRING() << vote;
+}
+
 td::Status verify_certificate_rebroadcast(const TraceSnapshot& snapshot) {
   // Covers simplex_docs.md Rule 7 (certificate rebroadcast):
   // upon forming or receiving any certificate, a validator broadcasts it.
@@ -686,6 +782,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_notar_requires_parent_notar(snapshot);
     case TestCase::EmptyCandidatesConsensus:
       return verify_empty_candidates_consensus(snapshot);
+    case TestCase::StandstillRebroadcastContents:
+      return verify_standstill_rebroadcast_contents(snapshot);
     case TestCase::FinalRequiresOwnNotar:
       return verify_finalize_requires_own_notar(snapshot);
     case TestCase::NoSkipFinalConflict:
@@ -1796,9 +1894,51 @@ class TestConsensus : public td::actor::Actor {
         DURATION = 3.0;
       }
     }
+    if (TEST_CASE == TestCase::StandstillRebroadcastContents) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 200;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 4.0;
+      }
+      STANDSTILL_TIMEOUT_S = 1.0;
+    }
+  }
+
+  td::actor::Task<> wait_for_finalization_on(size_t node_idx, size_t instance_idx, double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == node_idx && record.instance_idx == instance_idx) {
+          co_return td::Unit{};
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for finalization on validator #" << node_idx << "."
+                                          << instance_idx);
+  }
+
+  bool skip_finalize_for_test_case() const {
+    return TEST_CASE == TestCase::StandstillRebroadcastContents;
   }
 
   td::actor::Task<> run_test_case_scenario() {
+    if (TEST_CASE == TestCase::StandstillRebroadcastContents) {
+      // Drives simplex_docs.md Rule 8 into a standstill:
+      // after one finalization, stop two validators so no new quorum can form,
+      // then wait past T_s for the surviving node to rebroadcast its cached state.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      co_await stop_instance(2, 0);
+      co_await stop_instance(3, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+
     co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
     if (TEST_CASE == TestCase::NotarRequiresParentNotar || TEST_CASE == TestCase::EmptyCandidatesConsensus) {
       co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
@@ -1872,6 +2012,10 @@ class TestConsensus : public td::actor::Actor {
 
     co_await run_test_case_scenario();
 
+    if (skip_finalize_for_test_case()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      co_return verify_test_case(snapshot);
+    }
     co_return co_await finalize();
   }
 
@@ -1917,6 +2061,7 @@ class TestConsensus : public td::actor::Actor {
     bus->cc_seqno = CC_SEQNO;
     bus->validator_set_hash = validator_set_->get_validator_set_hash();
     bus->populate_collator_schedule();
+    bus->standstill_timeout_s = STANDSTILL_TIMEOUT_S;
     bus->db = std::make_unique<TestDbImpl>(inst.db_inner);
     inst.bus = runtime.start(std::static_pointer_cast<simplex::Bus>(bus),
                              PSTRING() << "consensus." << node_idx << "." << instance_idx);
