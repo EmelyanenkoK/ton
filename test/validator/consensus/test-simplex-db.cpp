@@ -80,6 +80,13 @@ td::int64 stored_our_vote_seqno(const TestDbImpl& db, const simplex::Vote& vote)
   return value->seqno_;
 }
 
+td::uint32 stored_first_nonannounced_window(const TestDbImpl& db) {
+  auto stored = db.get(create_serialize_tl_object<tl::db_key_poolState>().as_slice());
+  CHECK(stored.has_value());
+  auto value = fetch_tl_object<tl::db_poolState>(*stored, true).move_as_ok();
+  return static_cast<td::uint32>(value->first_nonannounced_window_);
+}
+
 class SimplexDbTest : public td::Test {
  protected:
   std::unique_ptr<ValidatorSetup> ctx_;
@@ -257,6 +264,26 @@ struct RejectsDuplicateBroadcastVotes : SimplexDbTest {
   }
 };
 REGISTER_TEST(SimplexDb, RejectsDuplicateBroadcastVotes);
+
+struct PersistsLeaderWindowCheckpointAcrossRestart : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the frontier checkpoint that lets Rule 1 resume after restart:
+    // once a leader window is observed, Db must durably advance first_nonannounced_window and
+    // restore the same checkpoint on the next startup.
+    co_await start_actor();
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(8, ParentId{});
+
+    EXPECT_EQ(stored_first_nonannounced_window(db()), static_cast<td::uint32>(3));
+
+    co_await restart_actor();
+
+    EXPECT_EQ(handle_->first_nonannounced_window, static_cast<td::uint32>(3));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexDb, PersistsLeaderWindowCheckpointAcrossRestart);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
