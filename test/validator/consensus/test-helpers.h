@@ -12,6 +12,8 @@
 #include "td/actor/Mocks.h"
 #include "validator/consensus/bus.h"
 #include "validator/consensus/chain-state.h"
+#include "validator/consensus/simplex/bus.h"
+#include "validator/consensus/simplex/certificate.h"
 #include "validator/fabric.h"
 
 namespace ton::validator::consensus::test {
@@ -108,6 +110,42 @@ class ValidatorSetup {
   ValidatorWeight total_weight_{0};
 };
 
+inline void fill_simplex_bus(const ValidatorSetup& setup, simplex::Bus& bus, size_t idx) {
+  setup.fill(bus, idx);
+  bus.simplex_config = bus.config.consensus.get<NewConsensusConfig::Simplex>();
+  bus.populate_collator_schedule();
+}
+
+inline td::BufferSlice sign_consensus_payload(const ValidatorSetup& setup, const consensus::Bus& bus, size_t idx,
+                                              td::Slice payload) {
+  auto signed_data =
+      create_serialize_tl_object<consensus::tl::dataToSign>(bus.session_id, td::BufferSlice(payload));
+  auto decryptor = setup.key(idx).create_decryptor().move_as_ok();
+  return decryptor->sign(signed_data.as_slice()).move_as_ok();
+}
+
+template <typename VoteT>
+simplex::Signed<VoteT> make_signed_simplex_vote(const ValidatorSetup& setup, const consensus::Bus& bus, size_t idx,
+                                                VoteT vote) {
+  auto vote_to_sign = serialize_tl_object(vote.to_tl(), true);
+  auto signature = sign_consensus_payload(setup, bus, idx, vote_to_sign.as_slice());
+  return simplex::Signed<VoteT>{PeerValidatorId{idx}, std::move(vote), std::move(signature)};
+}
+
+template <typename VoteT>
+td::Ref<simplex::Certificate<VoteT>> make_simplex_certificate(const ValidatorSetup& setup, const consensus::Bus& bus,
+                                                              VoteT vote, std::initializer_list<size_t> signers) {
+  std::vector<typename simplex::Certificate<VoteT>::VoteSignature> signatures;
+  auto vote_to_sign = serialize_tl_object(vote.to_tl(), true);
+  for (size_t idx : signers) {
+    signatures.push_back(typename simplex::Certificate<VoteT>::VoteSignature{
+        .validator = PeerValidatorId{idx},
+        .signature = sign_consensus_payload(setup, bus, idx, vote_to_sign.as_slice()),
+    });
+  }
+  return td::make_ref<simplex::Certificate<VoteT>>(std::move(vote), std::move(signatures));
+}
+
 // =============================================================================
 // Block / state construction helpers
 // =============================================================================
@@ -169,6 +207,60 @@ inline CandidateRef make_full_candidate(const BlockCandidate& bc, PeerValidatorI
   CandidateId id{.slot = 1, .hash = bits256_pattern(102)};
   return td::Ref<Candidate>(true, id, std::optional<CandidateId>{}, leader, bc.clone(), td::BufferSlice());
 }
+
+inline CandidateId make_candidate_id(td::uint32 slot, td::uint64 pattern) {
+  return CandidateId{.slot = slot, .hash = bits256_pattern(pattern)};
+}
+
+inline CandidateRef make_wait_candidate(CandidateId id, ParentId parent, PeerValidatorId leader = PeerValidatorId{0}) {
+  return td::make_ref<Candidate>(id, std::move(parent), leader, min_mc_block_id, td::BufferSlice("sig"));
+}
+
+inline td::Result<simplex::Signed<simplex::Vote>> decode_simplex_signed_vote(const ProtocolMessage& message,
+                                                                             PeerValidatorId src,
+                                                                             const consensus::Bus& bus) {
+  return simplex::Signed<simplex::Vote>::deserialize(message.data.as_slice(), src, bus);
+}
+
+inline td::Result<td::Ref<simplex::Certificate<simplex::Vote>>> decode_simplex_certificate(
+    const ProtocolMessage& message, const consensus::Bus& bus) {
+  TRY_RESULT(tl_cert, fetch_tl_object<simplex::tl::certificate>(message.data, true));
+  return simplex::Certificate<simplex::Vote>::from_tl(std::move(*tl_cert), bus);
+}
+
+class TestDbImpl : public consensus::Db {
+ public:
+  void seed(td::BufferSlice key, td::BufferSlice value) {
+    map_[std::move(key)] = std::move(value);
+  }
+
+  std::optional<td::BufferSlice> get(td::Slice key) const override {
+    auto it = map_.find(td::BufferSlice{key});
+    if (it == map_.end()) {
+      return std::nullopt;
+    }
+    return it->second.clone();
+  }
+
+  std::vector<std::pair<td::BufferSlice, td::BufferSlice>> get_by_prefix(td::uint32 prefix) const override {
+    std::vector<std::pair<td::BufferSlice, td::BufferSlice>> result;
+    td::BufferSlice begin{reinterpret_cast<const char*>(&prefix), 4};
+    td::uint32 prefix2 = prefix + 1;
+    td::BufferSlice end{reinterpret_cast<const char*>(&prefix2), 4};
+    for (auto it = map_.lower_bound(begin); it != map_.end() && it->first < end; ++it) {
+      result.emplace_back(it->first.clone(), it->second.clone());
+    }
+    return result;
+  }
+
+  td::actor::Task<> set(td::BufferSlice key, td::BufferSlice value) override {
+    map_[std::move(key)] = std::move(value);
+    co_return {};
+  }
+
+ private:
+  std::map<td::BufferSlice, td::BufferSlice> map_;
+};
 
 // =============================================================================
 // Simple test bus (no event capture)
