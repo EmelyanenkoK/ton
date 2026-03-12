@@ -1008,30 +1008,29 @@ td::Status verify_duplicate_candidate_received_does_not_double_notar(const Trace
                                        << " was not delivered twice to any validator instance");
   }
 
-  size_t notar_votes_from_replayed_node = 0;
-  std::set<std::optional<size_t>> notar_vote_destinations;
+  std::map<std::optional<size_t>, size_t> notar_deliveries_by_destination;
   for (const auto& record : snapshot.protocol_votes) {
     if (record.src_node_idx != replayed_destination->first || record.src_instance_idx != replayed_destination->second) {
       continue;
     }
     auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
     if (notar != nullptr && notar->id == *attacked_id) {
-      ++notar_votes_from_replayed_node;
-      notar_vote_destinations.insert(record.dst_node_idx);
+      ++notar_deliveries_by_destination[record.dst_node_idx];
     }
   }
-  if (notar_vote_destinations.empty()) {
+  if (notar_deliveries_by_destination.empty()) {
     return td::Status::Error(PSTRING() << "validator #" << replayed_destination->first << "."
                                        << replayed_destination->second
                                        << " never sent Notar for duplicated candidate " << *attacked_id);
   }
-  if (notar_votes_from_replayed_node != notar_vote_destinations.size()) {
-    return td::Status::Error(PSTRING() << "validator #" << replayed_destination->first << "."
-                                       << replayed_destination->second << " sent "
-                                       << notar_votes_from_replayed_node
-                                       << " Notar sends for duplicated candidate " << *attacked_id << " across "
-                                       << notar_vote_destinations.size()
-                                       << " destination(s), so the candidate was re-broadcast");
+  for (const auto& [dst_node_idx, count] : notar_deliveries_by_destination) {
+    if (count > 1) {
+      return td::Status::Error(PSTRING() << "validator #" << replayed_destination->first << "."
+                                         << replayed_destination->second << " sent duplicated Notar for candidate "
+                                         << *attacked_id << " to destination "
+                                         << (dst_node_idx.has_value() ? PSTRING() << *dst_node_idx : "broadcast")
+                                         << " (" << count << " deliveries)");
+    }
   }
 
   return td::Status::OK();
@@ -2560,13 +2559,6 @@ class TestConsensus : public td::actor::Actor {
     co_return td::Unit{};
   }
 
-  td::actor::Task<td::uint32> resolve_prev_seqno_for_test(size_t node_idx, size_t instance_idx, ParentId base) {
-    auto resolved = co_await nodes_[node_idx].instances[instance_idx].bus.publish<simplex::ResolveState>(base);
-    CHECK(resolved.state.not_null());
-    CHECK(resolved.state->next_seqno() > 0);
-    co_return resolved.state->next_seqno() - 1;
-  }
-
   BlockCandidate make_synthetic_block_candidate_for_test(td::uint32 slot, BlockSeqno prev_seqno, td::uint64 tag,
                                                          PeerValidatorId leader,
                                                          std::optional<double> gen_utime = std::nullopt) const {
@@ -2779,36 +2771,6 @@ class TestConsensus : public td::actor::Actor {
                                           << instance_idx);
   }
 
-  td::actor::Task<> wait_for_finalization_past_slot_on(size_t node_idx, size_t instance_idx, td::uint32 slot,
-                                                       double timeout_s) {
-    td::Timestamp deadline = td::Timestamp::in(timeout_s);
-    while (!deadline.is_in_past()) {
-      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
-      for (const auto& record : snapshot.finalizations_observed) {
-        if (record.node_idx == node_idx && record.instance_idx == instance_idx && record.id.slot > slot) {
-          co_return td::Unit{};
-        }
-      }
-      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
-    }
-    co_return td::Status::Error(PSTRING() << "timeout waiting for finalization past slot " << slot
-                                          << " on validator #" << node_idx << "." << instance_idx);
-  }
-
-  td::actor::Task<> wait_for_notarization_of(CandidateId id, double timeout_s) {
-    td::Timestamp deadline = td::Timestamp::in(timeout_s);
-    while (!deadline.is_in_past()) {
-      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
-      for (const auto& record : snapshot.notarizations_observed) {
-        if (record.id == id) {
-          co_return td::Unit{};
-        }
-      }
-      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
-    }
-    co_return td::Status::Error(PSTRING() << "timeout waiting for notarization of " << id);
-  }
-
   td::actor::Task<LeaderWindowObservedTraceRecord> wait_for_leader_window_observed_record_on(size_t node_idx,
                                                                                              size_t instance_idx,
                                                                                              td::uint32 start_slot,
@@ -2870,54 +2832,6 @@ class TestConsensus : public td::actor::Actor {
         .prev_seqno = window.base.has_value() ? static_cast<td::uint32>(window.base->slot + 1) : 0,
         .expected_leader_idx = (window.start_slot / SLOTS_PER_LEADER_WINDOW) % N_NODES,
     };
-  }
-
-  struct BoundaryBase {
-    CandidateId parent_id;
-    BlockSeqno parent_seqno = 0;
-    td::uint32 next_slot = 0;
-    PeerValidatorId next_leader;
-  };
-
-  PeerValidatorId expected_leader_for_slot(td::uint32 slot) const {
-    return PeerValidatorId((int)((slot / SLOTS_PER_LEADER_WINDOW) % N_NODES));
-  }
-
-  td::actor::Task<BoundaryBase> wait_for_boundary_base_with_next_leader_not(size_t node_idx, size_t instance_idx,
-                                                                            size_t forbidden_leader_idx,
-                                                                            double timeout_s) {
-    td::Timestamp deadline = td::Timestamp::in(timeout_s);
-    while (!deadline.is_in_past()) {
-      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
-      std::optional<BoundaryBase> best;
-      for (const auto& record : snapshot.finalizations_observed) {
-        if (record.node_idx != node_idx || record.instance_idx != instance_idx) {
-          continue;
-        }
-        if ((record.id.slot + 1) % SLOTS_PER_LEADER_WINDOW != 0) {
-          continue;
-        }
-        auto next_slot = record.id.slot + 1;
-        auto next_leader = expected_leader_for_slot(next_slot);
-        if (next_leader.value() == forbidden_leader_idx) {
-          continue;
-        }
-        if (!best.has_value() || best->parent_id.slot < record.id.slot) {
-          best = BoundaryBase{
-              .parent_id = record.id,
-              // In this harness, every finalized slot advances the block seqno by exactly one.
-              .parent_seqno = static_cast<BlockSeqno>(record.id.slot + 1),
-              .next_slot = next_slot,
-              .next_leader = next_leader,
-          };
-        }
-      }
-      if (best.has_value()) {
-        co_return *best;
-      }
-      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
-    }
-    co_return td::Status::Error("timeout waiting for a finalized window boundary with a non-target next leader");
   }
 
   bool skip_finalize_for_test_case() const {
