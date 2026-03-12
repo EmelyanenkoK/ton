@@ -55,6 +55,9 @@ class BlockValidatorTest : public td::Test {
       handle_ = {};
       runtime = {};
       mock_own = {};
+
+      co_await ts_.wait_sync_work();
+
       mock_ = nullptr;
       ctx_.reset();
 
@@ -151,6 +154,32 @@ struct RejectsFullCandidates : BlockValidatorTest {
   }
 };
 REGISTER_TEST(BlockValidator, RejectsFullCandidates);
+
+struct CachesAcceptedFullCandidates : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the validator's accepted-candidate cache hook:
+    // once manager validation accepts a full candidate, the validator stores it for later local
+    // reuse instead of only returning the acceptance result.
+    mock_->validate.returns(CandidateAccept{});
+
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto bc = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{0});
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
+    EXPECT(result.has<CandidateAccept>());
+
+    co_await ts_.wait_sync_work();
+
+    ASSERT_EQ(mock_->cached_candidate_ids.size(), static_cast<size_t>(1));
+    EXPECT_EQ(mock_->cached_candidate_ids[0], bc.id);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, CachesAcceptedFullCandidates);
 
 struct WaitsUntilGenUtime : BlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {

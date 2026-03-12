@@ -192,6 +192,7 @@ struct TestBus : consensus::Bus {
 struct MockManagerFacade : ManagerFacade {
   td::actor::MockAsync<ValidateCandidateResult, BlockCandidate, ValidateParams, td::Timestamp> validate;
   td::actor::MockAsync<GeneratedCandidate, CollateParams, td::CancellationToken> collate;
+  std::vector<BlockIdExt> cached_candidate_ids;
 
   td::actor::Task<ValidateCandidateResult> validate_block_candidate(BlockCandidate c, ValidateParams p,
                                                                     td::Timestamp t) override {
@@ -221,6 +222,10 @@ struct MockManagerFacade : ManagerFacade {
 
   td::actor::Task<> store_block_candidate(BlockCandidate) override {
     co_return td::Status::Error("not mocked");
+  }
+
+  void cache_block_candidate(BlockCandidate candidate) override {
+    cached_candidate_ids.push_back(candidate.id);
   }
 };
 
