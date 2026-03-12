@@ -66,6 +66,38 @@ timeout 20s ./build/test/validator/consensus/test-candidate-resolver --filter Ig
   and confirm that the second response actually completes both missing pieces and wakes the bridge
   created in `ResolveCandidate`.
 
+## `simplex::Certificate::from_tl` accepts malformed skip-slot values after signed `int32 -> uint32` wraparound
+
+- Documentation / expectation: the tracker parser row (`Kernel-27`, `Kernel-31` `4c5eda7cb`) says
+  malformed or oversized window-slot values must be rejected instead of being silently reinterpreted.
+- Observed behavior: `SimplexParser_CertificateFromTlRejectsOversizedWindowSlot` is red. A
+  certificate carrying `skipVote(-1)` is accepted and ends up as slot `4294967295` after the
+  signed-to-unsigned cast in the vote parser.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-simplex-parser --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/simplex/votes.cpp` parses `skipVote.slot_` with
+  `static_cast<td::uint32>(vote.slot_)`, and the certificate parser then validates signatures and
+  quorum against that wrapped value instead of rejecting it as malformed input.
+- Probable cause:
+  the TL `int32` slot field is trusted too early. Negative values survive the TL parse and then
+  wrap into large `uint32` slot numbers before any range check runs.
+- What should be fixed:
+  validate `skipVote.slot_ >= 0` when converting from TL to `SkipVote` and return a parse error on
+  negative / out-of-domain slot values before signature or quorum handling continues.
+  Smallest intended production patch shape:
+```diff
+--- a/validator/consensus/simplex/votes.cpp
++++ b/validator/consensus/simplex/votes.cpp
+@@
+ SkipVote SkipVote::from_tl(const tl::skipVote& vote) {
++  CHECK(vote.slot_ >= 0);
+   return {static_cast<td::uint32>(vote.slot_)};
+ }
+```
+
 ## Rule 6 skip-timeout integration scenario is still red in `test-consensus`
 
 - Documentation / expectation: Rule 6 requires skip timeout in window `k` to be derived from the

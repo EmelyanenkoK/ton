@@ -97,3 +97,15 @@ target_link_libraries(test-simplex-consensus PRIVATE
     validator
     td-test-main
 )
+
+add_executable(test-simplex-parser test-simplex-parser.cpp)
+target_link_libraries(test-simplex-parser PRIVATE
+    adnl
+    overlay
+    tdactor
+    tdutils
+    tl_api
+    ton_validator
+    validator
+    td-test-main
+)
