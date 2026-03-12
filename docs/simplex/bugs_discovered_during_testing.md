@@ -38,6 +38,53 @@ timeout 20s ./build/test/validator/consensus/test-pool --filter WaitsForMissingG
   `handle_saved_certificate(SkipCertRef)` and confirm that a request with `parent.slot = 0`,
   `id.slot = 3`, and newly known skips for slots `1` and `2` transitions from pending to resolved.
 
+## `BlockValidator` accepts empty candidates with an unrelated parent link
+
+- Documentation / expectation: tracker `Kernel-23` / `Kernel-30` still expects malformed empty
+  candidates to be rejected rather than accepted as valid chain extensions.
+- Observed behavior: `BlockValidator_RejectsEmptyCandidateWithWrongParentLink` is red. An empty
+  candidate that references the local `BlockIdExt` but carries an unrelated `parent_id` is still
+  accepted.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-block-validator --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/block-validator.cpp` handles empty candidates by comparing only
+  `candidate->block` to `event->state->as_normal()` and never inspects `candidate->parent_id`.
+- Probable cause:
+  empty-candidate structural validation is incomplete at the validator boundary. The actor accepts
+  any empty candidate whose referenced block matches the local state, even if the candidate chain
+  link is inconsistent.
+- What should be fixed:
+  decide which layer owns empty-candidate chain-link validation, then reject inconsistent
+  `parent_id` values before acceptance. If the ownership remains in `BlockValidator`, extend the
+  empty-candidate branch to validate the parent link against the expected chain context instead of
+  checking only `BlockIdExt`.
+
+## `BlockValidator` wakes masterchain child validation on non-final `FinalizeBlock`
+
+- Documentation / expectation: tracker `Kernel-20` / `Kernel-23` expects a masterchain child to
+  wait for true parent finalization, not merely notarization / approve-level progress.
+- Observed behavior: `BlockValidator_RejectsMasterchainCandidateWhoseParentIsOnlyNotarized` is
+  red. Publishing `FinalizeBlock` with a non-final signature set is enough to wake the waiter and
+  let the child validate.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-block-validator --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/block-validator.cpp` handles every `FinalizeBlock` event with
+  `on_new_accepted_block(event->candidate->block_id())` and never checks
+  `event->signatures->is_final()`.
+- Probable cause:
+  the validator assumes every `FinalizeBlock` bus event already represents a locally accepted final
+  block. That makes it vulnerable to premature wake-up if upstream ever emits the event before the
+  signature set is actually final.
+- What should be fixed:
+  either tighten the event contract so non-final `FinalizeBlock` can never reach `BlockValidator`,
+  or add a local `is_final()` guard before advancing `last_accepted_block_` for masterchain waiters.
+
 ## `simplex::Certificate::from_tl` accepts malformed skip-slot values after signed `int32 -> uint32` wraparound
 
 - Documentation / expectation: the tracker parser row (`Kernel-27`, `Kernel-31` `4c5eda7cb`) says

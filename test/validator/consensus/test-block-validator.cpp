@@ -12,16 +12,38 @@
 namespace ton::validator::consensus::test {
 namespace {
 
+using td::actor::count_events;
+using td::actor::events_of;
+
+td::Ref<block::BlockSignatureSet> make_nonfinal_signatures_for(const CandidateRef& candidate,
+                                                               const consensus::Bus& bus) {
+  return block::BlockSignatureSet::create_simplex_approve(
+      {}, bus.cc_seqno, bus.validator_set_hash, bus.session_id, candidate->id.slot,
+      candidate->hash_data().to_tl());
+}
+
 // =============================================================================
 // BlockValidatorTest base class
 // =============================================================================
+
+using MockBus = td::actor::MockBus<consensus::Bus, MisbehaviorReport, TraceEvent>;
+
+struct ValidatorBus : MockBus {
+  using Parent = MockBus;
+  using Events = td::TypeList<>;
+
+  void populate_collator_schedule() override {
+    UNREACHABLE();
+  }
+};
 
 class BlockValidatorTest : public td::Test {
  protected:
   std::unique_ptr<ValidatorSetup> ctx_;
   td::actor::TestScheduler ts_;
   MockManagerFacade* mock_{};
-  td::actor::BusHandle<consensus::Bus> handle_;
+  td::actor::BusHandle<ValidatorBus> handle_;
+  bool stop_requested_{false};
 
   virtual TestOptions options() const {
     return TestOptions{};
@@ -32,25 +54,33 @@ class BlockValidatorTest : public td::Test {
     return *ctx_;
   }
 
+  auto& bus_mock() {
+    return *handle_->actor;
+  }
+
   void run() final {
     ts_.run([this]() -> td::actor::Task<td::Unit> {
       ctx_ = std::make_unique<ValidatorSetup>(options());
+      stop_requested_ = false;
 
       auto mock_own = td::actor::create_actor<MockManagerFacade>("mock");
       mock_ = &mock_own.get_actor_unsafe();
 
-      auto bus = std::make_shared<TestBus>();
+      auto bus = std::make_shared<ValidatorBus>();
       ctx().fill(*bus, 0);
       bus->manager = mock_own.get();
 
-      td::actor::Runtime runtime;
+      auto runtime = ValidatorBus::create_runtime();
+      TestFinalizeBlockResponder::register_in(runtime);
       BlockValidator::register_in(runtime);
-      handle_ = runtime.start<consensus::Bus>(std::move(bus));
+      handle_ = runtime.start(std::move(bus));
 
       co_await run_test();
 
-      handle_.publish<StopRequested>();
-      co_await ts_.wait_sync_work();
+      if (!stop_requested_) {
+        handle_.publish<StopRequested>();
+        co_await ts_.wait_sync_work();
+      }
 
       handle_ = {};
       runtime = {};
@@ -63,6 +93,15 @@ class BlockValidatorTest : public td::Test {
 
       co_return td::Unit{};
     });
+  }
+
+  td::actor::Task<td::Unit> request_stop() {
+    if (!stop_requested_) {
+      stop_requested_ = true;
+      handle_.publish<StopRequested>();
+      co_await ts_.wait_sync_work();
+    }
+    co_return {};
   }
 
   virtual td::actor::Task<td::Unit> run_test() = 0;
@@ -115,6 +154,51 @@ struct RejectsEmptyCandidatesWithWrongBlock : BlockValidatorTest {
 };
 REGISTER_TEST(BlockValidator, RejectsEmptyCandidatesWithWrongBlock);
 
+struct RejectsEmptyCandidateWithWrongParentLink : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-23 / Kernel-30 structural empty-candidate validation:
+    // an empty candidate that references the current block but carries an unrelated parent link
+    // should still be rejected instead of being treated as a valid chain extension.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto candidate = td::make_ref<Candidate>(CandidateId{.slot = 1, .hash = bits256_pattern(1701)},
+                                             ParentId{make_candidate_id(77, 1777)}, PeerValidatorId{0},
+                                             state->as_normal().value(), td::BufferSlice());
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
+
+    EXPECT(result.has<CandidateReject>());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, RejectsEmptyCandidateWithWrongParentLink);
+
+struct RejectsEmptyCandidateWithWrongBlockIdExtReference : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-23 / Kernel-30 exact BlockIdExt matching:
+    // empty-candidate validation must reject a referenced block that keeps the same shard/seqno
+    // but changes the root/file hashes.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto expected = state->as_normal().value();
+    auto wrong_block =
+        BlockIdExt{BlockId(ctx().shard(), expected.seqno()), bits256_pattern(1900), bits256_pattern(1901)};
+    auto candidate = make_empty_candidate(wrong_block, PeerValidatorId{0});
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
+
+    EXPECT(result.has<CandidateReject>());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, RejectsEmptyCandidateWithWrongBlockIdExtReference);
+
 struct AcceptsFullCandidates : BlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
     mock_->validate.returns(CandidateAccept{});
@@ -154,6 +238,32 @@ struct RejectsFullCandidates : BlockValidatorTest {
   }
 };
 REGISTER_TEST(BlockValidator, RejectsFullCandidates);
+
+struct RejectsCandidateFromWrongLeader : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-23 / Kernel-30 at the validator boundary:
+    // CandidateReceived already guarantees a leader-valid signature upstream, so if
+    // validate_block_candidate rejects a candidate as coming from the wrong leader, BlockValidator
+    // must propagate that rejection without caching or emitting misbehavior side effects.
+    mock_->validate.returns(CandidateReject{.reason = "wrong leader", .proof = td::BufferSlice()});
+
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto bc = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{1});
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
+
+    EXPECT(result.has<CandidateReject>());
+    EXPECT_EQ(result.get<CandidateReject>().reason, "wrong leader");
+    EXPECT_EQ(mock_->cached_candidate_ids.size(), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<MisbehaviorReport>(bus_mock().events_), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, RejectsCandidateFromWrongLeader);
 
 struct CachesAcceptedFullCandidates : BlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
@@ -233,6 +343,68 @@ struct WaitsUntilGenUtime : BlockValidatorTest {
   }
 };
 REGISTER_TEST(BlockValidator, WaitsUntilGenUtime);
+
+struct RejectsRunValidateFailureWithoutVoteOrMisbehavior : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-23 rejection side effects:
+    // if run_validate_query rejects the block, BlockValidator must return the rejection as-is and
+    // must not cache the candidate or emit MisbehaviorReport on its own.
+    mock_->validate.returns(CandidateReject{.reason = "validate query failed", .proof = td::BufferSlice("proof")});
+
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto bc = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{0});
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
+
+    EXPECT(result.has<CandidateReject>());
+    EXPECT_EQ(result.get<CandidateReject>().reason, "validate query failed");
+    EXPECT_EQ(mock_->cached_candidate_ids.size(), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<MisbehaviorReport>(bus_mock().events_), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, RejectsRunValidateFailureWithoutVoteOrMisbehavior);
+
+struct StoppingDuringValidationDoesNotReportMisbehavior : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-23 / Kernel-30 shutdown-mid-validation behavior:
+    // stopping the validator while a full-candidate validation is in flight must cancel the work
+    // without turning shutdown into a local misbehavior report or a cached candidate.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto pending_validate = mock_->validate.expect();
+
+    auto bc = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{0});
+    auto task = handle_.publish<ValidationRequest>(state, candidate).start();
+
+    co_await ts_.wait_sync_work();
+    EXPECT(!task.await_ready());
+
+    auto pending_call = co_await std::move(pending_validate);
+
+    co_await request_stop();
+
+    pending_call.respond.set_value(CandidateAccept{});
+    for (int i = 0; i < 10 && !task.await_ready(); ++i) {
+      co_await ts_.wait_sync_work();
+    }
+
+    EXPECT(task.await_ready());
+    auto result = co_await std::move(task).wrap();
+    ASSERT_TRUE(result.is_error());
+    EXPECT_EQ(mock_->cached_candidate_ids.size(), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<MisbehaviorReport>(bus_mock().events_), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, StoppingDuringValidationDoesNotReportMisbehavior);
 
 struct AcceptsMasterchainEmptyCandidatesWithoutWaiting : MasterchainBlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
@@ -362,6 +534,47 @@ struct RejectsStaleMasterchainCandidates : MasterchainBlockValidatorTest {
   }
 };
 REGISTER_TEST(BlockValidator, RejectsStaleMasterchainCandidates);
+
+struct RejectsMasterchainCandidateWhoseParentIsOnlyNotarized : MasterchainBlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-20 / Kernel-23 at the validator boundary:
+    // only a truly accepted/finalized previous masterchain block may unlock child validation; a
+    // parent that is merely notarized/approved must not wake the waiter.
+    mock_->validate.returns(CandidateAccept{});
+
+    auto accepted_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    handle_.publish<Start>(accepted_state);
+
+    auto child_block = make_block_candidate(ctx().shard(), 3);
+    auto child_candidate = make_full_candidate(child_block, PeerValidatorId{0});
+    auto task = handle_.publish<ValidationRequest>(state, child_candidate).start();
+
+    co_await ts_.wait_sync_work();
+    EXPECT(!task.await_ready());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    auto parent_candidate =
+        td::make_ref<Candidate>(CandidateId{.slot = 1, .hash = bits256_pattern(2601)}, ParentId{make_candidate_id(0, 2600)},
+                                PeerValidatorId{1}, state->as_normal().value(), td::BufferSlice());
+    auto approve_signatures = make_nonfinal_signatures_for(parent_candidate, *handle_.operator->());
+    co_await handle_.publish<FinalizeBlock>(parent_candidate, approve_signatures);
+    co_await ts_.wait_sync_work();
+
+    EXPECT(!task.await_ready());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    handle_.publish<BlockFinalizedInMasterchain>(state->as_normal().value());
+    co_await ts_.wait_sync_work();
+
+    auto result = co_await std::move(task);
+    EXPECT(result.has<CandidateAccept>());
+    EXPECT_EQ(mock_->validate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, RejectsMasterchainCandidateWhoseParentIsOnlyNotarized);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
