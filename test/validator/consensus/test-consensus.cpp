@@ -70,6 +70,7 @@ enum class TestCase {
   NoSkipFinalConflict,
   CertificateRequiresQuorum,
   CertificateRebroadcast,
+  FinalRequiresObservedNotar,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -90,6 +91,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "certificate-rebroadcast") {
     return TestCase::CertificateRebroadcast;
+  }
+  if (s == "final-requires-observed-notar") {
+    return TestCase::FinalRequiresObservedNotar;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -419,6 +423,44 @@ td::Status verify_certificate_rebroadcast(const TraceSnapshot& snapshot) {
   return td::Status::Error("no certificate was broadcast by more than one validator");
 }
 
+td::Status verify_finalize_requires_observed_notar(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 5(2):
+  // an honest validator may vote Final(s, h) only after it can prove Notar(s, h) is reached.
+  std::map<std::tuple<size_t, size_t, CandidateId>, double> first_notarization_observed_ts;
+  for (const auto& record : snapshot.notarizations_observed) {
+    auto key = std::make_tuple(record.node_idx, record.instance_idx, record.id);
+    auto [it, inserted] = first_notarization_observed_ts.emplace(key, record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+  }
+
+  bool saw_final_vote = false;
+  for (const auto& record : snapshot.protocol_votes) {
+    auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote);
+    if (final == nullptr) {
+      continue;
+    }
+    saw_final_vote = true;
+    auto key = std::make_tuple(record.src_node_idx, record.src_instance_idx, final->id);
+    auto it = first_notarization_observed_ts.find(key);
+    if (it == first_notarization_observed_ts.end()) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx << "." << record.src_instance_idx
+                                         << " sent Final without observing notarization for " << final->id);
+    }
+    if (it->second > record.ts + 1e-9) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx << "." << record.src_instance_idx
+                                         << " sent Final before observing notarization for " << final->id
+                                         << ": notar_ts=" << it->second << ", final_ts=" << record.ts);
+    }
+  }
+
+  if (!saw_final_vote) {
+    return td::Status::Error("scenario did not produce any Final votes");
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -433,6 +475,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_certificate_requires_quorum(snapshot);
     case TestCase::CertificateRebroadcast:
       return verify_certificate_rebroadcast(snapshot);
+    case TestCase::FinalRequiresObservedNotar:
+      return verify_finalize_requires_observed_notar(snapshot);
   }
   UNREACHABLE();
 }
