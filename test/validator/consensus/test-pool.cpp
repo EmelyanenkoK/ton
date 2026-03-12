@@ -175,5 +175,40 @@ struct ResolvesWaitForParentFromBootstrapProofs : PoolTest {
 };
 REGISTER_TEST(Pool, ResolvesWaitForParentFromBootstrapProofs);
 
+struct AnnouncesNextLeaderWindowWithBootstrapBase : PoolTest {
+  CandidateId base_id_ = make_candidate_id(0, 4000);
+
+  TestOptions options() const override {
+    auto opts = PoolTest::options();
+    opts.slots_per_leader_window = 2;
+    return opts;
+  }
+
+  void configure_bus(PoolBus& bus) override {
+    // Covers simplex_docs.md Rule 1 and Rule 3:
+    // once notarization and skips clear the frontier, the next announced leader window must carry
+    // the latest available base through the skipped range.
+    auto notar = make_simplex_certificate(ctx(), bus, simplex::NotarizeVote{base_id_}, {0, 1, 2});
+    auto skip = make_simplex_certificate(ctx(), bus, simplex::SkipVote{1}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(notar.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(skip.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto observed = events_of<simplex::LeaderWindowObserved>(events());
+    ASSERT_EQ(observed.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observed[0]->start_slot, static_cast<td::uint32>(2));
+    EXPECT_EQ(observed[0]->base, ParentId{base_id_});
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, AnnouncesNextLeaderWindowWithBootstrapBase);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
