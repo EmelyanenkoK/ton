@@ -180,6 +180,31 @@ struct WaitsUntilGenUtime : BlockValidatorTest {
 };
 REGISTER_TEST(BlockValidator, WaitsUntilGenUtime);
 
+struct AcceptsMasterchainEmptyCandidatesWithoutWaiting : MasterchainBlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Supports simplex_docs.md §4.4:
+    // empty masterchain candidates participate in validation through the ordinary empty-candidate
+    // path and must not be blocked on the full-candidate wait for the previous accepted block.
+    auto accepted_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    handle_.publish<Start>(accepted_state);
+
+    auto candidate = make_empty_candidate(state->as_normal().value(), PeerValidatorId{0});
+    auto task = handle_.publish<ValidationRequest>(state, candidate).start();
+
+    co_await ts_.wait_sync_work();
+
+    EXPECT(task.await_ready());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    auto result = co_await std::move(task);
+    EXPECT(result.has<CandidateAccept>());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, AcceptsMasterchainEmptyCandidatesWithoutWaiting);
+
 struct WaitsForPreviousMasterchainBlockBeforeValidating : MasterchainBlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
     // Supports the masterchain finalization dependency described in simplex_docs.md §4.4 case 2:
