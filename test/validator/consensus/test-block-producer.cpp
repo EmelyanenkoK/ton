@@ -237,5 +237,38 @@ struct GeneratesEmptyMasterchainCandidatesWhenConsensusFinalityLags : BlockProdu
 };
 REGISTER_TEST(BlockProducer, GeneratesEmptyMasterchainCandidatesWhenConsensusFinalityLags);
 
+struct GeneratesEmptyShardchainCandidatesWhenMasterchainFinalityLags : BlockProducerTest {
+  TestOptions options() const override {
+    return TestOptions{};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md §4.4, case 1:
+    // a shardchain leader generates an empty candidate when the last masterchain finalized seqno
+    // lags by more than 8 blocks behind the shardchain tip.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto ahead_state = make_normal_state(ctx().shard(), 9, min_mc_block_id);
+    auto parent = CandidateId{.slot = 88, .hash = bits256_pattern(880)};
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{parent}, ahead_state, 0, 4, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    auto candidate = generated[0]->candidate;
+    EXPECT(candidate->is_empty());
+    EXPECT_EQ(candidate->parent_id, ParentId{parent});
+    EXPECT_EQ(candidate->block_id(), ahead_state->assert_normal());
+    EXPECT_EQ(mock_->collate.call_count(), 0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, GeneratesEmptyShardchainCandidatesWhenMasterchainFinalityLags);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
