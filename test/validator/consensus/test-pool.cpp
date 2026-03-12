@@ -210,5 +210,33 @@ struct AnnouncesNextLeaderWindowWithBootstrapBase : PoolTest {
 };
 REGISTER_TEST(Pool, AnnouncesNextLeaderWindowWithBootstrapBase);
 
+struct RejectsCandidateWhoseParentFallsBeforeFinalizedFrontier : PoolTest {
+  CandidateId finalized_id_ = make_candidate_id(2, 5002);
+
+  void configure_bus(PoolBus& bus) override {
+    auto final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{finalized_id_}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(final.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 4 negative gating:
+    // if a candidate's parent would place its chain behind the finalized frontier, WaitForParent
+    // must reject it as conflicting instead of letting notarization proceed.
+    auto state = make_normal_state(ctx().shard(), 3, min_mc_block_id);
+    auto candidate = make_wait_candidate(make_candidate_id(4, 5004), ParentId{make_candidate_id(1, 5001)});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto result = co_await handle_.publish<simplex::WaitForParent>(candidate).wrap();
+    ASSERT_TRUE(result.is_ok());
+    ASSERT_TRUE(result.ok().has_value());
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, RejectsCandidateWhoseParentFallsBeforeFinalizedFrontier);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
