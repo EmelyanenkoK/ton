@@ -149,6 +149,19 @@ honest finalized outputs remain prefix-related and never rewind.
 Implemented by:
 `delayed-finalization-observation-preserves-prefix`
 
+### B5. Adjacent-window rollback after late alternate finalization
+
+Condition:
+an adjacent single-slot fork is both notarized and skipped, then later honest finalization picks the
+other branch.
+
+Checks:
+the fork collapses after the later finalization and honest validators do not emit late `Final`
+votes for the forked branch afterwards.
+
+Implemented by:
+`adjacent-window-fork-rolls-back-after-late-alternate-finalization`
+
 ## C. Liveness and Recovery Cases
 
 ### C1. Silent malicious leader
@@ -219,6 +232,31 @@ Implemented by:
 Implemented by:
 `duplicate-instance-same-key-split-brain-still-progresses`
 
+### C15. Several fully skipped windows, then progress
+
+Condition:
+three consecutive silent leaders with total adversarial weight still below `W / 3` force several
+whole windows to clear by `Skip`.
+
+Checks:
+a consecutive run of skipped slots is observed and later honest finalization resumes past it.
+
+Implemented by:
+`several-windows-fully-skipped-then-progress-resumes`
+
+### C16. Standstill recovery requires certificate rebroadcast
+
+Condition:
+one validator misses ordinary certificate traffic for a slot and only receives the missing proofs
+after standstill-era rebroadcast resumes.
+
+Checks:
+the lagging validator does not catch up early, then catches up only after rebroadcast is allowed
+through again.
+
+Implemented by:
+`standstill-without-certificate-rebroadcast-requires-recovery`
+
 ## D. TON-Specific Implementation / Regression Cases
 
 ### D1. Multi-slot equivocation inside one leader window
@@ -276,6 +314,19 @@ Implemented by:
 
 Implemented by:
 `empty-candidates-with-silent-validator-still-finalize`
+
+### D9. Good candidate with wrong slot-parent hash
+
+Condition:
+an otherwise well-formed full candidate is injected with a parent id whose slot/hash chain cannot
+be valid for the attacked slot.
+
+Checks:
+honest validators do not notarize it, the attacked slot clears by `Skip`, and later honest
+finalization resumes.
+
+Implemented by:
+`good-candidate-with-wrong-slot-parent-hash-does-not-resolve`
 
 ## Core Regression Subset
 

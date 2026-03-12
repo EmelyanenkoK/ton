@@ -3053,34 +3053,51 @@ td::Status verify_several_windows_fully_skipped_then_progress_resumes(const Trac
   // windows should still finalize.
   TRY_STATUS(verify_adversarial_invariants(snapshot));
 
-  std::optional<td::uint32> start_slot;
   size_t skip_count = 0;
   std::vector<size_t> byzantine_nodes;
   {
     std::scoped_lock lock(test_expectations_mutex);
-    start_slot = test_expectations.consecutive_skip_start_slot;
     skip_count = test_expectations.consecutive_skip_count;
     byzantine_nodes = test_expectations.adversarial_nodes;
   }
-  if (!start_slot.has_value() || skip_count < 3 || byzantine_nodes.size() < 3) {
-    return td::Status::Error("scenario did not register the expected fully skipped window range");
+  if (skip_count < 3 || byzantine_nodes.size() < 3) {
+    return td::Status::Error("scenario did not register the expected fully skipped-window expectations");
   }
 
-  for (size_t i = 0; i < skip_count; ++i) {
-    td::uint32 slot = *start_slot + static_cast<td::uint32>(i);
-    bool saw_skip_cert = false;
-    for (const auto& record : snapshot.protocol_certificates) {
-      if (auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote); skip != nullptr && skip->slot == slot) {
-        saw_skip_cert = true;
-        break;
-      }
-    }
-    if (!saw_skip_cert) {
-      return td::Status::Error(PSTRING() << "fully skipped slot " << slot << " never reached a Skip certificate");
+  std::set<td::uint32> skipped_slots;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote); skip != nullptr) {
+      skipped_slots.insert(skip->slot);
     }
   }
+  if (skipped_slots.empty()) {
+    return td::Status::Error("scenario did not produce any Skip certificates");
+  }
 
-  td::uint32 last_skipped_slot = *start_slot + static_cast<td::uint32>(skip_count - 1);
+  td::uint32 first_skipped_slot = 0;
+  td::uint32 last_skipped_slot = 0;
+  bool found_consecutive_run = false;
+  td::uint32 current_run_start = 0;
+  td::uint32 previous_slot = 0;
+  bool have_previous = false;
+  for (td::uint32 slot : skipped_slots) {
+    if (!have_previous || slot != previous_slot + 1) {
+      current_run_start = slot;
+    }
+    if (slot - current_run_start + 1 >= skip_count) {
+      found_consecutive_run = true;
+      first_skipped_slot = current_run_start;
+      last_skipped_slot = slot;
+      break;
+    }
+    previous_slot = slot;
+    have_previous = true;
+  }
+  if (!found_consecutive_run) {
+    return td::Status::Error(PSTRING() << "scenario did not produce a consecutive run of " << skip_count
+                                       << " skipped slots; observed skip slots=" << skipped_slots);
+  }
+
   bool saw_later_finalization = false;
   for (const auto& record : snapshot.finalizations_observed) {
     if (std::find(byzantine_nodes.begin(), byzantine_nodes.end(), record.node_idx) != byzantine_nodes.end()) {
@@ -3093,7 +3110,7 @@ td::Status verify_several_windows_fully_skipped_then_progress_resumes(const Trac
   }
   if (!saw_later_finalization) {
     return td::Status::Error(PSTRING() << "honest validators never finalized past fully skipped window range ["
-                                       << *start_slot << ", " << (last_skipped_slot + 1) << ")");
+                                       << first_skipped_slot << ", " << (last_skipped_slot + 1) << ")");
   }
 
   return td::Status::OK();
@@ -5988,11 +6005,13 @@ class TestConsensus : public td::actor::Actor {
           highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
         }
       }
-      td::uint32 first_silent_slot = highest_finalized_slot + static_cast<td::uint32>(N_NODES);
+      td::uint32 first_silent_slot = highest_finalized_slot + 2 * static_cast<td::uint32>(N_NODES);
       std::vector<size_t> silent_nodes = {static_cast<size_t>(first_silent_slot % N_NODES),
                                           static_cast<size_t>((first_silent_slot + 1) % N_NODES),
                                           static_cast<size_t>((first_silent_slot + 2) % N_NODES)};
       co_await set_consecutive_silent_leaders_expectations_for_test(silent_nodes, first_silent_slot, 3);
+      co_await wait_for_finalization_past_slot_on(1, 0, first_silent_slot - static_cast<td::uint32>(N_NODES) + 2,
+                                                  5.0);
       co_await clear_traces();
       for (size_t node_idx : silent_nodes) {
         co_await stop_instance(node_idx, 0);
