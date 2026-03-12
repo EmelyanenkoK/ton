@@ -66,6 +66,7 @@ td::Result<std::pair<T, T>> parse_int_range(td::Slice s) {
 enum class TestCase {
   Smoke,
   NoDoubleNotar,
+  NotarRequiresParentNotar,
   FinalRequiresOwnNotar,
   NoSkipFinalConflict,
   CertificateRequiresQuorum,
@@ -81,6 +82,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "no-double-notar") {
     return TestCase::NoDoubleNotar;
+  }
+  if (s == "notar-requires-parent-notar") {
+    return TestCase::NotarRequiresParentNotar;
   }
   if (s == "final-requires-own-notar") {
     return TestCase::FinalRequiresOwnNotar;
@@ -289,6 +293,82 @@ td::Status verify_no_double_notar(const TraceSnapshot& snapshot) {
                                          << " sent conflicting Notar votes for slot " << notar->id.slot
                                          << ": first=" << it->second << ", later=" << notar->id);
     }
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_notar_requires_parent_notar(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 4(2):
+  // even if a child candidate arrives before its parent is notarized, an honest validator must
+  // not vote Notar for the child until it has observed the parent's notarization certificate.
+  std::map<std::tuple<size_t, size_t, CandidateId>, double> first_candidate_available_ts;
+  std::map<CandidateId, ParentId> parent_by_candidate;
+  for (const auto& record : snapshot.candidates_generated) {
+    auto key = std::make_tuple(record.node_idx, record.instance_idx, record.candidate_id);
+    auto [it, inserted] = first_candidate_available_ts.emplace(key, record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+    parent_by_candidate.emplace(record.candidate_id, record.parent_id);
+  }
+  for (const auto& record : snapshot.candidate_deliveries) {
+    auto key = std::make_tuple(record.dst_node_idx, record.dst_instance_idx, record.candidate_id);
+    auto [it, inserted] = first_candidate_available_ts.emplace(key, record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+    parent_by_candidate.emplace(record.candidate_id, record.parent_id);
+  }
+
+  std::map<std::tuple<size_t, size_t, CandidateId>, double> first_parent_notar_ts;
+  for (const auto& record : snapshot.notarizations_observed) {
+    auto key = std::make_tuple(record.node_idx, record.instance_idx, record.id);
+    auto [it, inserted] = first_parent_notar_ts.emplace(key, record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+  }
+
+  bool saw_candidate_before_parent_notar = false;
+  bool saw_checked_child_vote = false;
+  for (const auto& record : snapshot.protocol_votes) {
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (notar == nullptr) {
+      continue;
+    }
+    auto parent_it = parent_by_candidate.find(notar->id);
+    if (parent_it == parent_by_candidate.end() || !parent_it->second.has_value()) {
+      continue;
+    }
+    saw_checked_child_vote = true;
+    CandidateId parent_id = *parent_it->second;
+    auto parent_key = std::make_tuple(record.src_node_idx, record.src_instance_idx, parent_id);
+    auto notar_it = first_parent_notar_ts.find(parent_key);
+    if (notar_it == first_parent_notar_ts.end()) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx << "." << record.src_instance_idx
+                                         << " voted Notar for child " << notar->id
+                                         << " without observing parent notarization for " << parent_id);
+    }
+    if (notar_it->second > record.ts + 1e-9) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx << "." << record.src_instance_idx
+                                         << " voted Notar for child " << notar->id
+                                         << " before observing parent notarization for " << parent_id
+                                         << ": parent_notar_ts=" << notar_it->second
+                                         << ", child_notar_ts=" << record.ts);
+    }
+
+    auto availability_key = std::make_tuple(record.src_node_idx, record.src_instance_idx, notar->id);
+    auto available_it = first_candidate_available_ts.find(availability_key);
+    if (available_it != first_candidate_available_ts.end() && available_it->second < notar_it->second - 1e-9) {
+      saw_candidate_before_parent_notar = true;
+    }
+  }
+
+  if (!saw_checked_child_vote) {
+    return td::Status::Error("scenario did not produce any child-candidate Notar votes");
+  }
+  if (!saw_candidate_before_parent_notar) {
+    return td::Status::Error("scenario did not deliver any child candidate before its parent notarization");
   }
   return td::Status::OK();
 }
@@ -516,6 +596,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return td::Status::OK();
     case TestCase::NoDoubleNotar:
       return verify_no_double_notar(snapshot);
+    case TestCase::NotarRequiresParentNotar:
+      return verify_notar_requires_parent_notar(snapshot);
     case TestCase::FinalRequiresOwnNotar:
       return verify_finalize_requires_own_notar(snapshot);
     case TestCase::NoSkipFinalConflict:
@@ -1583,7 +1665,33 @@ class TestConsensus : public td::actor::Actor {
   }
 
  private:
+  void apply_test_case_defaults() {
+    if (TEST_CASE == TestCase::NotarRequiresParentNotar) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 3.0;
+      }
+      if (NET_PING == std::pair<double, double>{0.05, 0.1}) {
+        NET_PING = {0.25, 0.3};
+      }
+    }
+  }
+
+  td::actor::Task<> run_test_case_scenario() {
+    co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+    if (TEST_CASE == TestCase::NotarRequiresParentNotar) {
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
+    }
+    co_return td::Unit{};
+  }
+
   td::actor::Task<> run_inner() {
+    apply_test_case_defaults();
     keyring_ = keyring::Keyring::create("");
 
     for (size_t i = 0; i < N_NODES; ++i) {
@@ -1646,7 +1754,7 @@ class TestConsensus : public td::actor::Actor {
       run_net_gremlin().start().detach();
     }
 
-    co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+    co_await run_test_case_scenario();
 
     co_return co_await finalize();
   }
