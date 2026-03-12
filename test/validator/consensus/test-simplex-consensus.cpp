@@ -382,5 +382,37 @@ struct SkipPreventsLaterFinalizeForSameSlot : SimplexConsensusTest {
 };
 REGISTER_TEST(SimplexConsensus, SkipPreventsLaterFinalizeForSameSlot);
 
+struct FinalizationPrunesOldSlotsAndSuppressesLateMessages : SimplexConsensusTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 4 and Rule 5 negative behavior:
+    // once a later slot is finalized, late candidate and notarization events for older slots must
+    // be ignored instead of restarting parent proofing, validation, or local voting.
+    auto finalized_id = make_candidate_id(3, 4203);
+    auto late_candidate = make_wait_candidate(make_candidate_id(2, 4202), ParentId{make_candidate_id(1, 4201)},
+                                              PeerValidatorId{1});
+
+    ConsensusBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 0);
+    auto final_cert = make_simplex_certificate(ctx(), seed_bus, simplex::FinalizeVote{finalized_id}, {0, 1});
+    auto late_notar = make_simplex_certificate(ctx(), seed_bus, simplex::NotarizeVote{late_candidate->id}, {0, 1});
+
+    handle_.publish<simplex::FinalizationObserved>(finalized_id, final_cert);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<CandidateReceived>(late_candidate);
+    handle_.publish<simplex::NotarizationObserved>(late_candidate->id, late_notar);
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(observer().wait_for_parent_candidate_ids_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().resolve_state_requests_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().stored_candidate_ids_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().validation_candidate_ids_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().broadcast_votes_.size(), static_cast<size_t>(0));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexConsensus, FinalizationPrunesOldSlotsAndSuppressesLateMessages);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
