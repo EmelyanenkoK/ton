@@ -110,6 +110,7 @@ enum class TestCase {
   StandstillFloodStillRecovers,
   SeveralWindowsFullySkippedThenProgressResumes,
   AdjacentWindowForkRollsBackAfterLateAlternateFinalization,
+  RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates,
   StandstillWithoutCertificateRebroadcastRequiresRecovery,
   GoodCandidateWithWrongSlotParentHashDoesNotResolve,
 };
@@ -243,6 +244,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "adjacent-window-fork-rolls-back-after-late-alternate-finalization") {
     return TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization;
+  }
+  if (s == "restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates") {
+    return TestCase::RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates;
   }
   if (s == "standstill-without-certificate-rebroadcast-requires-recovery") {
     return TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery;
@@ -394,6 +398,7 @@ struct TestExpectations {
   std::optional<td::uint32> standstill_recovery_slot;
   std::optional<double> standstill_recovery_release_ts;
   std::optional<CandidateId> wrong_parent_hash_candidate_id;
+  std::optional<td::uint32> restart_reaccept_stop_slot;
 };
 
 std::mutex test_expectations_mutex;
@@ -636,6 +641,8 @@ std::set<size_t> adversarial_nodes() {
       return {3, 4, 5};
     case TestCase::StandstillFloodStillRecovers:
       return {1};
+    case TestCase::RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates:
+      return {0};
     default:
       return {};
   }
@@ -3168,6 +3175,106 @@ td::Status verify_adjacent_window_fork_rolls_back_after_late_alternate_finalizat
   return td::Status::OK();
 }
 
+td::Status verify_restart_after_eight_non_mc_finalized_blocks_reaccepts_pending_candidates(
+    const TraceSnapshot& snapshot) {
+  // Covers Kernel-28's restart/reaccept regression:
+  // once shardchain production crosses the eight-block non-MC-finalized threshold and switches to
+  // empty candidates, a restarted validator must still reaccept the missing pending block chain.
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> stop_slot;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    stop_slot = test_expectations.restart_reaccept_stop_slot;
+  }
+  if (!stop_slot.has_value()) {
+    return td::Status::Error("scenario did not register the restart/reaccept stop slot");
+  }
+
+  double restart_ts = std::numeric_limits<double>::infinity();
+  for (const auto& record : snapshot.lifecycle) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.started) {
+      restart_ts = std::min(restart_ts, record.ts);
+    }
+  }
+  if (!std::isfinite(restart_ts)) {
+    return td::Status::Error("scenario never restarted validator #0.0");
+  }
+
+  std::set<CandidateId> empty_candidates;
+  for (const auto& record : snapshot.candidates_generated) {
+    if (record.is_empty && record.candidate_id.slot > *stop_slot) {
+      empty_candidates.insert(record.candidate_id);
+    }
+  }
+  for (const auto& record : snapshot.candidate_deliveries) {
+    if (record.is_empty && record.candidate_id.slot > *stop_slot) {
+      empty_candidates.insert(record.candidate_id);
+    }
+  }
+
+  double first_empty_finalization_ts = std::numeric_limits<double>::infinity();
+  td::uint32 first_empty_slot = 0;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (!empty_candidates.contains(record.id)) {
+      continue;
+    }
+    if (record.ts < first_empty_finalization_ts) {
+      first_empty_finalization_ts = record.ts;
+      first_empty_slot = record.id.slot;
+    }
+  }
+  if (!std::isfinite(first_empty_finalization_ts)) {
+    td::uint32 highest_accepted_seqno = 0;
+    for (const auto& record : snapshot.accepted_blocks) {
+      highest_accepted_seqno = std::max(highest_accepted_seqno, record.block_id.seqno());
+    }
+    return td::Status::Error(PSTRING() << "scenario never reached empty-candidate finalization after validator #0.0 "
+                                       << "fell behind; highest accepted shard block seqno observed was "
+                                       << highest_accepted_seqno);
+  }
+
+  std::map<td::uint32, double> accepted_ts_by_seqno;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx != 0 || record.instance_idx != 0 || record.ts <= restart_ts + 1e-9) {
+      continue;
+    }
+    auto [it, inserted] = accepted_ts_by_seqno.emplace(record.block_id.seqno(), record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+  }
+
+  bool saw_accept_after_empty = false;
+  for (td::uint32 seqno = *stop_slot + 1; seqno <= *stop_slot + 8; ++seqno) {
+    auto it = accepted_ts_by_seqno.find(seqno);
+    if (it == accepted_ts_by_seqno.end()) {
+      return td::Status::Error(PSTRING() << "restarted validator #0.0 never reaccepted pending shard block seqno "
+                                         << seqno);
+    }
+    if (it->second > first_empty_finalization_ts + 1e-9) {
+      saw_accept_after_empty = true;
+    }
+  }
+  if (!saw_accept_after_empty) {
+    return td::Status::Error("restarted validator #0.0 reaccepted blocks only before any empty slot finalized");
+  }
+
+  bool saw_node0_catchup_finalization = false;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > first_empty_finalization_ts + 1e-9 &&
+        record.id.slot >= first_empty_slot) {
+      saw_node0_catchup_finalization = true;
+      break;
+    }
+  }
+  if (!saw_node0_catchup_finalization) {
+    return td::Status::Error("restarted validator #0.0 never observed finalization after the empty-slot catch-up point");
+  }
+
+  return td::Status::OK();
+}
+
 td::Status verify_standstill_without_certificate_rebroadcast_requires_recovery(const TraceSnapshot& snapshot) {
   // Covers Kernel-28's explicit "no cert rebroadcast => standstill recovery required" regression:
   // if one validator misses normal certificate traffic for a slot, it should only catch up after
@@ -3387,6 +3494,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_several_windows_fully_skipped_then_progress_resumes(snapshot);
     case TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization:
       return verify_adjacent_window_fork_rolls_back_after_late_alternate_finalization(snapshot);
+    case TestCase::RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates:
+      return verify_restart_after_eight_non_mc_finalized_blocks_reaccepts_pending_candidates(snapshot);
     case TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery:
       return verify_standstill_without_certificate_rebroadcast_requires_recovery(snapshot);
     case TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve:
@@ -5454,7 +5563,7 @@ class TestConsensus : public td::actor::Actor {
         SLOTS_PER_LEADER_WINDOW = 1;
       }
       if (DURATION == 60.0) {
-        DURATION = 6.0;
+        DURATION = 7.0;
       }
     }
     if (TEST_CASE == TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization) {
@@ -5469,6 +5578,20 @@ class TestConsensus : public td::actor::Actor {
       }
       if (DURATION == 60.0) {
         DURATION = 4.0;
+      }
+    }
+    if (TEST_CASE == TestCase::RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates) {
+      if (N_NODES == 8) {
+        N_NODES = 10;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 6.0;
       }
     }
     if (TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery) {
@@ -5610,6 +5733,22 @@ class TestConsensus : public td::actor::Actor {
       co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
     }
     co_return td::Status::Error(PSTRING() << "timeout waiting for finalization past slot " << slot
+                                          << " on validator #" << node_idx << "." << instance_idx);
+  }
+
+  td::actor::Task<> wait_for_accepted_block_seqno_on(size_t node_idx, size_t instance_idx, td::uint32 seqno,
+                                                     double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      for (const auto& record : snapshot.accepted_blocks) {
+        if (record.node_idx == node_idx && record.instance_idx == instance_idx && record.block_id.seqno() >= seqno) {
+          co_return td::Unit{};
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for accepted block seqno >= " << seqno
                                           << " on validator #" << node_idx << "." << instance_idx);
   }
 
@@ -6039,6 +6178,31 @@ class TestConsensus : public td::actor::Actor {
         co_await set_drop_notar_votes_for_test(dst_node_idx, attacked_slot, attacked_slot + 1);
         co_await set_drop_notar_certs_for_test(dst_node_idx, attacked_slot, attacked_slot + 1);
       }
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates) {
+      // Covers Kernel-28's restart-after-eight-non-MC-finalized-blocks regression:
+      // validator #0 misses eight shardchain blocks while peers keep finalizing, then restarts just
+      // before empty-candidate mode and must reaccept the pending full-block chain once empties land.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+        }
+      }
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.restart_reaccept_stop_slot = highest_finalized_slot;
+      }
+
+      co_await stop_instance(0, 0);
+      co_await clear_traces();
+      co_await wait_for_accepted_block_seqno_on(1, 0, highest_finalized_slot + 8, 10.0);
+      co_await set_force_candidate_request_destination_for_test(0, 0, 1);
+      start_instance(0, 0);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }

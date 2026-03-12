@@ -38,6 +38,32 @@ under the current policy. In particular:
   votes remain present after `BroadcastVote` handling. Then trace why `serialize_to(...)` skips the
   local vote for slot 2 even though no certificate exists for that vote.
 
+## Shardchain integration never reaches empty-candidate mode after eight non-MC-finalized blocks
+
+- Documentation / expectation: tracker `Kernel-28` expects shardchain leaders to switch into
+  empty-candidate mode after eight accepted shard blocks that are still not finalized in the
+  masterchain, and a restarted validator should then reaccept the pending block chain.
+- Observed behavior:
+  `restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates` is red in
+  `test-consensus-adversarial.cpp`.
+  The scenario waits until a live validator has accepted eight later shard blocks while validator
+  `#0.0` is down, restarts `#0.0`, and then expects empty-candidate finalization plus catch-up.
+  Instead the run still aborts with:
+  `scenario never reached empty-candidate finalization after validator #0.0 fell behind`.
+- Reproduce:
+```sh
+timeout 80s ./build/test/validator/consensus/test-consensus-adversarial --test-case restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates --verbosity 0
+```
+- Probable cause:
+  either shardchain block production is not switching into the documented empty-candidate mode once
+  the accepted-block lag reaches eight, or the later empty candidates are not making it through the
+  end-to-end notarization/finalization path that the restarted validator depends on for reaccept.
+- What should be fixed:
+  inspect the end-to-end shardchain lag path around `validator/consensus/block-producer.cpp` and
+  the subsequent state-resolution / acceptance flow. Once honest peers have accepted eight
+  non-MC-finalized shard blocks, later leader windows should enter empty-candidate mode and a
+  restarted validator should be able to reaccept the pending chain from that point.
+
 ## `BlockValidator` accepts empty candidates with an unrelated parent link
 
 - Documentation / expectation: tracker `Kernel-23` / `Kernel-30` still expects malformed empty

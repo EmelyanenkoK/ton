@@ -328,6 +328,19 @@ finalization resumes.
 Implemented by:
 `good-candidate-with-wrong-slot-parent-hash-does-not-resolve`
 
+### D10. Restart after eight non-MC-finalized shard blocks
+
+Condition:
+one validator is stopped while peers finalize eight shardchain blocks that are still not finalized
+in the masterchain, so later shard slots switch into empty-candidate mode.
+
+Checks:
+after restart, the lagging validator reaccepts the missing pending full-block chain and later
+observes finalization again once empties begin to land.
+
+Implemented by:
+`restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates`
+
 ## Core Regression Subset
 
 These are the strongest small-set adversarial cases to run first:
