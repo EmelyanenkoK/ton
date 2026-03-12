@@ -69,6 +69,7 @@ enum class TestCase {
   FinalRequiresOwnNotar,
   NoSkipFinalConflict,
   CertificateRequiresQuorum,
+  CertificateRebroadcast,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -86,6 +87,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "certificate-requires-quorum") {
     return TestCase::CertificateRequiresQuorum;
+  }
+  if (s == "certificate-rebroadcast") {
+    return TestCase::CertificateRebroadcast;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -381,6 +385,40 @@ td::Status verify_certificate_requires_quorum(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+std::string certificate_trace_key(const ProtocolCertificateTraceRecord& record) {
+  std::vector<size_t> signers;
+  for (PeerValidatorId signer : record.signers) {
+    signers.push_back(signer.value());
+  }
+  std::sort(signers.begin(), signers.end());
+
+  std::string key = PSTRING() << record.vote;
+  for (size_t signer : signers) {
+    key += PSTRING() << "|" << signer;
+  }
+  return key;
+}
+
+td::Status verify_certificate_rebroadcast(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 7 (certificate rebroadcast):
+  // upon forming or receiving any certificate, a validator broadcasts it.
+  if (snapshot.protocol_certificates.empty()) {
+    return td::Status::Error("scenario did not produce any certificates");
+  }
+
+  std::map<std::string, std::set<size_t>> broadcasters_by_certificate;
+  for (const auto& record : snapshot.protocol_certificates) {
+    broadcasters_by_certificate[certificate_trace_key(record)].insert(record.src_node_idx);
+  }
+
+  for (const auto& [certificate, broadcasters] : broadcasters_by_certificate) {
+    if (broadcasters.size() >= 2) {
+      return td::Status::OK();
+    }
+  }
+  return td::Status::Error("no certificate was broadcast by more than one validator");
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -393,6 +431,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_no_skip_final_conflict(snapshot);
     case TestCase::CertificateRequiresQuorum:
       return verify_certificate_requires_quorum(snapshot);
+    case TestCase::CertificateRebroadcast:
+      return verify_certificate_rebroadcast(snapshot);
   }
   UNREACHABLE();
 }
