@@ -38,6 +38,56 @@ under the current policy. In particular:
   votes remain present after `BroadcastVote` handling. Then trace why `serialize_to(...)` skips the
   local vote for slot 2 even though no certificate exists for that vote.
 
+## `ConsensusImpl` still notarizes a candidate that names the wrong slot leader
+
+- Documentation / expectation: tracker `Kernel-23` / `Kernel-28` expects an otherwise well-formed
+  candidate with the wrong `leader` for the slot to be rejected by the consensus pipeline and to
+  never produce `Notar`.
+- Observed behavior: `wrong-leader-candidate-never-notarizes` is red in `test-consensus.cpp`.
+  Validator `#0.0` still sends `Notar` for a synthetic full candidate whose `leader` field names a
+  different validator than the one assigned to that slot.
+- Reproduce:
+```sh
+timeout 40s ./build/test/validator/consensus/test-consensus --test-case wrong-leader-candidate-never-notarizes --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/simplex/consensus.cpp` stores the candidate in `pending_block`, then only
+  emits a trace event when `candidate->leader != owning_bus()->local_id.idx` before continuing into
+  `try_notarize(...)`. There is no local leader-ownership rejection on the `CandidateReceived`
+  path before `WaitForParent`, validation, and `BroadcastVote(NotarizeVote{...})`.
+- Probable cause:
+  leader mismatch is currently treated as an informational trace condition rather than a consensus
+  validity gate, so a wrong-leader candidate can still pass the rest of the notarization pipeline.
+- What should be fixed:
+  reject or report misbehavior for candidates whose `leader` does not match the expected slot
+  leader before they reach `try_notarize(...)`. The wrong-leader integration regression should stay
+  red until that guard exists in the live pipeline.
+
+## `ConsensusImpl` leaves a rejected candidate stuck as the slot's pending block
+
+- Documentation / expectation: tracker `Kernel-23` expects a validation rejection to leave no
+  residual votes or slot state, so a later replacement candidate for the same slot can still
+  progress normally through notarization.
+- Observed behavior: `validation-reject-does-not-leave-residual-votes` is red in
+  `test-consensus.cpp`. The first candidate is synthetically rejected by validation as intended,
+  but the later replacement candidate for the same slot never produces `Notar`.
+- Reproduce:
+```sh
+timeout 40s ./build/test/validator/consensus/test-consensus --test-case validation-reject-does-not-leave-residual-votes --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/simplex/consensus.cpp` sets `slot->state->pending_block = candidate` before
+  validation starts. When validation returns `CandidateReject`, the actor logs and returns, but it
+  does not clear `pending_block`. A later candidate for the same slot then hits the early
+  `pending_block.has_value()` guard in `CandidateReceived` and is ignored.
+- Probable cause:
+  the slot-level pending-candidate state is mutated before validation is known to have succeeded,
+  and the reject path does not roll that state back.
+- What should be fixed:
+  clear `pending_block` on validation rejection, or delay setting it until the candidate has passed
+  the validation gate. The integration regression should remain red until the replacement
+  candidate can notarize after an earlier reject.
+
 ## Shardchain integration never reaches empty-candidate mode after eight non-MC-finalized blocks
 
 - Documentation / expectation: tracker `Kernel-28` expects shardchain leaders to switch into

@@ -80,6 +80,11 @@ enum class TestCase {
   FinalRequiresObservedNotar,
   LeaderWindowSchedule,
   NoMisbehaviorReports,
+  WrongLeaderCandidateNeverNotarizes,
+  DuplicateCandidateReceivedDoesNotDoubleNotar,
+  ValidationRejectDoesNotLeaveResidualVotes,
+  MasterchainChildWaitsForParentFinalizationBeforeNotar,
+  StateResolutionPreservesExactGenUtime,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -124,6 +129,21 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "no-misbehavior-reports") {
     return TestCase::NoMisbehaviorReports;
+  }
+  if (s == "wrong-leader-candidate-never-notarizes") {
+    return TestCase::WrongLeaderCandidateNeverNotarizes;
+  }
+  if (s == "duplicate-candidate-received-does-not-double-notar") {
+    return TestCase::DuplicateCandidateReceivedDoesNotDoubleNotar;
+  }
+  if (s == "validation-reject-does-not-leave-residual-votes") {
+    return TestCase::ValidationRejectDoesNotLeaveResidualVotes;
+  }
+  if (s == "masterchain-child-waits-for-parent-finalization-before-notar") {
+    return TestCase::MasterchainChildWaitsForParentFinalizationBeforeNotar;
+  }
+  if (s == "state-resolution-preserves-exact-gen-utime") {
+    return TestCase::StateResolutionPreservesExactGenUtime;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -199,6 +219,13 @@ struct TestExpectations {
   std::optional<CandidateId> candidate_resolution_target;
   std::optional<td::uint32> skip_timeout_last_finalized_window;
   std::optional<td::uint32> skip_timeout_stalled_window;
+  std::optional<CandidateId> wrong_leader_candidate_id;
+  std::optional<CandidateId> duplicate_candidate_id;
+  std::optional<CandidateId> validation_reject_candidate_id;
+  std::optional<CandidateId> validation_replacement_candidate_id;
+  std::optional<BlockIdExt> validation_reject_block_id;
+  std::optional<CandidateId> masterchain_parent_candidate_id;
+  std::optional<CandidateId> masterchain_child_candidate_id;
 };
 
 std::mutex test_expectations_mutex;
@@ -908,6 +935,250 @@ td::Status verify_no_misbehavior_reports(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_wrong_leader_candidate_never_notarizes(const TraceSnapshot& snapshot) {
+  // Covers Kernel-23 / Kernel-28's wrong-leader regression:
+  // an otherwise well-formed candidate injected under the wrong leader id must never produce Notar.
+  std::optional<CandidateId> attacked_id;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    attacked_id = test_expectations.wrong_leader_candidate_id;
+  }
+  if (!attacked_id.has_value()) {
+    return td::Status::Error("wrong-leader scenario did not register the attacked candidate id");
+  }
+
+  bool delivered = false;
+  for (const auto& record : snapshot.candidate_deliveries) {
+    if (record.dst_node_idx == 0 && record.dst_instance_idx == 0 && record.candidate_id == *attacked_id) {
+      delivered = true;
+      break;
+    }
+  }
+  if (!delivered) {
+    return td::Status::Error(PSTRING() << "wrong-leader candidate " << *attacked_id
+                                       << " was never delivered to validator #0.0");
+  }
+
+  for (const auto& record : snapshot.protocol_votes) {
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (record.src_node_idx == 0 && record.src_instance_idx == 0 && notar != nullptr && notar->id == *attacked_id) {
+      return td::Status::Error(PSTRING() << "validator #0.0 sent Notar for wrong-leader candidate " << *attacked_id);
+    }
+  }
+  for (const auto& record : snapshot.protocol_certificates) {
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (notar != nullptr && notar->id == *attacked_id) {
+      return td::Status::Error(PSTRING() << "wrong-leader candidate " << *attacked_id
+                                         << " still produced a notarization certificate");
+    }
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_duplicate_candidate_received_does_not_double_notar(const TraceSnapshot& snapshot) {
+  // Covers Kernel-23's duplicate CandidateReceived regression:
+  // an honest validator must not send a second local Notar broadcast for the same candidate id
+  // after receiving a duplicate delivery of that candidate. The trace records one outgoing vote
+  // per destination peer, so the assertion is "one fanout batch" rather than "exactly one record".
+  std::optional<CandidateId> attacked_id;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    attacked_id = test_expectations.duplicate_candidate_id;
+  }
+  if (!attacked_id.has_value()) {
+    return td::Status::Error("duplicate-candidate scenario did not register the attacked id");
+  }
+
+  std::map<std::pair<size_t, size_t>, size_t> deliveries_by_destination;
+  for (const auto& record : snapshot.candidate_deliveries) {
+    if (record.candidate_id == *attacked_id) {
+      ++deliveries_by_destination[{record.dst_node_idx, record.dst_instance_idx}];
+    }
+  }
+  std::optional<std::pair<size_t, size_t>> replayed_destination;
+  for (const auto& [dst, count] : deliveries_by_destination) {
+    if (count >= 2) {
+      replayed_destination = dst;
+      break;
+    }
+  }
+  if (!replayed_destination.has_value()) {
+    return td::Status::Error(PSTRING() << "candidate " << *attacked_id
+                                       << " was not delivered twice to any validator instance");
+  }
+
+  size_t notar_votes_from_replayed_node = 0;
+  std::set<std::optional<size_t>> notar_vote_destinations;
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx != replayed_destination->first || record.src_instance_idx != replayed_destination->second) {
+      continue;
+    }
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (notar != nullptr && notar->id == *attacked_id) {
+      ++notar_votes_from_replayed_node;
+      notar_vote_destinations.insert(record.dst_node_idx);
+    }
+  }
+  if (notar_vote_destinations.empty()) {
+    return td::Status::Error(PSTRING() << "validator #" << replayed_destination->first << "."
+                                       << replayed_destination->second
+                                       << " never sent Notar for duplicated candidate " << *attacked_id);
+  }
+  if (notar_votes_from_replayed_node != notar_vote_destinations.size()) {
+    return td::Status::Error(PSTRING() << "validator #" << replayed_destination->first << "."
+                                       << replayed_destination->second << " sent "
+                                       << notar_votes_from_replayed_node
+                                       << " Notar sends for duplicated candidate " << *attacked_id << " across "
+                                       << notar_vote_destinations.size()
+                                       << " destination(s), so the candidate was re-broadcast");
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_validation_reject_does_not_leave_residual_votes(const TraceSnapshot& snapshot) {
+  // Covers Kernel-23's validation-reject side-effect regression:
+  // if the first candidate for a slot is rejected by validation, a later replacement candidate for
+  // the same slot must still be able to notarize, and the rejected candidate must leave no votes.
+  std::optional<CandidateId> rejected_id;
+  std::optional<CandidateId> replacement_id;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    rejected_id = test_expectations.validation_reject_candidate_id;
+    replacement_id = test_expectations.validation_replacement_candidate_id;
+  }
+  if (!rejected_id.has_value() || !replacement_id.has_value()) {
+    return td::Status::Error("validation-reject scenario did not register both candidate ids");
+  }
+
+  bool saw_replacement_notar = false;
+  for (const auto& record : snapshot.protocol_votes) {
+    if (auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote); notar != nullptr) {
+      if (notar->id == *rejected_id) {
+        return td::Status::Error(PSTRING() << "rejected candidate " << *rejected_id
+                                           << " still produced a Notar vote");
+      }
+      if (notar->id == *replacement_id) {
+        saw_replacement_notar = true;
+      }
+    }
+    if (auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote);
+        final != nullptr && final->id == *rejected_id) {
+      return td::Status::Error(PSTRING() << "rejected candidate " << *rejected_id
+                                         << " still produced a Final vote");
+    }
+  }
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+        notar != nullptr && notar->id == *rejected_id) {
+      return td::Status::Error(PSTRING() << "rejected candidate " << *rejected_id
+                                         << " still produced a notarization certificate");
+    }
+    if (auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote);
+        final != nullptr && final->id == *rejected_id) {
+      return td::Status::Error(PSTRING() << "rejected candidate " << *rejected_id
+                                         << " still produced a finalization certificate");
+    }
+  }
+  if (!saw_replacement_notar) {
+    return td::Status::Error(PSTRING() << "replacement candidate " << *replacement_id
+                                       << " never notarized after the first candidate was rejected");
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_masterchain_child_waits_for_parent_finalization_before_notar(const TraceSnapshot& snapshot) {
+  // Covers Kernel-20's end-to-end masterchain gating:
+  // once the parent is notarized but its final cert is withheld from validator #0.0, that validator
+  // must not vote Notar for the child until it finalizes the parent block locally.
+  std::optional<CandidateId> parent_id;
+  std::optional<CandidateId> child_id;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    parent_id = test_expectations.masterchain_parent_candidate_id;
+    child_id = test_expectations.masterchain_child_candidate_id;
+  }
+  if (!parent_id.has_value() || !child_id.has_value()) {
+    return td::Status::Error("masterchain child scenario did not register both candidate ids");
+  }
+
+  bool saw_parent_notar_on_node0 = false;
+  bool saw_child_delivery_to_node0 = false;
+  std::optional<double> first_parent_final_ts_on_node0;
+  for (const auto& record : snapshot.notarizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.id == *parent_id) {
+      saw_parent_notar_on_node0 = true;
+    }
+  }
+  for (const auto& record : snapshot.candidate_deliveries) {
+    if (record.dst_node_idx == 0 && record.dst_instance_idx == 0 && record.candidate_id == *child_id) {
+      saw_child_delivery_to_node0 = true;
+    }
+  }
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.id == *parent_id) {
+      first_parent_final_ts_on_node0 = std::min(first_parent_final_ts_on_node0.value_or(record.ts), record.ts);
+    }
+  }
+  if (!saw_parent_notar_on_node0) {
+    return td::Status::Error(PSTRING() << "validator #0.0 never observed parent notarization for " << *parent_id);
+  }
+  if (!saw_child_delivery_to_node0) {
+    return td::Status::Error(PSTRING() << "validator #0.0 never received child candidate " << *child_id);
+  }
+
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx != 0 || record.src_instance_idx != 0) {
+      continue;
+    }
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (notar == nullptr || notar->id != *child_id) {
+      continue;
+    }
+    if (!first_parent_final_ts_on_node0.has_value() || record.ts + 1e-9 < *first_parent_final_ts_on_node0) {
+      return td::Status::Error(PSTRING() << "validator #0.0 voted Notar for child " << *child_id
+                                         << " before finalizing parent " << *parent_id);
+    }
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_state_resolution_preserves_exact_gen_utime(const TraceSnapshot& snapshot) {
+  // Covers the feasible Kernel-11 proxy in this harness:
+  // under fast finalization, accepted blocks on one validator must still not collapse into a
+  // burst. These trace timestamps are a noisy proxy for exact `gen_utime`, so the assertion is
+  // intentionally weaker than "every gap equals TARGET_RATE_MS": we only fail if accepted blocks
+  // bunch up to less than half of the configured slot rate.
+  std::map<BlockSeqno, double> first_accept_ts_by_seqno;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == 0 && record.instance_idx == 0) {
+      auto [it, inserted] = first_accept_ts_by_seqno.emplace(record.block_id.seqno(), record.ts);
+      if (!inserted) {
+        it->second = std::min(it->second, record.ts);
+      }
+    }
+  }
+  if (first_accept_ts_by_seqno.size() < 3) {
+    return td::Status::Error("scenario did not accept enough distinct block seqnos on validator #0.0");
+  }
+  std::vector<double> accepted_ts;
+  accepted_ts.reserve(first_accept_ts_by_seqno.size());
+  for (const auto& [seqno, ts] : first_accept_ts_by_seqno) {
+    (void)seqno;
+    accepted_ts.push_back(ts);
+  }
+  std::sort(accepted_ts.begin(), accepted_ts.end());
+  double min_expected_gap_s = static_cast<double>(TARGET_RATE_MS) / 2000.0;
+  for (size_t i = 1; i < accepted_ts.size(); ++i) {
+    if (accepted_ts[i] + 1e-9 < accepted_ts[i - 1] + min_expected_gap_s) {
+      return td::Status::Error(PSTRING() << "accepted block gap " << (accepted_ts[i] - accepted_ts[i - 1])
+                                         << "s on validator #0.0 is below " << min_expected_gap_s << "s");
+    }
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_skip_timeout_uses_last_finalization(const TraceSnapshot& snapshot) {
   // Covers simplex_docs.md Rule 6 and §4.2:
   // skip timeout in window k must be lower-bounded by T0 * alpha^(k-k*-1), where k* is determined
@@ -1026,6 +1297,16 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_leader_window_schedule(snapshot);
     case TestCase::NoMisbehaviorReports:
       return verify_no_misbehavior_reports(snapshot);
+    case TestCase::WrongLeaderCandidateNeverNotarizes:
+      return verify_wrong_leader_candidate_never_notarizes(snapshot);
+    case TestCase::DuplicateCandidateReceivedDoesNotDoubleNotar:
+      return verify_duplicate_candidate_received_does_not_double_notar(snapshot);
+    case TestCase::ValidationRejectDoesNotLeaveResidualVotes:
+      return verify_validation_reject_does_not_leave_residual_votes(snapshot);
+    case TestCase::MasterchainChildWaitsForParentFinalizationBeforeNotar:
+      return verify_masterchain_child_waits_for_parent_finalization_before_notar(snapshot);
+    case TestCase::StateResolutionPreservesExactGenUtime:
+      return verify_state_resolution_preserves_exact_gen_utime(snapshot);
   }
   UNREACHABLE();
 }
@@ -1973,6 +2254,16 @@ class TestManagerFacade : public ManagerFacade {
     CHECK(params.prev_block_state_roots.size() == 1 &&
           params.prev_block_state_roots[0]->get_hash() == gen_shard_state(prev_seqno)->get_hash());
     co_await td::actor::coro_sleep(td::Timestamp::in(td::Random::fast(VALIDATION_TIME.first, VALIDATION_TIME.second)));
+    {
+      std::scoped_lock lock(test_expectations_mutex);
+      if (test_expectations.validation_reject_block_id.has_value() &&
+          *test_expectations.validation_reject_block_id == candidate.id) {
+        co_return CandidateReject{
+            .reason = "synthetic validation rejection for tracker regression test",
+            .proof = td::BufferSlice(),
+        };
+      }
+    }
     co_await store_block_candidate(candidate.clone());
     co_return CandidateAccept{.ok_from_utime = co_await get_candidate_gen_utime_exact(candidate)};
   }
@@ -2189,6 +2480,34 @@ class TestConsensus : public td::actor::Actor {
     co_return td::Unit{};
   }
 
+  td::actor::Task<> set_wrong_leader_candidate_for_test(CandidateId id) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.wrong_leader_candidate_id = id;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_duplicate_candidate_for_test(CandidateId id) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.duplicate_candidate_id = id;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_validation_reject_expectations_for_test(CandidateId rejected_id, CandidateId replacement_id,
+                                                                BlockIdExt rejected_block_id) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.validation_reject_candidate_id = rejected_id;
+    test_expectations.validation_replacement_candidate_id = replacement_id;
+    test_expectations.validation_reject_block_id = rejected_block_id;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_masterchain_parent_child_expectations_for_test(CandidateId parent_id, CandidateId child_id) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.masterchain_parent_candidate_id = parent_id;
+    test_expectations.masterchain_child_candidate_id = child_id;
+    co_return td::Unit{};
+  }
+
   td::actor::Task<> clear_instance_candidate_storage(size_t node_idx, size_t instance_idx) {
     co_return co_await td::actor::ask(nodes_[node_idx].instances[instance_idx].candidate_storage,
                                       &CandidateStorage::clear);
@@ -2241,8 +2560,142 @@ class TestConsensus : public td::actor::Actor {
     co_return td::Unit{};
   }
 
+  td::actor::Task<td::uint32> resolve_prev_seqno_for_test(size_t node_idx, size_t instance_idx, ParentId base) {
+    auto resolved = co_await nodes_[node_idx].instances[instance_idx].bus.publish<simplex::ResolveState>(base);
+    CHECK(resolved.state.not_null());
+    CHECK(resolved.state->next_seqno() > 0);
+    co_return resolved.state->next_seqno() - 1;
+  }
+
+  BlockCandidate make_synthetic_block_candidate_for_test(td::uint32 slot, BlockSeqno prev_seqno, td::uint64 tag,
+                                                         PeerValidatorId leader,
+                                                         std::optional<double> gen_utime = std::nullopt) const {
+    double candidate_gen_utime = gen_utime.value_or(td::Clocks::system());
+
+    block::gen::BlockInfo::Record info;
+    info.version = 0;
+    info.not_master = !SHARD.is_masterchain();
+    info.after_merge = false;
+    info.before_split = false;
+    info.after_split = false;
+    info.want_split = false;
+    info.want_merge = false;
+    info.key_block = false;
+    info.vert_seqno_incr = false;
+    info.flags = 0;
+    info.seq_no = prev_seqno + 1;
+    info.vert_seq_no = 0;
+    vm::CellBuilder cb;
+    block::ShardId{SHARD}.serialize(cb);
+    info.shard = cb.as_cellslice_ref();
+    info.gen_utime = static_cast<UnixTime>(candidate_gen_utime);
+    info.start_lt = static_cast<LogicalTime>(prev_seqno + 1) * 1000;
+    info.end_lt = static_cast<LogicalTime>(prev_seqno + 1) * 1000 + 1;
+    info.gen_validator_list_hash_short = validator_set_->get_validator_set_hash();
+    info.gen_catchain_seqno = validator_set_->get_catchain_seqno();
+    info.min_ref_mc_seqno = MIN_MC_BLOCK_ID.seqno();
+    info.prev_key_block_seqno = MIN_MC_BLOCK_ID.seqno();
+    if (!SHARD.is_masterchain()) {
+      info.master_ref = make_ext_blk_ref(MIN_MC_BLOCK_ID, 0);
+    }
+    info.prev_ref =
+        make_ext_blk_ref(BlockIdExt(BlockId(SHARD, prev_seqno), gen_shard_state(prev_seqno)->get_hash().bits(),
+                                    td::Bits256{}),
+                         static_cast<LogicalTime>(prev_seqno) * 1000 + 1);
+    td::Ref<vm::Cell> block_info;
+    CHECK(block::gen::pack_cell(block_info, info));
+
+    td::Ref<vm::Cell> value_flow = vm::CellBuilder{}.finalize_novm();
+    td::Ref<vm::Cell> merkle_update =
+        vm::CellBuilder::create_merkle_update(gen_shard_state(prev_seqno), gen_shard_state(prev_seqno + 1));
+    td::Bits256 rand_data;
+    rand_data.as_array().fill(0);
+    rand_data.as_slice().truncate(sizeof(tag)).copy_from(
+        td::Slice{reinterpret_cast<const td::uint8*>(&tag), sizeof(tag)});
+    td::Ref<vm::Cell> block_extra = vm::CellBuilder{}.store_bytes(rand_data.as_slice()).finalize_novm();
+    td::Ref<vm::Cell> block_root = vm::CellBuilder{}
+                                       .store_long(0x11ef55aa, 32)
+                                       .store_long(-111, 32)
+                                       .store_ref(block_info)
+                                       .store_ref(value_flow)
+                                       .store_ref(merkle_update)
+                                       .store_ref(block_extra)
+                                       .finalize_novm();
+    td::BufferSlice data = vm::std_boc_serialize(block_root, 31).move_as_ok();
+
+    std::vector<td::Ref<vm::Cell>> collated_roots;
+    auto consensus_extra = vm::CellBuilder{}
+                               .store_long(0x638eb292, 32)
+                               .store_long(0, 32)
+                               .store_long(static_cast<td::uint64>(candidate_gen_utime * 1000.0), 64)
+                               .finalize_novm();
+    collated_roots.push_back(std::move(consensus_extra));
+    td::BufferSlice collated_data = vm::std_boc_serialize_multi(collated_roots, 2).move_as_ok();
+
+    return BlockCandidate(
+        Ed25519_PublicKey{nodes_[leader.value()].public_key.ed25519_value().raw()},
+        BlockIdExt(BlockId(SHARD, prev_seqno + 1), block_root->get_hash().bits(), td::sha256_bits256(data)),
+        td::sha256_bits256(collated_data), std::move(data), std::move(collated_data));
+  }
+
+  CandidateRef make_synthetic_full_candidate_for_test(td::uint32 slot, ParentId parent, PeerValidatorId leader,
+                                                      BlockSeqno prev_seqno, td::uint64 tag,
+                                                      std::optional<double> gen_utime = std::nullopt) const {
+    auto block = make_synthetic_block_candidate_for_test(slot, prev_seqno, tag, leader, gen_utime);
+    auto id = CandidateHashData::create_full(block, parent).build_id_with(slot);
+    return td::make_ref<Candidate>(id, std::move(parent), leader, std::move(block), td::BufferSlice("synthetic-sign"));
+  }
+
+  td::actor::Task<> inject_candidate_for_test(size_t src_node_idx, std::vector<size_t> dst_node_indices,
+                                              CandidateRef candidate) {
+    for (size_t dst_node_idx : dst_node_indices) {
+      size_t dst_instance_idx = 0;
+      for (auto& inst : nodes_[dst_node_idx].instances) {
+        if (inst.status != Instance::Running) {
+          ++dst_instance_idx;
+          continue;
+        }
+        td::actor::send_closure(trace_sink_, &TestTraceSink::record_candidate_delivery, src_node_idx, 0, dst_node_idx,
+                                dst_instance_idx, candidate->id, candidate->parent_id, candidate->leader,
+                                candidate->is_empty(), candidate->block_id());
+        inst.bus.publish<CandidateReceived>(candidate);
+        ++dst_instance_idx;
+      }
+    }
+    co_return td::Unit{};
+  }
+
  private:
   void apply_test_case_defaults() {
+    if (TEST_CASE == TestCase::WrongLeaderCandidateNeverNotarizes ||
+        TEST_CASE == TestCase::DuplicateCandidateReceivedDoesNotDoubleNotar ||
+        TEST_CASE == TestCase::ValidationRejectDoesNotLeaveResidualVotes ||
+        TEST_CASE == TestCase::StateResolutionPreservesExactGenUtime) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 3.0;
+      }
+    }
+    if (TEST_CASE == TestCase::MasterchainChildWaitsForParentFinalizationBeforeNotar) {
+      SHARD = ShardIdFull{masterchainId};
+      FIRST_PARENT.id.workchain = masterchainId;
+      FIRST_PARENT.id.shard = shardIdAll;
+      MIN_MC_BLOCK_ID = FIRST_PARENT;
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 3.0;
+      }
+    }
     if (TEST_CASE == TestCase::NotarRequiresParentNotar) {
       if (N_NODES == 8) {
         N_NODES = 4;
@@ -2326,6 +2779,54 @@ class TestConsensus : public td::actor::Actor {
                                           << instance_idx);
   }
 
+  td::actor::Task<> wait_for_finalization_past_slot_on(size_t node_idx, size_t instance_idx, td::uint32 slot,
+                                                       double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == node_idx && record.instance_idx == instance_idx && record.id.slot > slot) {
+          co_return td::Unit{};
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for finalization past slot " << slot
+                                          << " on validator #" << node_idx << "." << instance_idx);
+  }
+
+  td::actor::Task<> wait_for_notarization_of(CandidateId id, double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      for (const auto& record : snapshot.notarizations_observed) {
+        if (record.id == id) {
+          co_return td::Unit{};
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for notarization of " << id);
+  }
+
+  td::actor::Task<LeaderWindowObservedTraceRecord> wait_for_leader_window_observed_record_on(size_t node_idx,
+                                                                                             size_t instance_idx,
+                                                                                             td::uint32 start_slot,
+                                                                                             double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      for (const auto& record : snapshot.leader_windows_observed) {
+        if (record.node_idx == node_idx && record.instance_idx == instance_idx && record.start_slot == start_slot) {
+          co_return record;
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for leader window observation record " << start_slot
+                                          << " on validator #" << node_idx << "." << instance_idx);
+  }
+
   td::actor::Task<> wait_for_leader_window_observed_on(size_t node_idx, size_t instance_idx, td::uint32 start_slot,
                                                        double timeout_s) {
     td::Timestamp deadline = td::Timestamp::in(timeout_s);
@@ -2342,12 +2843,187 @@ class TestConsensus : public td::actor::Actor {
                                           << node_idx << "." << instance_idx);
   }
 
+  struct IsolatedLeaderWindowContext {
+    LeaderWindowObservedTraceRecord window;
+    td::uint32 prev_seqno = 0;
+    size_t expected_leader_idx = 0;
+  };
+
+  td::actor::Task<IsolatedLeaderWindowContext> prepare_isolated_future_window_on_node0() {
+    co_await wait_for_finalization_on(1, 0, 5.0);
+
+    auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+    bool have_window = false;
+    td::uint32 last_start_slot = 0;
+    for (const auto& record : snapshot.leader_windows_observed) {
+      if (record.node_idx == 0 && record.instance_idx == 0) {
+        last_start_slot = have_window ? std::max(last_start_slot, record.start_slot) : record.start_slot;
+        have_window = true;
+      }
+    }
+    td::uint32 target_start_slot = have_window ? last_start_slot + SLOTS_PER_LEADER_WINDOW : 0;
+    co_await set_drop_candidates_for_test(0, target_start_slot, target_start_slot + 1);
+    auto window = co_await wait_for_leader_window_observed_record_on(0, 0, target_start_slot, 5.0);
+    co_await set_instance_network_disabled_for_test(0, 0, true);
+    co_return IsolatedLeaderWindowContext{
+        .window = window,
+        .prev_seqno = window.base.has_value() ? static_cast<td::uint32>(window.base->slot + 1) : 0,
+        .expected_leader_idx = (window.start_slot / SLOTS_PER_LEADER_WINDOW) % N_NODES,
+    };
+  }
+
+  struct BoundaryBase {
+    CandidateId parent_id;
+    BlockSeqno parent_seqno = 0;
+    td::uint32 next_slot = 0;
+    PeerValidatorId next_leader;
+  };
+
+  PeerValidatorId expected_leader_for_slot(td::uint32 slot) const {
+    return PeerValidatorId((int)((slot / SLOTS_PER_LEADER_WINDOW) % N_NODES));
+  }
+
+  td::actor::Task<BoundaryBase> wait_for_boundary_base_with_next_leader_not(size_t node_idx, size_t instance_idx,
+                                                                            size_t forbidden_leader_idx,
+                                                                            double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      std::optional<BoundaryBase> best;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx != node_idx || record.instance_idx != instance_idx) {
+          continue;
+        }
+        if ((record.id.slot + 1) % SLOTS_PER_LEADER_WINDOW != 0) {
+          continue;
+        }
+        auto next_slot = record.id.slot + 1;
+        auto next_leader = expected_leader_for_slot(next_slot);
+        if (next_leader.value() == forbidden_leader_idx) {
+          continue;
+        }
+        if (!best.has_value() || best->parent_id.slot < record.id.slot) {
+          best = BoundaryBase{
+              .parent_id = record.id,
+              // In this harness, every finalized slot advances the block seqno by exactly one.
+              .parent_seqno = static_cast<BlockSeqno>(record.id.slot + 1),
+              .next_slot = next_slot,
+              .next_leader = next_leader,
+          };
+        }
+      }
+      if (best.has_value()) {
+        co_return *best;
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error("timeout waiting for a finalized window boundary with a non-target next leader");
+  }
+
   bool skip_finalize_for_test_case() const {
     return TEST_CASE == TestCase::StandstillRebroadcastContents || TEST_CASE == TestCase::CandidateResolutionRecovery ||
            TEST_CASE == TestCase::SkipTimeoutUsesLastFinalization;
   }
 
   td::actor::Task<> run_test_case_scenario() {
+    if (TEST_CASE == TestCase::WrongLeaderCandidateNeverNotarizes) {
+      // Covers Kernel-23 / Kernel-28's end-to-end wrong-leader regression:
+      // a candidate that is otherwise well-formed but names the wrong leader for the slot must not
+      // produce Notar when delivered into the live consensus pipeline.
+      auto ctx = co_await prepare_isolated_future_window_on_node0();
+      size_t wrong_leader_idx = (ctx.expected_leader_idx + 1) % N_NODES;
+      auto wrong_leader_candidate = make_synthetic_full_candidate_for_test(
+          ctx.window.start_slot, ctx.window.base, PeerValidatorId(static_cast<int>(wrong_leader_idx)), ctx.prev_seqno,
+          0x7700000000000001ULL);
+      co_await set_wrong_leader_candidate_for_test(wrong_leader_candidate->id);
+      co_await clear_traces();
+      co_await inject_candidate_for_test(wrong_leader_idx, {0}, wrong_leader_candidate);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.5));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::DuplicateCandidateReceivedDoesNotDoubleNotar) {
+      // Covers Kernel-23's duplicate-delivery regression:
+      // the same candidate received twice must still produce at most one local Notar vote.
+      auto ctx = co_await prepare_isolated_future_window_on_node0();
+      auto duplicate_candidate = make_synthetic_full_candidate_for_test(
+          ctx.window.start_slot, ctx.window.base, PeerValidatorId(static_cast<int>(ctx.expected_leader_idx)),
+          ctx.prev_seqno, 0x7700000000000002ULL);
+      co_await set_duplicate_candidate_for_test(duplicate_candidate->id);
+      co_await clear_traces();
+      co_await inject_candidate_for_test(ctx.expected_leader_idx, {0}, duplicate_candidate);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.25));
+      co_await inject_candidate_for_test(ctx.expected_leader_idx, {0}, duplicate_candidate);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.5));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::ValidationRejectDoesNotLeaveResidualVotes) {
+      // Covers Kernel-23's validation side-effects regression:
+      // if the first candidate for a slot is rejected by validation, a later replacement for the
+      // same slot must still be able to vote Notar and the rejected candidate must leave no votes.
+      auto ctx = co_await prepare_isolated_future_window_on_node0();
+      auto rejected_candidate = make_synthetic_full_candidate_for_test(
+          ctx.window.start_slot, ctx.window.base, PeerValidatorId(static_cast<int>(ctx.expected_leader_idx)),
+          ctx.prev_seqno, 0x7700000000000003ULL);
+      auto replacement_candidate = make_synthetic_full_candidate_for_test(
+          ctx.window.start_slot, ctx.window.base, PeerValidatorId(static_cast<int>(ctx.expected_leader_idx)),
+          ctx.prev_seqno, 0x7700000000000004ULL);
+      co_await set_validation_reject_expectations_for_test(rejected_candidate->id, replacement_candidate->id,
+                                                           rejected_candidate->block_id());
+      co_await clear_traces();
+      co_await inject_candidate_for_test(ctx.expected_leader_idx, {0}, rejected_candidate);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.25));
+      co_await inject_candidate_for_test(ctx.expected_leader_idx, {0}, replacement_candidate);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.75));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::MasterchainChildWaitsForParentFinalizationBeforeNotar) {
+      // Covers Kernel-20's end-to-end masterchain gating:
+      // a child candidate may be delivered after the parent is notarized, but it must not vote
+      // Notar on validator #0.0 until that validator has locally finalized the parent block.
+      co_await set_drop_final_certs_for_test(0, 0);
+      co_await clear_traces();
+
+      td::Timestamp deadline = td::Timestamp::in(5.0);
+      std::optional<CandidateDeliveryTraceRecord> parent_delivery;
+      while (!deadline.is_in_past() && !parent_delivery.has_value()) {
+        auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+        std::map<CandidateId, CandidateDeliveryTraceRecord> delivered_to_node0;
+        for (const auto& record : snapshot.candidate_deliveries) {
+          if (record.dst_node_idx == 0 && record.dst_instance_idx == 0 && !record.is_empty) {
+            delivered_to_node0.emplace(record.candidate_id, record);
+          }
+        }
+        for (const auto& record : snapshot.notarizations_observed) {
+          if (record.node_idx == 0 && record.instance_idx == 0) {
+            auto it = delivered_to_node0.find(record.id);
+            if (it != delivered_to_node0.end()) {
+              parent_delivery = it->second;
+              break;
+            }
+          }
+        }
+        if (!parent_delivery.has_value()) {
+          co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+        }
+      }
+      if (!parent_delivery.has_value()) {
+        co_return td::Status::Error("masterchain child scenario did not find a parent candidate notarized on #0.0");
+      }
+
+      td::uint32 child_slot = parent_delivery->candidate_id.slot + 1;
+      size_t child_leader_idx = (child_slot / SLOTS_PER_LEADER_WINDOW) % N_NODES;
+      co_await set_drop_candidates_for_test(0, child_slot, child_slot + 1);
+      auto child_candidate = make_synthetic_full_candidate_for_test(
+          child_slot, parent_delivery->candidate_id, PeerValidatorId(static_cast<int>(child_leader_idx)),
+          parent_delivery->block_id.seqno(), 0x7700000000000005ULL);
+      co_await set_masterchain_parent_child_expectations_for_test(parent_delivery->candidate_id, child_candidate->id);
+      co_await inject_candidate_for_test(child_leader_idx, {0}, child_candidate);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.5));
+      co_await clear_test_message_filters();
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.75));
+      co_return td::Unit{};
+    }
     if (TEST_CASE == TestCase::StandstillRebroadcastContents) {
       // Drives simplex_docs.md Rule 8 into a standstill:
       // after one finalization, stop two validators so no new quorum can form,
@@ -2433,7 +3109,6 @@ class TestConsensus : public td::actor::Actor {
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }
-
     co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
     if (TEST_CASE == TestCase::NotarRequiresParentNotar || TEST_CASE == TestCase::EmptyCandidatesConsensus) {
       co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
@@ -2534,7 +3209,6 @@ class TestConsensus : public td::actor::Actor {
     runtime.register_actor<TestSimplexObserver>("TestSimplexObserver");
     simplex::CandidateResolver::register_in(runtime);
     simplex::Consensus::register_in(runtime);
-    runtime.register_actor<TestSimplexDb>("SimplexDb");
     simplex::Pool::register_in(runtime);
     simplex::StateResolver::register_in(runtime);
     simplex::Db::register_in(runtime);
