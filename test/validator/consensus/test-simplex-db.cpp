@@ -308,5 +308,28 @@ struct RetriesBroadcastVoteAfterSetFailure : SimplexDbTest {
 };
 REGISTER_TEST(SimplexDb, RetriesBroadcastVoteAfterSetFailure);
 
+struct RetriesCertificateSaveAfterSetFailure : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the durable certificate image behind simplex Rule 4 and Rule 7:
+    // if persisting a newly formed certificate fails, the same certificate must remain retryable
+    // instead of being marked as already saved.
+    co_await start_actor();
+
+    auto skip_cert = make_simplex_certificate(ctx(), bus(), simplex::SkipVote{7}, {0, 1});
+    auto cert = std::move(skip_cert.unique_write()).consume_and_upcast();
+    db().fail_next_sets(1);
+
+    auto first = co_await handle_.publish<simplex::SaveCertificate>(cert).wrap();
+    auto retry = co_await handle_.publish<simplex::SaveCertificate>(cert).wrap();
+
+    ASSERT_TRUE(first.is_error());
+    ASSERT_TRUE(retry.is_ok());
+    EXPECT_EQ(db().size(), static_cast<size_t>(1));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexDb, RetriesCertificateSaveAfterSetFailure);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
