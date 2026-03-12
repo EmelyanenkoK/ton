@@ -213,5 +213,63 @@ struct DoesNotLeakUnrequestedCandidateBody : CandidateResolverTest {
 };
 REGISTER_TEST(CandidateResolver, DoesNotLeakUnrequestedCandidateBody);
 
+struct IgnoresWrongIdResponseAndKeepsWaiting : CandidateResolverTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 2 negative behavior:
+    // if a peer responds with a candidate for the wrong id, CandidateResolver must ignore it and
+    // keep requesting the missing candidate instead of resolving with mismatched data.
+    auto correct_candidate = make_serializable_empty_candidate(ctx(), *bus_, 9, make_candidate_id(8, 9900),
+                                                               min_mc_block_id, PeerValidatorId{0});
+    auto wrong_candidate = make_serializable_empty_candidate(ctx(), *bus_, 9, make_candidate_id(8, 9911),
+                                                             BlockIdExt{BlockId(ctx().shard(), 9), bits256_pattern(42),
+                                                                        bits256_pattern(43)},
+                                                             PeerValidatorId{0});
+    auto notar = make_simplex_certificate(ctx(), *bus_, simplex::NotarizeVote{correct_candidate->id}, {0, 1});
+
+    std::optional<td::Result<simplex::ResolveCandidate::Result>> resolve_result;
+    bool completed = false;
+    auto first_request = bus_->overlay_responder->request.expect();
+    [&]() -> td::actor::Task<td::Unit> {
+      resolve_result = co_await handle_.publish<simplex::ResolveCandidate>(correct_candidate->id).wrap();
+      completed = true;
+      co_return td::Unit{};
+    }()
+        .start()
+        .detach();
+
+    auto request1 = co_await std::move(first_request);
+    auto second_request = bus_->overlay_responder->request.expect();
+
+    auto request1_tl =
+        fetch_tl_object<ton_api::consensus_simplex_requestCandidate>(std::get<2>(request1.args).data, true).move_as_ok();
+    EXPECT(request1_tl->want_candidate_);
+    EXPECT(request1_tl->want_notar_);
+
+    request1.respond.set_value(ProtocolMessage{make_candidate_and_cert_response(wrong_candidate, std::nullopt)});
+    co_await ts_.wait_sync_work();
+    EXPECT(!completed);
+
+    auto request2 = co_await std::move(second_request);
+    auto request2_tl =
+        fetch_tl_object<ton_api::consensus_simplex_requestCandidate>(std::get<2>(request2.args).data, true).move_as_ok();
+    EXPECT(request2_tl->want_candidate_);
+    EXPECT(request2_tl->want_notar_);
+
+    request2.respond.set_value(ProtocolMessage{make_candidate_and_cert_response(correct_candidate, notar)});
+    for (int i = 0; i < 10 && !completed; ++i) {
+      co_await ts_.wait_sync_work();
+    }
+
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(resolve_result.has_value());
+    ASSERT_TRUE(resolve_result->is_ok());
+    EXPECT_EQ(resolve_result->ok().candidate->id, correct_candidate->id);
+    EXPECT_EQ(resolve_result->ok().notar->vote.id, correct_candidate->id);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(CandidateResolver, IgnoresWrongIdResponseAndKeepsWaiting);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
