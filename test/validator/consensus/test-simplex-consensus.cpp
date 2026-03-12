@@ -330,5 +330,57 @@ struct Rule6SkipTimeoutUsesLastObservedFinalization : SimplexConsensusTest {
 };
 REGISTER_TEST(SimplexConsensus, Rule6SkipTimeoutUsesLastObservedFinalization);
 
+struct SkipPreventsLaterFinalizeForSameSlot : SimplexConsensusTest {
+  TestOptions options() const override {
+    auto opts = SimplexConsensusTest::options();
+    opts.weight_distribution = {1, 1};
+    opts.slots_per_leader_window = 1;
+    opts.target_rate_ms = 1000;
+    opts.first_block_timeout_ms = 1000;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 5 negative gating:
+    // once the local validator has already skipped a slot, later notarization evidence for that
+    // same slot must not allow it to cast FinalizeVote.
+    auto base = ParentId{make_candidate_id(0, 4100)};
+    auto candidate = make_wait_candidate(make_candidate_id(1, 4101), base, PeerValidatorId{1});
+    auto parent_state = make_normal_state(ctx().shard(), 11, min_mc_block_id);
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(1, base);
+    co_await ts_.wait_sync_work();
+
+    ts_.advance_time(ts_.next_timeout_in());
+    co_await ts_.wait_sync_work();
+
+    auto skip_votes = published_votes<simplex::SkipVote>(observer().broadcast_votes_);
+    ASSERT_EQ(skip_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(skip_votes[0].slot, static_cast<td::uint32>(1));
+
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+    observer().validation_results_.push_back(CandidateAccept{});
+
+    handle_.publish<CandidateReceived>(candidate);
+    co_await ts_.wait_sync_work();
+
+    ConsensusBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 0);
+    auto notar_cert = make_simplex_certificate(ctx(), seed_bus, simplex::NotarizeVote{candidate->id}, {0, 1});
+
+    handle_.publish<simplex::NotarizationObserved>(candidate->id, notar_cert);
+    co_await ts_.wait_sync_work();
+
+    auto notar_votes = published_votes<simplex::NotarizeVote>(observer().broadcast_votes_);
+    auto final_votes = published_votes<simplex::FinalizeVote>(observer().broadcast_votes_);
+    ASSERT_EQ(notar_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(notar_votes[0].id, candidate->id);
+    EXPECT_EQ(final_votes.size(), static_cast<size_t>(0));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexConsensus, SkipPreventsLaterFinalizeForSameSlot);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
