@@ -205,6 +205,53 @@ struct AcceptsMasterchainEmptyCandidatesWithoutWaiting : MasterchainBlockValidat
 };
 REGISTER_TEST(BlockValidator, AcceptsMasterchainEmptyCandidatesWithoutWaiting);
 
+struct IgnoresIrrelevantMasterchainFinalizationNotifications : MasterchainBlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the validator's masterchain wake-up guard:
+    // while waiting for the previous accepted masterchain block, notifications for another shard
+    // or for seqno 0 must not release the waiter.
+    mock_->validate.returns(CandidateAccept{});
+
+    auto accepted_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    handle_.publish<Start>(accepted_state);
+
+    auto bc = make_block_candidate(ctx().shard(), 3);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{0});
+    auto task = handle_.publish<ValidationRequest>(state, candidate).start();
+
+    co_await ts_.wait_sync_work();
+
+    EXPECT(!task.await_ready());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    auto wrong_shard_block = make_block_data(ShardIdFull{0, 0xC000'0000'0000'0000ULL}, 2, create_cell(20))->block_id();
+    handle_.publish<BlockFinalizedInMasterchain>(wrong_shard_block);
+    co_await ts_.wait_sync_work();
+
+    EXPECT(!task.await_ready());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    auto seqno_zero_block =
+        BlockIdExt{ctx().shard().workchain, ctx().shard().shard, 0, bits256_pattern(600), bits256_pattern(601)};
+    handle_.publish<BlockFinalizedInMasterchain>(seqno_zero_block);
+    co_await ts_.wait_sync_work();
+
+    EXPECT(!task.await_ready());
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    handle_.publish<BlockFinalizedInMasterchain>(state->as_normal().value());
+    co_await ts_.wait_sync_work();
+
+    auto result = co_await std::move(task);
+    EXPECT(result.has<CandidateAccept>());
+    EXPECT_EQ(mock_->validate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, IgnoresIrrelevantMasterchainFinalizationNotifications);
+
 struct WaitsForPreviousMasterchainBlockBeforeValidating : MasterchainBlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
     // Supports the masterchain finalization dependency described in simplex_docs.md §4.4 case 2:
