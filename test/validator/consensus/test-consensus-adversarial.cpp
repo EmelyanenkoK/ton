@@ -108,6 +108,10 @@ enum class TestCase {
   SkipTimeoutCapPlateausUnderStall,
   CountThresholdMismatchPreservesSafety,
   StandstillFloodStillRecovers,
+  SeveralWindowsFullySkippedThenProgressResumes,
+  AdjacentWindowForkRollsBackAfterLateAlternateFinalization,
+  StandstillWithoutCertificateRebroadcastRequiresRecovery,
+  GoodCandidateWithWrongSlotParentHashDoesNotResolve,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -233,6 +237,18 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "standstill-flood-still-recovers") {
     return TestCase::StandstillFloodStillRecovers;
+  }
+  if (s == "several-windows-fully-skipped-then-progress-resumes") {
+    return TestCase::SeveralWindowsFullySkippedThenProgressResumes;
+  }
+  if (s == "adjacent-window-fork-rolls-back-after-late-alternate-finalization") {
+    return TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization;
+  }
+  if (s == "standstill-without-certificate-rebroadcast-requires-recovery") {
+    return TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery;
+  }
+  if (s == "good-candidate-with-wrong-slot-parent-hash-does-not-resolve") {
+    return TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -375,6 +391,9 @@ struct TestExpectations {
   size_t multi_slot_equivocation_slot_count = 0;
   std::optional<td::uint32> invalid_full_candidate_slot;
   std::optional<td::uint32> count_weight_mismatch_slot;
+  std::optional<td::uint32> standstill_recovery_slot;
+  std::optional<double> standstill_recovery_release_ts;
+  std::optional<CandidateId> wrong_parent_hash_candidate_id;
 };
 
 std::mutex test_expectations_mutex;
@@ -3028,6 +3047,241 @@ td::Status verify_standstill_flood_still_recovers(const TraceSnapshot& snapshot)
   return td::Status::OK();
 }
 
+td::Status verify_several_windows_fully_skipped_then_progress_resumes(const TraceSnapshot& snapshot) {
+  // Covers Kernel-28's missing "several fully skipped windows" regression:
+  // under < 1/3 silent leaders, several consecutive windows should clear by Skip and later honest
+  // windows should still finalize.
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> start_slot;
+  size_t skip_count = 0;
+  std::vector<size_t> byzantine_nodes;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    start_slot = test_expectations.consecutive_skip_start_slot;
+    skip_count = test_expectations.consecutive_skip_count;
+    byzantine_nodes = test_expectations.adversarial_nodes;
+  }
+  if (!start_slot.has_value() || skip_count < 3 || byzantine_nodes.size() < 3) {
+    return td::Status::Error("scenario did not register the expected fully skipped window range");
+  }
+
+  for (size_t i = 0; i < skip_count; ++i) {
+    td::uint32 slot = *start_slot + static_cast<td::uint32>(i);
+    bool saw_skip_cert = false;
+    for (const auto& record : snapshot.protocol_certificates) {
+      if (auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote); skip != nullptr && skip->slot == slot) {
+        saw_skip_cert = true;
+        break;
+      }
+    }
+    if (!saw_skip_cert) {
+      return td::Status::Error(PSTRING() << "fully skipped slot " << slot << " never reached a Skip certificate");
+    }
+  }
+
+  td::uint32 last_skipped_slot = *start_slot + static_cast<td::uint32>(skip_count - 1);
+  bool saw_later_finalization = false;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (std::find(byzantine_nodes.begin(), byzantine_nodes.end(), record.node_idx) != byzantine_nodes.end()) {
+      continue;
+    }
+    if (record.id.slot > last_skipped_slot) {
+      saw_later_finalization = true;
+      break;
+    }
+  }
+  if (!saw_later_finalization) {
+    return td::Status::Error(PSTRING() << "honest validators never finalized past fully skipped window range ["
+                                       << *start_slot << ", " << (last_skipped_slot + 1) << ")");
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_adjacent_window_fork_rolls_back_after_late_alternate_finalization(const TraceSnapshot& snapshot) {
+  // Covers Kernel-28's narrower rollback regression:
+  // after an adjacent-window fork is both notarized and skipped, later honest finalization must
+  // collapse the fork and honest validators must not later emit Final votes for the forked branch.
+  TRY_STATUS(verify_fork_descendants_collapse_after_later_finalization(snapshot));
+
+  std::optional<td::uint32> forked_slot;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    forked_slot = test_expectations.forked_slot;
+  }
+  if (!forked_slot.has_value()) {
+    return td::Status::Error("scenario did not register the adjacent fork slot");
+  }
+
+  std::optional<CandidateId> forked_candidate_id;
+  double first_honest_later_finalization_ts = std::numeric_limits<double>::infinity();
+  for (const auto& record : snapshot.notarizations_observed) {
+    if (record.id.slot == *forked_slot) {
+      forked_candidate_id = record.id;
+      break;
+    }
+  }
+  if (!forked_candidate_id.has_value()) {
+    return td::Status::Error(PSTRING() << "adjacent fork slot " << *forked_slot << " was never notarized");
+  }
+
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 || record.id.slot <= *forked_slot) {
+      continue;
+    }
+    first_honest_later_finalization_ts = std::min(first_honest_later_finalization_ts, record.ts);
+  }
+  if (!std::isfinite(first_honest_later_finalization_ts)) {
+    return td::Status::Error(PSTRING() << "no honest validator finalized after adjacent fork slot " << *forked_slot);
+  }
+
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx == 0 || record.ts <= first_honest_later_finalization_ts + 1e-9) {
+      continue;
+    }
+    if (auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote);
+        final != nullptr && final->id == *forked_candidate_id) {
+      return td::Status::Error(PSTRING() << "honest validator #" << record.src_node_idx
+                                         << " emitted late Final for forked candidate " << *forked_candidate_id
+                                         << " after later finalization had already collapsed the fork");
+    }
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_standstill_without_certificate_rebroadcast_requires_recovery(const TraceSnapshot& snapshot) {
+  // Covers Kernel-28's explicit "no cert rebroadcast => standstill recovery required" regression:
+  // if one validator misses normal certificate traffic for a slot, it should only catch up after
+  // standstill rebroadcast resumes once the filter is lifted.
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> attacked_slot;
+  std::optional<double> release_ts;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    attacked_slot = test_expectations.standstill_recovery_slot;
+    release_ts = test_expectations.standstill_recovery_release_ts;
+  }
+  if (!attacked_slot.has_value() || !release_ts.has_value()) {
+    return td::Status::Error("scenario did not register standstill certificate-recovery expectations");
+  }
+
+  bool saw_cert_to_node0_before_release = false;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (record.dst_node_idx == 0 && record.vote.referenced_slot() == *attacked_slot &&
+        record.ts < *release_ts - 1e-9) {
+      saw_cert_to_node0_before_release = true;
+      break;
+    }
+  }
+  if (saw_cert_to_node0_before_release) {
+    return td::Status::Error(PSTRING() << "validator #0 received ordinary certificate traffic for slot "
+                                       << *attacked_slot << " before the standstill-recovery filter was lifted");
+  }
+
+  bool saw_post_release_cert_to_node0 = false;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (record.dst_node_idx == 0 && record.vote.referenced_slot() >= *attacked_slot &&
+        record.ts > *release_ts + 1e-9) {
+      saw_post_release_cert_to_node0 = true;
+      break;
+    }
+  }
+  if (!saw_post_release_cert_to_node0) {
+    return td::Status::Error(PSTRING() << "validator #0 never received any standstill-era certificate for slot >= "
+                                       << *attacked_slot << " after filters were lifted");
+  }
+
+  double first_node0_finalization_ts = std::numeric_limits<double>::infinity();
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.id.slot >= *attacked_slot) {
+      first_node0_finalization_ts = std::min(first_node0_finalization_ts, record.ts);
+    }
+  }
+  if (!std::isfinite(first_node0_finalization_ts)) {
+    return td::Status::Error(PSTRING() << "validator #0 never caught up to slot " << *attacked_slot
+                                       << " after standstill recovery");
+  }
+  if (first_node0_finalization_ts <= *release_ts + 1e-9) {
+    return td::Status::Error("validator #0 caught up before standstill recovery traffic was allowed through");
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_good_candidate_with_wrong_slot_parent_hash_does_not_resolve(const TraceSnapshot& snapshot) {
+  // Covers Kernel-28's wrong-slot-parent-hash regression:
+  // a structurally valid full candidate with a parent id whose slot/hash chain is impossible must
+  // not be notarized, and honest progress should continue past the attacked slot.
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<CandidateId> attacked_candidate_id;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    attacked_candidate_id = test_expectations.wrong_parent_hash_candidate_id;
+  }
+  if (!attacked_candidate_id.has_value()) {
+    return td::Status::Error("scenario did not register the wrong-parent-hash candidate");
+  }
+
+  bool saw_delivery = false;
+  for (const auto& record : snapshot.candidate_deliveries) {
+    if (record.candidate_id == *attacked_candidate_id) {
+      saw_delivery = true;
+      break;
+    }
+  }
+  if (!saw_delivery) {
+    return td::Status::Error(PSTRING() << "wrong-parent-hash candidate " << *attacked_candidate_id
+                                       << " was never delivered to any validator");
+  }
+
+  for (const auto& record : snapshot.protocol_votes) {
+    if (auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+        notar != nullptr && notar->id == *attacked_candidate_id) {
+      return td::Status::Error(PSTRING() << "honest validator #" << record.src_node_idx
+                                         << " voted Notar for wrong-parent-hash candidate "
+                                         << *attacked_candidate_id);
+    }
+  }
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+        notar != nullptr && notar->id == *attacked_candidate_id) {
+      return td::Status::Error(PSTRING() << "wrong-parent-hash candidate " << *attacked_candidate_id
+                                         << " still reached a notarization certificate");
+    }
+  }
+
+  bool saw_skip_cert = false;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote);
+        skip != nullptr && skip->slot == attacked_candidate_id->slot) {
+      saw_skip_cert = true;
+      break;
+    }
+  }
+  if (!saw_skip_cert) {
+    return td::Status::Error(PSTRING() << "attacked slot " << attacked_candidate_id->slot
+                                       << " never cleared by Skip");
+  }
+
+  bool saw_later_finalization = false;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx != 1 && record.id.slot > attacked_candidate_id->slot) {
+      saw_later_finalization = true;
+      break;
+    }
+  }
+  if (!saw_later_finalization) {
+    return td::Status::Error(PSTRING() << "honest validators never finalized past wrong-parent-hash slot "
+                                       << attacked_candidate_id->slot);
+  }
+
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -3112,6 +3366,14 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_count_threshold_mismatch_preserves_safety(snapshot);
     case TestCase::StandstillFloodStillRecovers:
       return verify_standstill_flood_still_recovers(snapshot);
+    case TestCase::SeveralWindowsFullySkippedThenProgressResumes:
+      return verify_several_windows_fully_skipped_then_progress_resumes(snapshot);
+    case TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization:
+      return verify_adjacent_window_fork_rolls_back_after_late_alternate_finalization(snapshot);
+    case TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery:
+      return verify_standstill_without_certificate_rebroadcast_requires_recovery(snapshot);
+    case TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve:
+      return verify_good_candidate_with_wrong_slot_parent_hash_does_not_resolve(snapshot);
   }
   UNREACHABLE();
 }
@@ -5164,6 +5426,63 @@ class TestConsensus : public td::actor::Actor {
       }
       STANDSTILL_TIMEOUT_S = 0.5;
     }
+    if (TEST_CASE == TestCase::SeveralWindowsFullySkippedThenProgressResumes) {
+      if (N_NODES == 8) {
+        N_NODES = 13;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 6.0;
+      }
+    }
+    if (TEST_CASE == TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 4.0;
+      }
+    }
+    if (TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 200;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 4.0;
+      }
+      STANDSTILL_TIMEOUT_S = 0.5;
+    }
+    if (TEST_CASE == TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 4.0;
+      }
+    }
     if (TEST_CASE == TestCase::DelayedFinalizationObservationPreservesPrefix) {
       if (N_NODES == 8) {
         N_NODES = 4;
@@ -5322,7 +5641,8 @@ class TestConsensus : public td::actor::Actor {
            TEST_CASE == TestCase::LaterSlotWaitsForGapSkipProof ||
            TEST_CASE == TestCase::EquivocatingLeaderDoesNotCreateTwoNotarsOrFinals ||
            TEST_CASE == TestCase::MultiSlotEquivocationWindowPreservesSafety ||
-           TEST_CASE == TestCase::StandstillFloodStillRecovers;
+           TEST_CASE == TestCase::StandstillFloodStillRecovers ||
+           TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery;
   }
 
   td::actor::Task<> run_test_case_scenario() {
@@ -5653,6 +5973,121 @@ class TestConsensus : public td::actor::Actor {
       co_await set_instance_network_disabled_for_test(2, 0, false);
       co_await td::actor::coro_sleep(td::Timestamp::in(0.6));
       co_await set_instance_network_disabled_for_test(3, 0, false);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::SeveralWindowsFullySkippedThenProgressResumes) {
+      // Covers Kernel-28's explicit fully-skipped-window regression:
+      // three consecutive silent leaders should yield three skipped slots, then later honest
+      // windows should resume finalization.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+        }
+      }
+      td::uint32 first_silent_slot = highest_finalized_slot + static_cast<td::uint32>(N_NODES);
+      std::vector<size_t> silent_nodes = {static_cast<size_t>(first_silent_slot % N_NODES),
+                                          static_cast<size_t>((first_silent_slot + 1) % N_NODES),
+                                          static_cast<size_t>((first_silent_slot + 2) % N_NODES)};
+      co_await set_consecutive_silent_leaders_expectations_for_test(silent_nodes, first_silent_slot, 3);
+      co_await clear_traces();
+      for (size_t node_idx : silent_nodes) {
+        co_await stop_instance(node_idx, 0);
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::AdjacentWindowForkRollsBackAfterLateAlternateFinalization) {
+      // Covers Kernel-28's adjacent-window rollback regression:
+      // keep one slot forked across adjacent single-slot windows, then require later honest
+      // finalization to collapse the fork without any forbidden late Final votes on the fork.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+      }
+      td::uint32 attacked_slot = highest_finalized_slot + static_cast<td::uint32>(N_NODES) + 1;
+      while (attacked_slot % N_NODES != 0) {
+        ++attacked_slot;
+      }
+      co_await set_forked_slot_for_test(attacked_slot);
+      co_await clear_traces();
+      for (size_t dst_node_idx : {1UL, 2UL, 3UL}) {
+        co_await set_drop_notar_votes_for_test(dst_node_idx, attacked_slot, attacked_slot + 1);
+        co_await set_drop_notar_certs_for_test(dst_node_idx, attacked_slot, attacked_slot + 1);
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery) {
+      // Covers Kernel-28's explicit standstill-recovery regression:
+      // validator #0 misses normal cert traffic for a slot, then only catches up after standstill
+      // rebroadcast once the certificate filter is lifted.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+        }
+      }
+      td::uint32 attacked_slot = highest_finalized_slot + static_cast<td::uint32>(N_NODES);
+      while (attacked_slot % N_NODES != 1) {
+        ++attacked_slot;
+      }
+      td::uint32 blocked_until_slot = attacked_slot + 8;
+      for (auto kind : {TestMessageFilters::ProtocolKind::NotarVote, TestMessageFilters::ProtocolKind::FinalVote,
+                        TestMessageFilters::ProtocolKind::NotarCert, TestMessageFilters::ProtocolKind::FinalCert}) {
+        for (size_t src_node_idx = 1; src_node_idx < N_NODES; ++src_node_idx) {
+          co_await set_selective_protocol_drop_for_test(src_node_idx, 0, {0}, attacked_slot, blocked_until_slot, kind);
+        }
+      }
+      co_await clear_traces();
+      co_await wait_for_finalization_past_slot_on(1, 0, attacked_slot, 5.0);
+      co_await stop_instance(2, 0);
+      co_await stop_instance(3, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.8));
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.standstill_recovery_slot = attacked_slot;
+        test_expectations.standstill_recovery_release_ts = td::Time::now_unadjusted();
+      }
+      co_await clear_test_message_filters();
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve) {
+      // Covers Kernel-28's wrong-slot-parent-hash regression:
+      // inject an otherwise well-formed full candidate whose parent id hash cannot match the slot
+      // chain, and require the attacked slot to clear by Skip instead of Notar.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+        }
+      }
+      td::uint32 attacked_slot = highest_finalized_slot + static_cast<td::uint32>(N_NODES) + 1;
+      while (attacked_slot % N_NODES != 1) {
+        ++attacked_slot;
+      }
+      co_await clear_traces();
+      co_await stop_instance(1, 0);
+      ParentId wrong_parent =
+          CandidateId{attacked_slot - 1, from_hex("1111111122222222333333334444444455555555666666667777777788888888")};
+      auto candidate =
+          make_synthetic_full_candidate_for_test(attacked_slot, wrong_parent, PeerValidatorId{1}, attacked_slot - 1,
+                                                 0xC0FFEE00ULL + attacked_slot);
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.wrong_parent_hash_candidate_id = candidate->id;
+      }
+      co_await inject_candidate_for_test(1, {0}, candidate);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }
