@@ -19,6 +19,8 @@
 
 #include "block-auto.h"
 
+#include <cmath>
+
 using namespace ton;
 using namespace ton::validator;
 using namespace ton::validator::consensus;
@@ -67,6 +69,7 @@ enum class TestCase {
   Smoke,
   NoDoubleNotar,
   CandidateResolutionRecovery,
+  SkipTimeoutUsesLastFinalization,
   NotarRequiresParentNotar,
   EmptyCandidatesConsensus,
   StandstillRebroadcastContents,
@@ -88,6 +91,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "candidate-resolution-recovery") {
     return TestCase::CandidateResolutionRecovery;
+  }
+  if (s == "skip-timeout-uses-last-finalization") {
+    return TestCase::SkipTimeoutUsesLastFinalization;
   }
   if (s == "notar-requires-parent-notar") {
     return TestCase::NotarRequiresParentNotar;
@@ -152,6 +158,9 @@ td::uint32 TARGET_RATE_MS = 1000;
 td::uint32 SLOTS_PER_LEADER_WINDOW = 4;
 TestCase TEST_CASE = TestCase::Smoke;
 double STANDSTILL_TIMEOUT_S = 10.0;
+double FIRST_BLOCK_TIMEOUT_S = 1.0;
+double FIRST_BLOCK_TIMEOUT_MULTIPLIER = 1.05;
+double FIRST_BLOCK_MAX_TIMEOUT_S = 100.0;
 
 std::pair<double, double> GREMLIN_PERIOD = {-1.0, -1.0};
 std::pair<double, double> GREMLIN_DOWNTIME = {1.0, 1.0};
@@ -172,6 +181,9 @@ std::pair<double, double> VALIDATION_TIME = {0.0, 0.0};
 struct TestMessageFilters {
   std::optional<size_t> drop_final_cert_dst_node;
   std::optional<td::uint32> drop_final_cert_from_slot;
+  std::optional<size_t> drop_notar_cert_dst_node;
+  std::optional<td::uint32> drop_notar_cert_start_slot;
+  std::optional<td::uint32> drop_notar_cert_end_slot;
   std::optional<size_t> drop_candidate_dst_node;
   std::optional<td::uint32> drop_candidate_start_slot;
   std::optional<td::uint32> drop_candidate_end_slot;
@@ -185,6 +197,8 @@ TestMessageFilters test_message_filters;
 
 struct TestExpectations {
   std::optional<CandidateId> candidate_resolution_target;
+  std::optional<td::uint32> skip_timeout_last_finalized_window;
+  std::optional<td::uint32> skip_timeout_stalled_window;
 };
 
 std::mutex test_expectations_mutex;
@@ -900,6 +914,95 @@ td::Status verify_no_misbehavior_reports(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_skip_timeout_uses_last_finalization(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 6 and §4.2:
+  // skip timeout in window k must be lower-bounded by T0 * alpha^(k-k*-1), where k* is determined
+  // by the last observed finalization when window k becomes active.
+  std::optional<td::uint32> last_finalized_window;
+  std::optional<td::uint32> earliest_expected_skip_window;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    last_finalized_window = test_expectations.skip_timeout_last_finalized_window;
+    earliest_expected_skip_window = test_expectations.skip_timeout_stalled_window;
+  }
+  if (!last_finalized_window.has_value() || !earliest_expected_skip_window.has_value()) {
+    return td::Status::Error("Rule 6 scenario did not register the expected windows");
+  }
+
+  std::optional<td::uint32> actual_skip_window;
+  double first_skip_ts = 0.0;
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx != 0 || record.src_instance_idx != 0) {
+      continue;
+    }
+    auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote);
+    if (skip == nullptr) {
+      continue;
+    }
+    td::uint32 window = skip->slot / SLOTS_PER_LEADER_WINDOW;
+    if (window < *earliest_expected_skip_window) {
+      continue;
+    }
+    if (!actual_skip_window.has_value() || window < *actual_skip_window ||
+        (window == *actual_skip_window && record.ts < first_skip_ts)) {
+      actual_skip_window = window;
+      first_skip_ts = record.ts;
+    }
+  }
+  if (!actual_skip_window.has_value()) {
+    std::set<td::uint32> skip_windows;
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx != 0 || record.src_instance_idx != 0) {
+        continue;
+      }
+      auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote);
+      if (skip == nullptr) {
+        continue;
+      }
+      skip_windows.insert(skip->slot / SLOTS_PER_LEADER_WINDOW);
+    }
+    td::StringBuilder sb;
+    sb << "[";
+    bool first = true;
+    for (td::uint32 window : skip_windows) {
+      if (!first) {
+        sb << ",";
+      }
+      first = false;
+      sb << window;
+    }
+    sb << "]";
+    return td::Status::Error(PSTRING() << "scenario did not produce any SkipVote in window "
+                                       << *earliest_expected_skip_window << " or later; observed skip windows="
+                                       << sb.as_cslice());
+  }
+
+  std::optional<double> stalled_window_start_ts;
+  td::uint32 stalled_window_start_slot = *actual_skip_window * SLOTS_PER_LEADER_WINDOW;
+  for (const auto& record : snapshot.leader_windows_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.start_slot == stalled_window_start_slot) {
+      stalled_window_start_ts = record.ts;
+      break;
+    }
+  }
+  if (!stalled_window_start_ts.has_value()) {
+    return td::Status::Error(PSTRING() << "scenario did not observe skip window " << *actual_skip_window
+                                       << " on validator #0.0");
+  }
+
+  double observed_delay_s = first_skip_ts - *stalled_window_start_ts;
+  double spec_lower_bound_s =
+      FIRST_BLOCK_TIMEOUT_S *
+      std::pow(FIRST_BLOCK_TIMEOUT_MULTIPLIER, *actual_skip_window - *last_finalized_window - 1);
+  if (observed_delay_s + 0.15 < spec_lower_bound_s) {
+    return td::Status::Error(PSTRING() << "validator #0.0 skipped window " << *actual_skip_window << " after "
+                                       << observed_delay_s << "s, below Rule 6 lower bound " << spec_lower_bound_s
+                                       << "s from last finalized window " << *last_finalized_window);
+  }
+
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -908,6 +1011,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_no_double_notar(snapshot);
     case TestCase::CandidateResolutionRecovery:
       return verify_candidate_resolution_recovery(snapshot);
+    case TestCase::SkipTimeoutUsesLastFinalization:
+      return verify_skip_timeout_uses_last_finalization(snapshot);
     case TestCase::NotarRequiresParentNotar:
       return verify_notar_requires_parent_notar(snapshot);
     case TestCase::EmptyCandidatesConsensus:
@@ -1361,15 +1466,21 @@ bool should_drop_protocol_message(const TestSimplexBus& bus, size_t dst_node_idx
   if (!maybe_certificate.has_value()) {
     return false;
   }
-  auto* final = std::get_if<simplex::FinalizeVote>(&maybe_certificate->vote.vote);
-  if (final == nullptr) {
-    return false;
-  }
 
   std::scoped_lock lock(test_message_filters_mutex);
-  return test_message_filters.drop_final_cert_dst_node == dst_node_idx &&
-         test_message_filters.drop_final_cert_from_slot.has_value() &&
-         final->id.slot >= *test_message_filters.drop_final_cert_from_slot;
+  if (auto* final = std::get_if<simplex::FinalizeVote>(&maybe_certificate->vote.vote)) {
+    return test_message_filters.drop_final_cert_dst_node == dst_node_idx &&
+           test_message_filters.drop_final_cert_from_slot.has_value() &&
+           final->id.slot >= *test_message_filters.drop_final_cert_from_slot;
+  }
+  if (auto* notar = std::get_if<simplex::NotarizeVote>(&maybe_certificate->vote.vote)) {
+    return test_message_filters.drop_notar_cert_dst_node == dst_node_idx &&
+           test_message_filters.drop_notar_cert_start_slot.has_value() &&
+           test_message_filters.drop_notar_cert_end_slot.has_value() &&
+           notar->id.slot >= *test_message_filters.drop_notar_cert_start_slot &&
+           notar->id.slot < *test_message_filters.drop_notar_cert_end_slot;
+  }
+  return false;
 }
 
 bool should_drop_candidate_delivery(size_t dst_node_idx, const CandidateRef& candidate) {
@@ -2050,6 +2161,14 @@ class TestConsensus : public td::actor::Actor {
     co_return td::Unit{};
   }
 
+  td::actor::Task<> set_drop_notar_certs_for_test(size_t dst_node_idx, td::uint32 start_slot, td::uint32 end_slot) {
+    std::scoped_lock lock(test_message_filters_mutex);
+    test_message_filters.drop_notar_cert_dst_node = dst_node_idx;
+    test_message_filters.drop_notar_cert_start_slot = start_slot;
+    test_message_filters.drop_notar_cert_end_slot = end_slot;
+    co_return td::Unit{};
+  }
+
   td::actor::Task<> set_drop_candidates_for_test(size_t dst_node_idx, td::uint32 start_slot, td::uint32 end_slot) {
     std::scoped_lock lock(test_message_filters_mutex);
     test_message_filters.drop_candidate_dst_node = dst_node_idx;
@@ -2070,6 +2189,14 @@ class TestConsensus : public td::actor::Actor {
   td::actor::Task<> set_candidate_resolution_target_for_test(CandidateId id) {
     std::scoped_lock lock(test_expectations_mutex);
     test_expectations.candidate_resolution_target = id;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_skip_timeout_expectations_for_test(td::uint32 last_finalized_window,
+                                                           td::uint32 stalled_window) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.skip_timeout_last_finalized_window = last_finalized_window;
+    test_expectations.skip_timeout_stalled_window = stalled_window;
     co_return td::Unit{};
   }
 
@@ -2178,6 +2305,20 @@ class TestConsensus : public td::actor::Actor {
         DURATION = 5.0;
       }
     }
+    if (TEST_CASE == TestCase::SkipTimeoutUsesLastFinalization) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 100;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 4.0;
+      }
+      if (FIRST_BLOCK_TIMEOUT_MULTIPLIER == 1.05) {
+        FIRST_BLOCK_TIMEOUT_MULTIPLIER = 2.0;
+      }
+    }
   }
 
   td::actor::Task<> wait_for_finalization_on(size_t node_idx, size_t instance_idx, double timeout_s) {
@@ -2195,8 +2336,26 @@ class TestConsensus : public td::actor::Actor {
                                           << instance_idx);
   }
 
+  td::actor::Task<> wait_for_leader_window_observed_on(size_t node_idx, size_t instance_idx, td::uint32 start_slot,
+                                                       double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      for (const auto& record : snapshot.leader_windows_observed) {
+        if (record.node_idx == node_idx && record.instance_idx == instance_idx && record.start_slot == start_slot) {
+          co_return td::Unit{};
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for leader window " << start_slot << " on validator #"
+                                          << node_idx << "." << instance_idx);
+  }
+
   bool skip_finalize_for_test_case() const {
-    return TEST_CASE == TestCase::StandstillRebroadcastContents || TEST_CASE == TestCase::CandidateResolutionRecovery;
+    return TEST_CASE == TestCase::StandstillRebroadcastContents ||
+           TEST_CASE == TestCase::CandidateResolutionRecovery ||
+           TEST_CASE == TestCase::SkipTimeoutUsesLastFinalization;
   }
 
   td::actor::Task<> run_test_case_scenario() {
@@ -2249,6 +2408,38 @@ class TestConsensus : public td::actor::Actor {
       resolve_candidate_for_test(0, 0, *target_id).start().detach();
       co_await td::actor::coro_sleep(td::Timestamp::in(1.5));
       start_instance(3, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::SkipTimeoutUsesLastFinalization) {
+      // Drives simplex_docs.md Rule 6 and the §4.2 known implementation deviation:
+      // freeze validator #0.0's last observed finalization after one finalized window, let the
+      // next window clear normally, then withhold all candidates in the following window and check
+      // whether Skip is delayed according to the last reached finalization rather than reset.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      std::optional<td::uint32> finalized_slot;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          finalized_slot = std::max(finalized_slot.value_or(0), record.id.slot);
+        }
+      }
+      if (!finalized_slot.has_value()) {
+        co_return td::Status::Error("Rule 6 scenario did not observe any finalized slot on validator #0.0");
+      }
+
+      td::uint32 last_finalized_window = *finalized_slot / SLOTS_PER_LEADER_WINDOW;
+      td::uint32 clear_without_skip_start_slot = (last_finalized_window + 1) * SLOTS_PER_LEADER_WINDOW;
+      td::uint32 stalled_window = last_finalized_window + 2;
+      td::uint32 stalled_window_start_slot = stalled_window * SLOTS_PER_LEADER_WINDOW;
+      co_await set_skip_timeout_expectations_for_test(last_finalized_window, stalled_window);
+      co_await set_drop_final_certs_for_test(0, clear_without_skip_start_slot);
+      co_await clear_traces();
+      co_await wait_for_leader_window_observed_on(0, 0, clear_without_skip_start_slot, 5.0);
+      co_await set_drop_candidates_for_test(0, stalled_window_start_slot,
+                                            stalled_window_start_slot + SLOTS_PER_LEADER_WINDOW);
+      co_await set_drop_notar_certs_for_test(0, stalled_window_start_slot,
+                                             stalled_window_start_slot + SLOTS_PER_LEADER_WINDOW);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }
@@ -2377,12 +2568,17 @@ class TestConsensus : public td::actor::Actor {
         .target_rate_ms = TARGET_RATE_MS,
         .max_block_size = 1 << 20,
         .max_collated_data_size = 1 << 20,
-        .consensus = NewConsensusConfig::Simplex{.slots_per_leader_window = SLOTS_PER_LEADER_WINDOW}};
+        .consensus = NewConsensusConfig::Simplex{
+            .slots_per_leader_window = SLOTS_PER_LEADER_WINDOW,
+            .first_block_timeout_ms = static_cast<td::uint32>(FIRST_BLOCK_TIMEOUT_S * 1000.0),
+        }};
     bus->simplex_config = bus->config.consensus.get<NewConsensusConfig::Simplex>();
     bus->session_id = SESSION_ID;
     bus->cc_seqno = CC_SEQNO;
     bus->validator_set_hash = validator_set_->get_validator_set_hash();
     bus->populate_collator_schedule();
+    bus->first_block_timeout_multipler = FIRST_BLOCK_TIMEOUT_MULTIPLIER;
+    bus->first_block_max_timeout_s = FIRST_BLOCK_MAX_TIMEOUT_S;
     bus->standstill_timeout_s = STANDSTILL_TIMEOUT_S;
     bus->db = std::make_unique<TestDbImpl>(inst.db_inner);
     inst.bus = runtime.start(std::static_pointer_cast<simplex::Bus>(bus),

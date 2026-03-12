@@ -21,6 +21,13 @@
 - Trigger: stop validator `#0.0`, wipe its simplex DB and candidate storage, restart partial peers without candidate bodies, then restart the only peer that still has the candidate body.
 - Testing impact: Rule 2 now has a deterministic red test. The failure is no longer “scenario not built”; it is that the documented recovery behavior does not complete under this restart/data-loss setup.
 
+## Rule 6 skip timeout resets instead of following the last observed finalization
+
+- Documentation / expectation: Rule 6 requires skip timeout in window `k` to satisfy `T_skip >= T0 * alpha^(k-k*-1)`, where `k*` is the window of the last observed finalization when `k` becomes active.
+- Observed behavior: in the new `skip-timeout-uses-last-finalization` `test-consensus` scenario, validator `#0.0` freezes its observed finalization at window `0` and still skips window `4` after about `1.10 s`, even though the documented lower bound with `T0 = 1 s` and `alpha = 2` is `8.0 s`.
+- Trigger: drop finalization certificates to one validator after the next window boundary, let one later window clear normally, then suppress candidate and notarization-certificate delivery for a later window from that validator's point of view.
+- Testing impact: Rule 6 now has a deterministic red test confirming the timeout-reset bug described in `simplex_docs.md`.
+
 ## Mid-run standstill scenarios can wedge orderly `test-consensus` teardown
 
 - Documentation / expectation: Rule 8 standstill-resolution testing needs the harness to stop or isolate part of the validator set mid-run, wait for rebroadcasts, and then shut down normally.
