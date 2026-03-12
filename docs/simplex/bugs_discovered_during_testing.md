@@ -29,17 +29,6 @@ void handle(BusHandle, std::shared_ptr<const StopRequested>) {
 - Scope:
   this currently looks like a harness/runtime-stop bug, not a protocol bug. I would fix this before drawing any deeper conclusions from restart teardown failures.
 
-## Fixed: Rule 2 request bits were inverted in `CandidateAndCert::make_request()`
-
-- Documentation / expectation: Rule 2 says a validator requests the candidate body and notarization certificate it is missing.
-- Observed behavior before fix: [CandidateAndCert::make_request()](/home/rulon/ton/validator/consensus/simplex/candidate-resolver.cpp#L82) was setting `want_candidate` and `want_notar` from `candidate.has_value()` / `notar_cert.has_value()`, i.e. from the pieces already present locally, not the pieces that were missing.
-- Trigger: a resolver state with neither candidate body nor notarization certificate available locally.
-- Testing impact before fix: the focused unit test in [test-candidate-resolver.cpp](/home/rulon/ton/test/validator/consensus/test-candidate-resolver.cpp#L125) failed because the outgoing request asked for neither piece. The larger `candidate-resolution-recovery` `test-consensus` scenario also stalled in that state.
-- Status:
-  fixed in production code by flipping the request bits to `!candidate.has_value()` and `!notar_cert.has_value()`.
-- Post-fix verification:
-  `./build/test/validator/consensus/test-candidate-resolver --verbosity 0` now passes, including the request-bit unit test, and `timeout 40s ./build/test/validator/consensus/test-consensus --test-case candidate-resolution-recovery --verbosity 0` also returned successfully after the patch.
-
 ## Rule 6 skip timeout resets instead of following the last observed finalization
 
 - Documentation / expectation: Rule 6 requires skip timeout in window `k` to satisfy `T_skip >= T0 * alpha^(k-k*-1)`, where `k*` is the window of the last observed finalization when `k` becomes active.
