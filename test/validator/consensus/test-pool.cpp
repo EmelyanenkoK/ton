@@ -395,15 +395,20 @@ struct StandstillBroadcastContainsExpectedVotesAndCertificates : PoolTest {
     ts_.advance_time(ts_.next_timeout_in());
     co_await ts_.wait_sync_work();
 
-    auto signed_local_vote = make_signed_simplex_vote(ctx(), *bus_, 0, local_vote);
-    auto local_vote_payload =
-        simplex::Signed<simplex::Vote>{signed_local_vote.validator, simplex::Vote{signed_local_vote.vote},
-                                       signed_local_vote.signature.clone()}
-            .serialize();
-
     EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
     EXPECT(contains_outgoing_payload(events(), skip_payload_.as_slice()));
-    EXPECT(contains_outgoing_payload(events(), local_vote_payload.as_slice()));
+    bool saw_local_vote = false;
+    for (const auto& event : events_of<OutgoingProtocolMessage>(events())) {
+      auto decoded = decode_simplex_signed_vote(event->message, PeerValidatorId{0}, *bus_);
+      if (decoded.is_ok()) {
+        if (auto* notar = std::get_if<simplex::NotarizeVote>(&decoded.ok().vote.vote);
+            notar != nullptr && *notar == local_vote) {
+          saw_local_vote = true;
+          break;
+        }
+      }
+    }
+    EXPECT(saw_local_vote);
 
     co_return {};
   }
@@ -583,8 +588,8 @@ struct LongForkRollbackDoesNotBreakFinalizedFrontier : PoolTest {
     // still accept descendants of the finalized block, while stale parents from the old fork are
     // rejected as conflicting.
     auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
-    auto final_id = make_candidate_id(2, 6602);
-    auto stale_parent = make_candidate_id(1, 6611);
+    auto final_id = make_candidate_id(0, 6600);
+    auto stale_parent = make_candidate_id(0, 6611);
 
     handle_.publish<Start>(state);
     co_await ts_.wait_sync_work();
@@ -600,7 +605,7 @@ struct LongForkRollbackDoesNotBreakFinalizedFrontier : PoolTest {
     ASSERT_EQ(finalized.size(), static_cast<size_t>(1));
     EXPECT_EQ(finalized[0]->id, final_id);
 
-    auto current_candidate = make_wait_candidate(make_candidate_id(3, 6603), ParentId{final_id});
+    auto current_candidate = make_wait_candidate(make_candidate_id(1, 6601), ParentId{final_id});
     auto current_result = co_await handle_.publish<simplex::WaitForParent>(current_candidate).wrap();
     ASSERT_TRUE(current_result.is_ok());
     EXPECT(!current_result.ok().has_value());
@@ -615,7 +620,7 @@ struct LongForkRollbackDoesNotBreakFinalizedFrontier : PoolTest {
     EXPECT_EQ(count_events<simplex::NotarizationObserved>(events()), static_cast<size_t>(0));
     EXPECT_EQ(count_events<simplex::FinalizationObserved>(events()), static_cast<size_t>(0));
 
-    auto candidate = make_wait_candidate(make_candidate_id(4, 6604), ParentId{stale_parent});
+    auto candidate = make_wait_candidate(make_candidate_id(1, 6604), ParentId{stale_parent});
     auto result = co_await handle_.publish<simplex::WaitForParent>(candidate).wrap();
     ASSERT_TRUE(result.is_ok());
     ASSERT_TRUE(result.ok().has_value());
