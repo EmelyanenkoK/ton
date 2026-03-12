@@ -709,7 +709,6 @@ class TestConsensus : public td::actor::Actor {
     bus->validator_set_hash = validator_set_->get_validator_set_hash();
     bus->populate_collator_schedule();
     bus->db = std::make_unique<TestDbImpl>(inst.db_inner);
-    bus->load_bootstrap_state();
     inst.bus = runtime.start(std::static_pointer_cast<simplex::Bus>(bus),
                              PSTRING() << "consensus." << node_idx << "." << instance_idx);
     inst.status = Instance::Running;

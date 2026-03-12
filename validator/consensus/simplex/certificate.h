@@ -60,6 +60,23 @@ struct Certificate : td::CntObject {
     return std::visit(visitor, vote.vote);
   }
 
+  auto copy_and_downcast(auto&& func) const
+    requires std::same_as<T, Vote>
+  {
+    auto visitor = [&]<typename U>(const U& vote) {
+      std::vector<typename Certificate<U>::VoteSignature> casted_signatures;
+      for (auto& sig : signatures) {
+        casted_signatures.emplace_back(sig.validator, sig.signature.clone());
+      }
+      auto cert = td::make_ref<Certificate<U>>(vote, std::move(casted_signatures));
+      return func(std::move(cert));
+    };
+    return std::visit(visitor, vote.vote);
+  }
+
+  td::Ref<Certificate<Vote>> consume_and_upcast() &&
+    requires(!std::same_as<T, Vote>);
+
   T vote;
   std::vector<VoteSignature> signatures;
 };

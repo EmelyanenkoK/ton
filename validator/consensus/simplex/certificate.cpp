@@ -91,6 +91,17 @@ td::Ref<block::BlockSignatureSet> Certificate<T>::to_signature_set(const Candida
             candidate->hash_data().to_tl());
 }
 
+template <ValidVote T>
+td::Ref<Certificate<Vote>> Certificate<T>::consume_and_upcast() &&
+  requires(!std::same_as<T, Vote>)
+{
+  std::vector<Certificate<Vote>::VoteSignature> casted_signatures;
+  for (auto& sig : signatures) {
+    casted_signatures.emplace_back(sig.validator, std::move(sig.signature));
+  }
+  return td::make_ref<Certificate<Vote>>(vote, std::move(casted_signatures));
+}
+
 template struct Certificate<NotarizeVote>;
 template struct Certificate<SkipVote>;
 template struct Certificate<FinalizeVote>;
