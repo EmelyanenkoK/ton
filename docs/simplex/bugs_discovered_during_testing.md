@@ -16,6 +16,63 @@ void handle(BusHandle, std::shared_ptr<const StopRequested>) {
 }
 ```
 
+## `simplex::Db` marks votes and certificates saved before the write actually succeeds
+
+- Documentation / expectation: local vote and certificate persistence is supposed to be durable state. If `db->set()` fails, the same vote or certificate must remain retryable.
+- Observed behavior: the new unit tests [SimplexDb_RetriesBroadcastVoteAfterSetFailure](/home/rulon/ton/test/validator/consensus/test-simplex-db.cpp#L288) and [SimplexDb_RetriesCertificateSaveAfterSetFailure](/home/rulon/ton/test/validator/consensus/test-simplex-db.cpp#L311) both fail. After one injected `db->set()` failure, retrying the exact same object is rejected as already stored.
+- Observed code: [validator/consensus/simplex/db.cpp](/home/rulon/ton/validator/consensus/simplex/db.cpp#L54) inserts the vote hash into `saved_votes` and advances `next_seqno_` before awaiting `db->set()`. The certificate path at [validator/consensus/simplex/db.cpp](/home/rulon/ton/validator/consensus/simplex/db.cpp#L69) does the same `saved_votes` pre-mutation.
+- Probable cause: the in-memory dedup / seqno state is being treated as committed state instead of post-commit state. A failed write leaves memory saying “already saved” while the backing db never recorded it.
+- Testing impact: both retry tests are now deterministic red tests.
+- What should be fixed:
+  move `saved_votes.insert(...)` and `next_seqno_` advancement to after successful `db->set()`.
+- Minimal patch for `BroadcastVote`:
+```diff
+-    saved_votes.insert(hash);
+-
+     auto key = create_serialize_tl_object<tl::db_key_vote>(hash);
+-    auto value = create_serialize_tl_object<tl::db_ourVote>(std::move(vote), next_seqno_++);
+-    co_return co_await owning_bus()->db->set(std::move(key), std::move(value));
++    auto seqno = next_seqno_;
++    auto value = create_serialize_tl_object<tl::db_ourVote>(std::move(vote), seqno);
++    co_await owning_bus()->db->set(std::move(key), std::move(value));
++    saved_votes.insert(hash);
++    next_seqno_ = seqno + 1;
++    co_return {};
+```
+- Minimal patch for `SaveCertificate`:
+```diff
+-    saved_votes.insert(hash);
+-
+     auto key = create_serialize_tl_object<tl::db_key_vote>(hash);
+     auto value = create_serialize_tl_object<tl::db_cert>(std::move(cert));
+-    co_return co_await owning_bus()->db->set(std::move(key), std::move(value));
++    co_await owning_bus()->db->set(std::move(key), std::move(value));
++    saved_votes.insert(hash);
++    co_return {};
+```
+
+## `simplex::Pool::WaitForParent` stays blocked after the last missing gap skip certificate arrives
+
+- Documentation / expectation: Rule 4 says a candidate should proceed once its parent notarization and every skipped slot in the gap are locally proven.
+- Observed behavior: the new unit test [Pool_WaitsForMissingGapSkipCertificates](/home/rulon/ton/test/validator/consensus/test-pool.cpp#L241) shows the negative gate works at first, but even after the final missing skip cert is injected, `WaitForParent` never resumes.
+- Narrowing evidence:
+  the test sees the new skip certificate go through `SaveCertificate`, so the failure is not “certificate never decoded” or “request was resolved too early”. The actor accepts the new cert and still leaves the request pending.
+- Probable cause: the bug is likely in the post-save gap bookkeeping around [handle_typed_saved_certificate(SkipCertRef)](/home/rulon/ton/validator/consensus/simplex/pool.cpp#L768) and [maybe_resolve_requests()](/home/rulon/ton/validator/consensus/simplex/pool.cpp#L693). Either `skip_intervals_` is not transitioning to the expected boundary after the new skip cert, or pending `WaitForParent` requests are not being re-resolved against the updated interval state the way Rule 4 expects.
+- Testing impact: `test-pool` is now red until this gap-resolution path is fixed.
+- What should be fixed:
+  instrument `skip_intervals_` and the `Request{id,parent}` vector around `handle_saved_certificate(SkipCertRef)` and confirm that a request with `parent.slot = 0`, `id.slot = 3`, and newly known skips for slots `1` and `2` transitions from pending to resolved.
+
+## `simplex::CandidateResolver` can remain unresolved after ignoring a malformed peer response
+
+- Documentation / expectation: Rule 2 says malformed or irrelevant peer data should be ignored, but later valid data should still allow resolution to complete.
+- Observed behavior: the new unit test [CandidateResolver_IgnoresWrongIdResponseAndKeepsWaiting](/home/rulon/ton/test/validator/consensus/test-candidate-resolver.cpp#L216) first receives a response with the wrong candidate id, then a later response with the correct candidate body and notar cert. The actor does issue the second request, but the overall `ResolveCandidate` task still never completes.
+- Narrowing evidence:
+  this is not the old request-bit bug. The test proves the resolver survives the malformed response far enough to send another request. The failure is in the “accept later good data and finish resolution” part.
+- Probable cause: the issue is likely in the completion path around [resolve_candidate_inner()](/home/rulon/ton/validator/consensus/simplex/candidate-resolver.cpp#L320) and [resolve_candidate_task()](/home/rulon/ton/validator/consensus/simplex/candidate-resolver.cpp#L304). After a malformed response has been ignored, either the later `merge(...)` is not making `candidate_and_cert` complete as expected, or the resolve awaiters are not being resumed after the state becomes complete.
+- Testing impact: `test-candidate-resolver` is now red until malformed-response recovery is fixed.
+- What should be fixed:
+  trace `CandidateAndCert::from_tl(...)`, `CandidateAndCert::merge(...)`, and `maybe_resume_resolve_awaiters(...)` for the sequence “wrong-id response, then correct response” and confirm that the second response actually completes both missing pieces and wakes the bridge created in `ResolveCandidate`.
+
 ## Restart after wiping simplex state can wedge `test-consensus` shutdown
 
 - Documentation / expectation: Rule 2 candidate-resolution testing needs the harness to stop one node, wipe its local simplex state, restart it, and then shut the whole run down cleanly.
