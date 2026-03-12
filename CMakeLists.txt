@@ -689,6 +689,8 @@ target_link_libraries(test-validator-session-state adnl dht rldp validatorsessio
 
 add_executable(test-overlay test/test-overlay.cpp)
 target_link_libraries(test-overlay overlay tdutils tdactor adnl adnltest tl_api dht )
+add_executable(test-overlay-manager test/test-td-main.cpp test/test-overlay-manager.cpp)
+target_link_libraries(test-overlay-manager overlay tdutils tdactor adnl adnltest tl_api dht)
 add_executable(test-catchain test/test-catchain.cpp)
 target_link_libraries(test-catchain overlay tdutils tdactor adnl adnltest rldp tl_api dht
   catchain )
@@ -805,6 +807,7 @@ endif()
 if (NOT TON_ONLY_TONLIB)
 ton_test(test-adnl)
 ton_test(test-dht)
+ton_test(test-overlay-manager)
 ton_test(test-rldp)
 ton_test(test-rldp2)
 ton_test(test-validator-session-state)
