@@ -153,3 +153,24 @@ timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-tim
   derive the manager `soft_timeout` from the remaining time until the current slot deadline, not
   from an unconditional full `target_rate_`, and after collation/signing re-check that the result
   is still within the slot budget before publishing it.
+
+## Simplex vote / certificate parsing still accepts an oversized skip slot
+
+- Documentation / expectation: `tracker-test-plan.md` `Kernel-27` / `Kernel-31` requires malformed
+  or oversized window-slot values to be rejected at parse time rather than silently reinterpreted.
+- Observed behavior: `SimplexParser_CertificateFromTlRejectsOversizedWindowSlot` is red.
+  A certificate carrying `skipVote(-1)` is still accepted and interpreted as slot `0xffffffff`.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-simplex-parser --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/simplex/votes.cpp` currently does
+  `SkipVote::from_tl(const tl::skipVote& vote) { return {static_cast<td::uint32>(vote.slot_)}; }`.
+  That means negative `int32` input is silently wrapped into a huge `uint32` slot before later
+  certificate logic sees it.
+- Probable cause:
+  there is no range check when converting TL `skipVote.slot_` into the internal `td::uint32 slot`.
+- What should be fixed:
+  reject negative or otherwise invalid slot values in the vote parser before constructing
+  `SkipVote`, and keep the parser-level regression red until that check is in place.
