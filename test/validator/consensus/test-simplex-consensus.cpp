@@ -383,6 +383,49 @@ struct DuplicateCandidateReceivedDoesNotDoubleNotar : SimplexConsensusTest {
 };
 REGISTER_TEST(SimplexConsensus, DuplicateCandidateReceivedDoesNotDoubleNotar);
 
+struct SkipVoteIncreasesNextWindowFirstBlockTimeout : SimplexConsensusTest {
+  TestOptions options() const override {
+    auto opts = SimplexConsensusTest::options();
+    opts.weight_distribution = {1, 1};
+    opts.slots_per_leader_window = 1;
+    opts.target_rate_ms = 1000;
+    opts.first_block_timeout_ms = 1000;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-31 commit 2bd39cea8 in the actor that actually owns it:
+    // after a skipped window, ConsensusImpl should increase the next window's first-block timeout
+    // instead of resetting it to the default immediately.
+    auto base = ParentId{make_candidate_id(0, 2290)};
+    auto parent_state = make_normal_state(ctx().shard(), 15, min_mc_block_id);
+
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(0, base);
+    co_await ts_.wait_sync_work();
+    double window0_timeout_s = ts_.next_timeout_in();
+
+    ts_.advance_time(window0_timeout_s);
+    co_await ts_.wait_sync_work();
+
+    auto skip_votes = published_votes<simplex::SkipVote>(observer().broadcast_votes_);
+    ASSERT_EQ(skip_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(skip_votes[0].slot, static_cast<td::uint32>(0));
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(1, base);
+    co_await ts_.wait_sync_work();
+    double window1_timeout_s = ts_.next_timeout_in();
+
+    EXPECT(window1_timeout_s > window0_timeout_s);
+    EXPECT(window1_timeout_s >= 2.0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(SimplexConsensus, SkipVoteIncreasesNextWindowFirstBlockTimeout);
+
 struct Rule6SkipTimeoutUsesLastObservedFinalization : SimplexConsensusTest {
   TestOptions options() const override {
     auto opts = SimplexConsensusTest::options();
