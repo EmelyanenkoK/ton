@@ -181,6 +181,31 @@ struct CachesAcceptedFullCandidates : BlockValidatorTest {
 };
 REGISTER_TEST(BlockValidator, CachesAcceptedFullCandidates);
 
+struct DoesNotCacheRejectedFullCandidates : BlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the opposite cache edge case:
+    // rejected full candidates must not be inserted into the local cache, because later stages
+    // must not be able to resolve them as if they had passed validation.
+    mock_->validate.returns(CandidateReject{.reason = "bad block", .proof = td::BufferSlice()});
+
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto bc = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{0});
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
+    EXPECT(result.has<CandidateReject>());
+
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(mock_->cached_candidate_ids.size(), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, DoesNotCacheRejectedFullCandidates);
+
 struct WaitsUntilGenUtime : BlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
     double future_utime = td::Time::system_now() + 5.0;
