@@ -183,6 +183,34 @@ struct SignsGeneratedCandidates : BlockProducerTest {
 };
 REGISTER_TEST(BlockProducer, SignsGeneratedCandidates);
 
+struct SignsEmptyCandidates : BlockProducerTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the "Candidates" definition in simplex_docs.md for the empty-candidate path:
+    // even when the payload is just a referenced block, the produced candidate still includes
+    // sigma, a valid leader signature over the candidate id and parent reference.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto ahead_state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    auto parent = CandidateId{.slot = 17, .hash = bits256_pattern(1717)};
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{parent}, ahead_state, 8, 12, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    auto candidate = generated[0]->candidate;
+    EXPECT(candidate->is_empty());
+    auto id_to_sign = serialize_tl_object(candidate->id.to_tl(), true);
+    EXPECT(handle_->local_id.check_signature(handle_->session_id, id_to_sign, candidate->signature));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, SignsEmptyCandidates);
+
 struct GeneratesChainedCandidatesForWholeLeaderWindow : BlockProducerTest {
   TestOptions options() const override {
     auto opts = TestOptions{};
