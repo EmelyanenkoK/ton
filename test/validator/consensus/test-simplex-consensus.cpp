@@ -287,6 +287,102 @@ struct ValidCandidateNotarizesAndFinalizesOnMatchingNotarCert : SimplexConsensus
 };
 REGISTER_TEST(SimplexConsensus, ValidCandidateNotarizesAndFinalizesOnMatchingNotarCert);
 
+struct ObservedNotarBeforeTryNotarCompletionStillFinalizesOnce : SimplexConsensusTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers tracker Kernel-15 against simplex_docs.md Rule 5:
+    // if NotarCert is observed before local try_notar() finishes its WaitForParent/ResolveState/
+    // validation pipeline, the later local Notar vote must still trigger exactly one FinalizeVote.
+    auto candidate =
+        make_wait_candidate(make_candidate_id(1, 2051), ParentId{make_candidate_id(0, 2050)}, PeerValidatorId{0});
+    auto parent_state = make_normal_state(ctx().shard(), 12, min_mc_block_id);
+
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+    observer().validation_results_.push_back(CandidateAccept{});
+
+    ConsensusBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 0);
+    auto notar_cert = make_simplex_certificate(ctx(), seed_bus, simplex::NotarizeVote{candidate->id}, {0, 1});
+
+    handle_.publish<CandidateReceived>(candidate);
+    handle_.publish<simplex::NotarizationObserved>(candidate->id, notar_cert);
+    co_await ts_.wait_sync_work();
+
+    auto notar_votes = published_votes<simplex::NotarizeVote>(observer().broadcast_votes_);
+    auto final_votes = published_votes<simplex::FinalizeVote>(observer().broadcast_votes_);
+    ASSERT_EQ(notar_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(notar_votes[0].id, candidate->id);
+    ASSERT_EQ(final_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(final_votes[0].id, candidate->id);
+
+    handle_.publish<simplex::NotarizationObserved>(candidate->id, notar_cert);
+    co_await ts_.wait_sync_work();
+
+    final_votes = published_votes<simplex::FinalizeVote>(observer().broadcast_votes_);
+    ASSERT_EQ(final_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(final_votes[0].id, candidate->id);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(SimplexConsensus, ObservedNotarBeforeTryNotarCompletionStillFinalizesOnce);
+
+struct ValidationRejectDoesNotCastVoteOrReportMisbehavior : SimplexConsensusTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the Kernel-23 validation-reject side-effect guard:
+    // a failed ValidationRequest must stop the pipeline without emitting local votes or accusing
+    // the candidate leader of misbehavior, because rejection alone is not contradictory proof.
+    auto candidate =
+        make_wait_candidate(make_candidate_id(2, 2152), ParentId{make_candidate_id(1, 2151)}, PeerValidatorId{1});
+    auto parent_state = make_normal_state(ctx().shard(), 13, min_mc_block_id);
+
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+    observer().validation_results_.push_back(
+        CandidateReject{.reason = "synthetic validation failure", .proof = td::BufferSlice()});
+
+    handle_.publish<CandidateReceived>(candidate);
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(observer().wait_for_parent_candidate_ids_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().resolve_state_requests_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().validation_candidate_ids_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().broadcast_votes_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().misbehavior_reports_.size(), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(SimplexConsensus, ValidationRejectDoesNotCastVoteOrReportMisbehavior);
+
+struct DuplicateCandidateReceivedDoesNotDoubleNotar : SimplexConsensusTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the duplicate CandidateReceived edge from Kernel-23 / Kernel-28:
+    // replaying the same candidate before try_notar() finishes must not start a second pipeline or
+    // emit duplicate local Notar votes.
+    auto candidate =
+        make_wait_candidate(make_candidate_id(3, 2253), ParentId{make_candidate_id(2, 2252)}, PeerValidatorId{0});
+    auto parent_state = make_normal_state(ctx().shard(), 14, min_mc_block_id);
+
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+    observer().validation_results_.push_back(CandidateAccept{});
+
+    handle_.publish<CandidateReceived>(candidate);
+    handle_.publish<CandidateReceived>(candidate);
+    co_await ts_.wait_sync_work();
+
+    ASSERT_EQ(observer().wait_for_parent_candidate_ids_.size(), static_cast<size_t>(1));
+    ASSERT_EQ(observer().resolve_state_requests_.size(), static_cast<size_t>(1));
+    ASSERT_EQ(observer().stored_candidate_ids_.size(), static_cast<size_t>(1));
+    ASSERT_EQ(observer().validation_candidate_ids_.size(), static_cast<size_t>(1));
+
+    auto notar_votes = published_votes<simplex::NotarizeVote>(observer().broadcast_votes_);
+    ASSERT_EQ(notar_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(notar_votes[0].id, candidate->id);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(SimplexConsensus, DuplicateCandidateReceivedDoesNotDoubleNotar);
+
 struct Rule6SkipTimeoutUsesLastObservedFinalization : SimplexConsensusTest {
   TestOptions options() const override {
     auto opts = SimplexConsensusTest::options();
