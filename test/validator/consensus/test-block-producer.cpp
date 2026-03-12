@@ -122,6 +122,41 @@ struct GeneratesFullCandidate : BlockProducerTest {
 };
 REGISTER_TEST(BlockProducer, GeneratesFullCandidate);
 
+struct GeneratesFullCandidateFromProvidedBase : BlockProducerTest {
+  TestOptions options() const override {
+    return TestOptions{};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 3 for a non-genesis base:
+    // when the leader window starts from a proved base (s_p, h_p), the first produced candidate
+    // must keep that base as its parent reference instead of resetting to consensus genesis.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    auto base = CandidateId{.slot = 7, .hash = bits256_pattern(707)};
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    mock_->collate.returns(make_collation_result(state, ctx().shard(), 3));
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{base}, state, 8, 12, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    auto candidate = generated[0]->candidate;
+    EXPECT_EQ(candidate->id.slot, static_cast<td::uint32>(8));
+    EXPECT_EQ(candidate->parent_id, ParentId{base});
+    EXPECT(!candidate->is_empty());
+    EXPECT_EQ(mock_->collate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, GeneratesFullCandidateFromProvidedBase);
+
 struct SignsGeneratedCandidates : BlockProducerTest {
   td::actor::Task<td::Unit> run_test() override {
     // Covers the "Candidates" definition in simplex_docs.md:
