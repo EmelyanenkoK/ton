@@ -51,6 +51,11 @@ class DbImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo<B
   }
 
   template <>
+  void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<BroadcastVote> event) {
     auto vote = event->vote.to_tl();
     auto hash = sha256_bits256(serialize_tl_object(vote, true));

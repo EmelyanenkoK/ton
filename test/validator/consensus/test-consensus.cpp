@@ -63,6 +63,21 @@ td::Result<std::pair<T, T>> parse_int_range(td::Slice s) {
   return std::make_pair(x, y);
 }
 
+enum class TestCase {
+  Smoke,
+  NoDoubleNotar,
+};
+
+td::Result<TestCase> parse_test_case(td::Slice s) {
+  if (s == "smoke") {
+    return TestCase::Smoke;
+  }
+  if (s == "no-double-notar") {
+    return TestCase::NoDoubleNotar;
+  }
+  return td::Status::Error(PSTRING() << "unknown test case " << s);
+}
+
 Ref<vm::Cell> make_ext_blk_ref(BlockIdExt block_id, LogicalTime lt) {
   vm::CellBuilder cb;
   cb.store_long_bool(lt, 64);
@@ -91,6 +106,7 @@ size_t N_DOUBLE_NODES = 0;
 double DURATION = 60.0;
 td::uint32 TARGET_RATE_MS = 1000;
 td::uint32 SLOTS_PER_LEADER_WINDOW = 4;
+TestCase TEST_CASE = TestCase::Smoke;
 
 std::pair<double, double> GREMLIN_PERIOD = {-1.0, -1.0};
 std::pair<double, double> GREMLIN_DOWNTIME = {1.0, 1.0};
@@ -228,6 +244,36 @@ struct TraceSnapshot {
   std::vector<NetworkToggleTraceRecord> network_toggles;
   std::vector<LifecycleTraceRecord> lifecycle;
 };
+
+td::Status verify_no_double_notar(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md §1.4 local Notar uniqueness and Lemma 2.2:
+  // an honest validator must never cast Notar(s, h1) and Notar(s, h2) for the same slot with h1 != h2.
+  std::map<std::pair<size_t, td::uint32>, CandidateId> first_vote_by_validator_and_slot;
+  for (const auto& record : snapshot.protocol_votes) {
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (notar == nullptr) {
+      continue;
+    }
+    auto key = std::make_pair(record.src_node_idx, notar->id.slot);
+    auto [it, inserted] = first_vote_by_validator_and_slot.emplace(key, notar->id);
+    if (!inserted && it->second != notar->id) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx
+                                         << " sent conflicting Notar votes for slot " << notar->id.slot
+                                         << ": first=" << it->second << ", later=" << notar->id);
+    }
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_test_case(const TraceSnapshot& snapshot) {
+  switch (TEST_CASE) {
+    case TestCase::Smoke:
+      return td::Status::OK();
+    case TestCase::NoDoubleNotar:
+      return verify_no_double_notar(snapshot);
+  }
+  UNREACHABLE();
+}
 
 class TestTraceSink : public td::actor::Actor {
  public:
@@ -709,13 +755,12 @@ class TestSimplexObserver : public td::actor::SpawnsWith<simplex::Bus>, public t
   }
 
   template <>
-  td::actor::Task<> process(BusHandle bus, std::shared_ptr<simplex::LeaderWindowObserved> event) {
+  void handle(BusHandle bus, std::shared_ptr<const simplex::LeaderWindowObserved> event) {
     auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
     if (!test_bus.trace_sink.empty()) {
       td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_leader_window_observed,
                               bus->local_id.idx.value(), instance_idx_, event->start_slot, event->base);
     }
-    co_return td::Unit{};
   }
 
   template <>
@@ -1225,6 +1270,7 @@ class TestConsensus : public td::actor::Actor {
     runtime.register_actor<TestSimplexObserver>("TestSimplexObserver");
     simplex::CandidateResolver::register_in(runtime);
     simplex::Consensus::register_in(runtime);
+    simplex::Db::register_in(runtime);
     simplex::Pool::register_in(runtime);
     simplex::StateResolver::register_in(runtime);
 
@@ -1404,6 +1450,11 @@ class TestConsensus : public td::actor::Actor {
         LOG(WARNING) << "Node #" << idx << " instance #" << inst_idx << " : synced up to block "
                      << inst.last_accepted_block;
       }
+    }
+    auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+    auto status = verify_test_case(snapshot);
+    if (status.is_error()) {
+      co_return status.move_as_error();
     }
     co_return td::Unit{};
   }
@@ -1607,6 +1658,11 @@ int main(int argc, char *argv[]) {
                          if (VALIDATION_TIME.first < 0.0) {
                            return td::Status::Error(PSTRING() << "invalid validation time " << arg);
                          }
+                         return td::Status::OK();
+                       });
+  p.add_checked_option('\0', "test-case", "named consensus assertion to run (default: smoke)",
+                       [&](td::Slice arg) {
+                         TRY_RESULT_ASSIGN(TEST_CASE, parse_test_case(arg));
                          return td::Status::OK();
                        });
 
