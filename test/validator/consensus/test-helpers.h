@@ -185,6 +185,30 @@ struct TestBus : consensus::Bus {
   }
 };
 
+// Allows tests to publish FinalizeBlock requests so listeners can observe the event,
+// without pulling in the full block acceptance actor and its extra side effects.
+class TestFinalizeBlockResponderImpl : public td::actor::SpawnsWith<consensus::Bus>,
+                                       public td::actor::ConnectsTo<consensus::Bus> {
+ public:
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
+  td::actor::Task<> process(BusHandle, std::shared_ptr<FinalizeBlock>) {
+    co_return td::Unit{};
+  }
+};
+
+struct TestFinalizeBlockResponder {
+  static void register_in(td::actor::Runtime& runtime) {
+    runtime.register_actor<TestFinalizeBlockResponderImpl>("TestFinalizeBlockResponder");
+  }
+};
+
 // =============================================================================
 // MockManagerFacade
 // =============================================================================

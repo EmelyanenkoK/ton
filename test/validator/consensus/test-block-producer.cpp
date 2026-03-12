@@ -16,6 +16,14 @@ namespace {
 using td::actor::count_events;
 using td::actor::events_of;
 
+td::Ref<block::BlockSignatureSet> make_nonfinal_signatures_for(const CandidateRef& candidate, const consensus::Bus& bus) {
+  auto& block = std::get<BlockCandidate>(candidate->block);
+  return block::BlockSignatureSet::create_simplex_approve({}, bus.cc_seqno, bus.validator_set_hash, bus.session_id,
+                                                          candidate->id.slot,
+                                                          CandidateHashData::create_full(block, candidate->parent_id)
+                                                              .to_tl());
+}
+
 // =============================================================================
 // Test bus and base class
 // =============================================================================
@@ -66,6 +74,7 @@ class BlockProducerTest : public td::Test {
       bus->keyring = keyring_own.get();
 
       auto runtime = ProducerBus::create_runtime();
+      TestFinalizeBlockResponder::register_in(runtime);
       BlockProducer::register_in(runtime);
       handle_ = runtime.start(std::move(bus));
 
@@ -211,6 +220,104 @@ struct SignsEmptyCandidates : BlockProducerTest {
 };
 REGISTER_TEST(BlockProducer, SignsEmptyCandidates);
 
+struct GeneratesFullMasterchainCandidatesAtConsensusFinalityBoundary : BlockProducerTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the exact-boundary negative for the masterchain empty-candidate rule:
+    // when consensus finality has caught up to exactly one block behind the local tip, production
+    // must still collate a full candidate instead of switching to the empty fallback.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    auto finalized_block = make_block_candidate(ctx().shard(), 2);
+    auto finalized_candidate = make_full_candidate(finalized_block, PeerValidatorId{1});
+    auto final_signatures = block::BlockSignatureSet::create_ordinary({}, handle_->cc_seqno, handle_->validator_set_hash);
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    co_await handle_.publish<FinalizeBlock>(finalized_candidate, final_signatures);
+    co_await ts_.wait_sync_work();
+
+    mock_->collate.returns(make_collation_result(state, ctx().shard(), 3));
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    EXPECT(!generated[0]->candidate->is_empty());
+    EXPECT_EQ(generated[0]->candidate->id.slot, static_cast<td::uint32>(0));
+    EXPECT_EQ(mock_->collate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, GeneratesFullMasterchainCandidatesAtConsensusFinalityBoundary);
+
+struct DoesNotAdvanceConsensusFinalityOnNonFinalFinalizeBlock : BlockProducerTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the negative FinalizeBlock path:
+    // approve/notarization signatures must not advance last_consensus_finalized_seqno_, otherwise
+    // the producer would wrongly leave the empty-candidate safety fallback too early.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto ahead_state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    auto parent = CandidateId{.slot = 23, .hash = bits256_pattern(2323)};
+    auto candidate_block = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(candidate_block, PeerValidatorId{1});
+    auto approve_signatures = make_nonfinal_signatures_for(candidate, *handle_.operator->());
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    co_await handle_.publish<FinalizeBlock>(candidate, approve_signatures);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{parent}, ahead_state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    EXPECT(generated[0]->candidate->is_empty());
+    EXPECT_EQ(generated[0]->candidate->parent_id, ParentId{parent});
+    EXPECT_EQ(mock_->collate.call_count(), 0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, DoesNotAdvanceConsensusFinalityOnNonFinalFinalizeBlock);
+
+struct GeneratesFullShardchainCandidatesAtMasterchainLagBoundary : BlockProducerTest {
+  TestOptions options() const override {
+    return TestOptions{};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the shardchain off-by-one negative:
+    // exactly 8 blocks of lag from the stored masterchain-finalized seqno is still allowed to
+    // collate a full candidate; the empty fallback starts only after that boundary is exceeded.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto boundary_state = make_normal_state(ctx().shard(), 8, min_mc_block_id);
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    mock_->collate.returns(make_collation_result(boundary_state, ctx().shard(), 9));
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, boundary_state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    EXPECT(!generated[0]->candidate->is_empty());
+    EXPECT_EQ(mock_->collate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, GeneratesFullShardchainCandidatesAtMasterchainLagBoundary);
+
 struct GeneratesChainedCandidatesForWholeLeaderWindow : BlockProducerTest {
   TestOptions options() const override {
     auto opts = TestOptions{};
@@ -309,6 +416,37 @@ struct DoesNotPublishCandidatesFromSupersededLeaderWindow : BlockProducerTest {
   }
 };
 REGISTER_TEST(BlockProducer, DoesNotPublishCandidatesFromSupersededLeaderWindow);
+
+struct DoesNotPublishCandidatesAfterStopRequested : BlockProducerTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the producer stop/cancellation path:
+    // once StopRequested is processed, an in-flight collation must not still publish a candidate
+    // afterward even if the manager eventually responds.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto pending_collation = mock_->collate.expect();
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto pending_call = co_await std::move(pending_collation);
+
+    handle_.publish<StopRequested>();
+    co_await ts_.wait_sync_work();
+
+    pending_call.respond.set_value(make_collation_result(state, ctx().shard(), 2));
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<CandidateGenerated>(bus_mock().events_), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<CandidateReceived>(bus_mock().events_), static_cast<size_t>(0));
+    EXPECT_EQ(mock_->collate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, DoesNotPublishCandidatesAfterStopRequested);
 
 struct SwitchesToEmptyCandidatesMidMasterchainWindow : BlockProducerTest {
   TestOptions options() const override {
