@@ -38,34 +38,6 @@ timeout 20s ./build/test/validator/consensus/test-pool --filter WaitsForMissingG
   `handle_saved_certificate(SkipCertRef)` and confirm that a request with `parent.slot = 0`,
   `id.slot = 3`, and newly known skips for slots `1` and `2` transitions from pending to resolved.
 
-## `simplex::CandidateResolver` can remain unresolved after ignoring a malformed peer response
-
-- Documentation / expectation: Rule 2 says malformed or irrelevant peer data should be ignored, but
-  later valid data should still allow resolution to complete.
-- Observed behavior: `CandidateResolver_IgnoresWrongIdResponseAndKeepsWaiting` still fails. The test
-  first receives a response with the wrong candidate id, then a later response with the correct
-  candidate body and notar cert. The actor does issue the second request, but the overall
-  `ResolveCandidate` task still never completes.
-- Reproduce:
-```sh
-timeout 20s ./build/test/validator/consensus/test-candidate-resolver --filter IgnoresWrongIdResponseAndKeepsWaiting --verbosity 0
-```
-- Narrowing evidence:
-  this is not the old request-bit bug. The test proves the resolver survives the malformed response
-  far enough to send another request. The failure is in the "accept later good data and finish
-  resolution" part.
-- Probable cause:
-  the issue is likely in the completion path around
-  `validator/consensus/simplex/candidate-resolver.cpp` `resolve_candidate_inner()` and
-  `resolve_candidate_task()`. After a malformed response has been ignored, either the later
-  `merge(...)` is not making `candidate_and_cert` complete as expected, or the resolve awaiters are
-  not being resumed after the state becomes complete.
-- What should be fixed:
-  trace `CandidateAndCert::from_tl(...)`, `CandidateAndCert::merge(...)`, and
-  `maybe_resume_resolve_awaiters(...)` for the sequence "wrong-id response, then correct response"
-  and confirm that the second response actually completes both missing pieces and wakes the bridge
-  created in `ResolveCandidate`.
-
 ## `simplex::Certificate::from_tl` accepts malformed skip-slot values after signed `int32 -> uint32` wraparound
 
 - Documentation / expectation: the tracker parser row (`Kernel-27`, `Kernel-31` `4c5eda7cb`) says
