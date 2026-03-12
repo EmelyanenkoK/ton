@@ -212,5 +212,30 @@ struct WaitsForPreviousMasterchainBlockBeforeValidating : MasterchainBlockValida
 };
 REGISTER_TEST(BlockValidator, WaitsForPreviousMasterchainBlockBeforeValidating);
 
+struct RejectsStaleMasterchainCandidates : MasterchainBlockValidatorTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Supports the same masterchain dependency from simplex_docs.md §4.4 case 2:
+    // once the validator has already finalized past a candidate's base block, that candidate is
+    // stale and must not be accepted for validation.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    handle_.publish<Start>(state);
+
+    auto finalized_block = make_block_data(ctx().shard(), 2, create_cell(2))->block_id();
+    handle_.publish<BlockFinalizedInMasterchain>(finalized_block);
+
+    auto bc = make_block_candidate(ctx().shard(), 2);
+    auto candidate = make_full_candidate(bc, PeerValidatorId{0});
+
+    auto result = co_await handle_.publish<ValidationRequest>(state, candidate).wrap();
+
+    ASSERT_TRUE(result.is_error());
+    EXPECT(result.error().message().str().find("already finalized") != std::string::npos);
+    EXPECT_EQ(mock_->validate.call_count(), 0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockValidator, RejectsStaleMasterchainCandidates);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
