@@ -29,23 +29,16 @@ void handle(BusHandle, std::shared_ptr<const StopRequested>) {
 - Scope:
   this currently looks like a harness/runtime-stop bug, not a protocol bug. I would fix this before drawing any deeper conclusions from restart teardown failures.
 
-## Rule 2 recovery retries but does not complete after restart and local data loss
+## Fixed: Rule 2 request bits were inverted in `CandidateAndCert::make_request()`
 
-- Documentation / expectation: Rule 2 says that after losing a notarized candidate, a validator retries `requestCandidate` with exponential backoff and eventually recovers once a peer with the candidate body is reachable.
-- Observed behavior: in the new `candidate-resolution-recovery` `test-consensus` scenario, validator `#0.0` repeatedly issues `requestCandidate` for the chosen notarized candidate and backs off its timeout, but still never resolves that candidate even after the only full-data peer is restarted.
-- Trigger: stop validator `#0.0`, wipe its simplex DB and candidate storage, restart partial peers without candidate bodies, then restart the only peer that still has the candidate body.
-- Testing impact: Rule 2 now has a deterministic red test. The failure is no longer “scenario not built”; it is that the documented recovery behavior does not complete under this restart/data-loss setup.
-- What should be fixed first:
-  [CandidateAndCert::make_request()](/home/rulon/ton/validator/consensus/simplex/candidate-resolver.cpp#L89) appears to set `want_candidate` and `want_notar` to what the node already has, instead of what it is missing. That is the highest-confidence production bug I found in this area, and it is consistent with the observed behavior: endless retries without ever obtaining the missing payload.
-- Minimal patch:
-```diff
-tl::RequestCandidateRef make_request(CandidateId id) const {
-  return create_tl_object<tl::requestCandidate>(
-      id.to_tl(), !candidate.has_value(), !notar_cert.has_value());
-}
-```
-- After that patch:
-  rerun the Rule 2 red test before changing anything else. If recovery still does not complete, the next suspects are the restart/storage lifecycle around candidate metadata/body persistence and the teardown ordering issue above, but the request-flag inversion is the first thing I would fix.
+- Documentation / expectation: Rule 2 says a validator requests the candidate body and notarization certificate it is missing.
+- Observed behavior before fix: [CandidateAndCert::make_request()](/home/rulon/ton/validator/consensus/simplex/candidate-resolver.cpp#L82) was setting `want_candidate` and `want_notar` from `candidate.has_value()` / `notar_cert.has_value()`, i.e. from the pieces already present locally, not the pieces that were missing.
+- Trigger: a resolver state with neither candidate body nor notarization certificate available locally.
+- Testing impact before fix: the focused unit test in [test-candidate-resolver.cpp](/home/rulon/ton/test/validator/consensus/test-candidate-resolver.cpp#L125) failed because the outgoing request asked for neither piece. The larger `candidate-resolution-recovery` `test-consensus` scenario also stalled in that state.
+- Status:
+  fixed in production code by flipping the request bits to `!candidate.has_value()` and `!notar_cert.has_value()`.
+- Post-fix verification:
+  `./build/test/validator/consensus/test-candidate-resolver --verbosity 0` now passes, including the request-bit unit test, and `timeout 40s ./build/test/validator/consensus/test-consensus --test-case candidate-resolution-recovery --verbosity 0` also returned successfully after the patch.
 
 ## Rule 6 skip timeout resets instead of following the last observed finalization
 

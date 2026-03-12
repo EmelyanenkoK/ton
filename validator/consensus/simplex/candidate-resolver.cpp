@@ -87,7 +87,7 @@ struct CandidateAndCert {
   }
 
   tl::RequestCandidateRef make_request(CandidateId id) const {
-    return create_tl_object<tl::requestCandidate>(id.to_tl(), candidate.has_value(), notar_cert.has_value());
+    return create_tl_object<tl::requestCandidate>(id.to_tl(), !candidate.has_value(), !notar_cert.has_value());
   }
 
   void merge(const CandidateAndCert &other) {
