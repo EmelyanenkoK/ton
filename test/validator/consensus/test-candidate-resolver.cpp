@@ -108,6 +108,22 @@ CandidateAndCertRef decode_candidate_and_cert(const ProtocolMessage& message) {
   return fetch_tl_object<ton_api::consensus_simplex_candidateAndCert>(message.data, true).move_as_ok();
 }
 
+CandidateAndCertRef make_candidate_and_cert_response(std::optional<CandidateRef> candidate,
+                                                     std::optional<simplex::NotarCertRef> notar) {
+  td::BufferSlice candidate_data;
+  if (candidate.has_value()) {
+    candidate_data = (*candidate)->serialize();
+  }
+
+  td::BufferSlice notar_data;
+  if (notar.has_value()) {
+    notar_data = serialize_tl_object((*notar)->to_tl_vote_signature_set(), true);
+  }
+
+  return create_tl_object<ton_api::consensus_simplex_candidateAndCert>(std::move(candidate_data),
+                                                                       std::move(notar_data));
+}
+
 struct ServesStoredCandidateToPeers : CandidateResolverTest {
   td::actor::Task<td::Unit> run_test() override {
     // Covers simplex_docs.md Rule 2:
@@ -171,6 +187,31 @@ struct RequestsMissingPiecesFromPeers : CandidateResolverTest {
   }
 };
 REGISTER_TEST(CandidateResolver, RequestsMissingPiecesFromPeers);
+
+struct DoesNotLeakUnrequestedCandidateBody : CandidateResolverTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 2 negative behavior:
+    // when a peer requests only the notarization certificate, CandidateResolver must not leak the
+    // candidate body in the response.
+    auto candidate =
+        make_serializable_empty_candidate(ctx(), *bus_, 1, make_candidate_id(0, 1100), min_mc_block_id, PeerValidatorId{0});
+    auto notar = make_simplex_certificate(ctx(), *bus_, simplex::NotarizeVote{candidate->id}, {0, 1});
+
+    co_await handle_.publish<StoreCandidate>(candidate);
+    handle_.publish<simplex::NotarizationObserved>(candidate->id, notar);
+    co_await ts_.wait_sync_work();
+
+    auto response = co_await handle_.publish<IncomingOverlayRequest>(
+        PeerValidatorId{1}, ProtocolMessage{make_request(candidate->id, false, true)});
+
+    auto response_tl = decode_candidate_and_cert(response);
+    EXPECT(response_tl->candidate_.empty());
+    EXPECT(!response_tl->notar_.empty());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(CandidateResolver, DoesNotLeakUnrequestedCandidateBody);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
