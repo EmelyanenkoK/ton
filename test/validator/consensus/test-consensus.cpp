@@ -66,6 +66,7 @@ td::Result<std::pair<T, T>> parse_int_range(td::Slice s) {
 enum class TestCase {
   Smoke,
   NoDoubleNotar,
+  FinalRequiresOwnNotar,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -74,6 +75,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "no-double-notar") {
     return TestCase::NoDoubleNotar;
+  }
+  if (s == "final-requires-own-notar") {
+    return TestCase::FinalRequiresOwnNotar;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -265,12 +269,50 @@ td::Status verify_no_double_notar(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_finalize_requires_own_notar(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 5(1):
+  // an honest validator may vote Final(s, h) only after it has voted Notar(s, h) itself.
+  std::map<std::pair<size_t, CandidateId>, double> first_notar_ts;
+  for (const auto& record : snapshot.protocol_votes) {
+    auto* notar = std::get_if<simplex::NotarizeVote>(&record.vote.vote);
+    if (notar == nullptr) {
+      continue;
+    }
+    auto key = std::make_pair(record.src_node_idx, notar->id);
+    auto [it, inserted] = first_notar_ts.emplace(key, record.ts);
+    if (!inserted) {
+      it->second = std::min(it->second, record.ts);
+    }
+  }
+
+  for (const auto& record : snapshot.protocol_votes) {
+    auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote);
+    if (final == nullptr) {
+      continue;
+    }
+    auto key = std::make_pair(record.src_node_idx, final->id);
+    auto it = first_notar_ts.find(key);
+    if (it == first_notar_ts.end()) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx
+                                         << " sent Final without an own prior Notar for " << final->id);
+    }
+    if (it->second > record.ts + 1e-9) {
+      return td::Status::Error(PSTRING() << "validator #" << record.src_node_idx
+                                         << " sent Final before its own Notar for " << final->id
+                                         << ": notar_ts=" << it->second << ", final_ts=" << record.ts);
+    }
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
       return td::Status::OK();
     case TestCase::NoDoubleNotar:
       return verify_no_double_notar(snapshot);
+    case TestCase::FinalRequiresOwnNotar:
+      return verify_finalize_requires_own_notar(snapshot);
   }
   UNREACHABLE();
 }
