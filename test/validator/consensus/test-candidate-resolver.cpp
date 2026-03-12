@@ -17,9 +17,36 @@ using simplex::StoreCandidate;
 using CandidateAndCertRef = tl_object_ptr<ton_api::consensus_simplex_candidateAndCert>;
 using RequestCandidateRef = tl_object_ptr<ton_api::consensus_simplex_requestCandidate>;
 
+class OverlayRequestResponderImpl;
+
 struct CandidateResolverBus : simplex::Bus {
   using Parent = simplex::Bus;
   using Events = td::TypeList<>;
+
+  OverlayRequestResponderImpl* overlay_responder = nullptr;
+};
+
+class OverlayRequestResponderImpl : public td::actor::SpawnsWith<CandidateResolverBus>,
+                                    public td::actor::ConnectsTo<CandidateResolverBus> {
+ public:
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  td::actor::MockAsync<ProtocolMessage, PeerValidatorId, td::Timestamp, ProtocolMessage> request;
+
+  void start_up() override {
+    const_cast<CandidateResolverBus&>(*owning_bus()).overlay_responder = this;
+  }
+
+  template <>
+  void handle(td::actor::BusHandle<CandidateResolverBus>, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
+  td::actor::Task<ProtocolMessage> process(td::actor::BusHandle<CandidateResolverBus>,
+                                           std::shared_ptr<OutgoingOverlayRequest> event) {
+    co_return co_await request.call(event->destination, event->timeout, std::move(event->request));
+  }
 };
 
 class CandidateResolverTest : public td::Test {
@@ -51,6 +78,7 @@ class CandidateResolverTest : public td::Test {
       db_ = static_cast<TestDbImpl*>(bus->db.get());
 
       td::actor::Runtime runtime;
+      runtime.register_actor<OverlayRequestResponderImpl>("OverlayRequestResponder");
       simplex::CandidateResolver::register_in(runtime);
       handle_ = runtime.start(std::move(bus));
 
@@ -106,6 +134,43 @@ struct ServesStoredCandidateToPeers : CandidateResolverTest {
   }
 };
 REGISTER_TEST(CandidateResolver, ServesStoredCandidateToPeers);
+
+struct RequestsMissingPiecesFromPeers : CandidateResolverTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 2:
+    // when local state lacks both the candidate body and the notarization certificate, resolution
+    // must ask peers for both missing pieces.
+    auto id = make_candidate_id(9, 9009);
+    auto parent = make_candidate_id(8, 8008);
+    auto resolved_candidate = td::make_ref<Candidate>(id, ParentId{parent}, PeerValidatorId{0}, min_mc_block_id,
+                                                      td::BufferSlice("sig"));
+    auto notar = make_simplex_certificate(ctx(), *bus_, simplex::NotarizeVote{id}, {0, 1});
+
+    auto first_request = bus_->overlay_responder->request.expect();
+
+    [&]() -> td::actor::Task<td::Unit> {
+      auto _ = co_await handle_.publish<simplex::ResolveCandidate>(id).wrap();
+      co_return td::Unit{};
+    }()
+        .start()
+        .detach();
+
+    auto request = co_await std::move(first_request);
+
+    auto request_tl = fetch_tl_object<ton_api::consensus_simplex_requestCandidate>(std::get<2>(request.args).data, true)
+                          .move_as_ok();
+    EXPECT(request_tl->want_candidate_);
+    EXPECT(request_tl->want_notar_);
+
+    co_await handle_.publish<StoreCandidate>(resolved_candidate);
+    handle_.publish<simplex::NotarizationObserved>(id, notar);
+    request.respond.set_value(ProtocolMessage{create_tl_object<ton_api::consensus_simplex_candidateAndCert>(
+        td::BufferSlice(), td::BufferSlice())});
+    co_await ts_.wait_sync_work();
+    co_return {};
+  }
+};
+REGISTER_TEST(CandidateResolver, RequestsMissingPiecesFromPeers);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
