@@ -31,6 +31,48 @@ struct DbBus : simplex::Bus {
   using Events = td::TypeList<>;
 };
 
+td::BufferSlice db_vote_key(const simplex::Vote& vote) {
+  auto hash = sha256_bits256(serialize_tl_object(vote.to_tl(), true));
+  return create_serialize_tl_object<tl::db_key_vote>(hash);
+}
+
+template <typename VoteT>
+void seed_legacy_vote(TestDbImpl& db, const simplex::Signed<VoteT>& vote) {
+  db.seed(db_vote_key(simplex::Vote{vote.vote}),
+          create_serialize_tl_object<tl::db_voteLegacy>(vote.serialize(),
+                                                        static_cast<td::int32>(vote.validator.value())));
+}
+
+void seed_our_vote(TestDbImpl& db, const simplex::Vote& vote, td::int64 seqno) {
+  db.seed(db_vote_key(vote), create_serialize_tl_object<tl::db_ourVote>(vote.to_tl(), seqno));
+}
+
+void seed_certificate(TestDbImpl& db, const simplex::CertificateRef<simplex::Vote>& cert) {
+  db.seed(db_vote_key(cert->vote), create_serialize_tl_object<tl::db_cert>(cert->to_tl()));
+}
+
+void seed_candidate_resolver_notar(TestDbImpl& db, CandidateId id, const simplex::NotarCertRef& cert) {
+  db.seed(create_serialize_tl_object<tl::db_key_candidateResolver_notarCert>(id.to_tl()),
+          create_serialize_tl_object<tl::db_candidateResolver_notarCert>(cert->to_tl_vote_signature_set()));
+}
+
+void seed_pool_state(TestDbImpl& db, td::uint32 first_nonannounced_window) {
+  db.seed(create_serialize_tl_object<tl::db_key_poolState>(),
+          create_serialize_tl_object<tl::db_poolState>(static_cast<td::int32>(first_nonannounced_window)));
+}
+
+template <typename VoteT>
+bool has_certificate_for(const std::vector<simplex::CertificateRef<simplex::Vote>>& certs, const VoteT& vote) {
+  for (const auto& cert : certs) {
+    if (auto* typed = std::get_if<VoteT>(&cert->vote.vote)) {
+      if (*typed == vote) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 class SimplexDbTest : public td::Test {
  protected:
   std::unique_ptr<ValidatorSetup> ctx_;
@@ -114,6 +156,57 @@ class SimplexDbTest : public td::Test {
 
   virtual td::actor::Task<td::Unit> run_test() = 0;
 };
+
+struct RestoresBootstrapStateFromDb : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the restart image that simplex uses for Rule 2 and Rule 4/5 implementation:
+    // Db startup must restore local votes in replay order, merge bootstrap certificates from both
+    // namespaces, and restore the first unannounced leader window.
+    DbBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 0);
+
+    auto legacy_vote = make_signed_simplex_vote(ctx(), seed_bus, 0, simplex::SkipVote{2});
+    auto foreign_legacy_vote = make_signed_simplex_vote(ctx(), seed_bus, 1, simplex::SkipVote{9});
+    auto early_notar = simplex::NotarizeVote{make_candidate_id(4, 4004)};
+    auto late_final = simplex::FinalizeVote{make_candidate_id(6, 6006)};
+    auto early_vote = simplex::Vote{early_notar};
+    auto late_vote = simplex::Vote{late_final};
+
+    auto cert_vote = simplex::NotarizeVote{make_candidate_id(7, 7007)};
+    auto cert_ref = make_simplex_certificate(ctx(), seed_bus, cert_vote, {0, 1});
+    auto cert = std::move(cert_ref.unique_write()).consume_and_upcast();
+    auto resolver_vote = simplex::NotarizeVote{make_candidate_id(8, 8008)};
+    auto resolver_cert = make_simplex_certificate(ctx(), seed_bus, resolver_vote, {0, 1});
+
+    auto seed_entries = [&] {
+      TestDbImpl seed_db;
+      seed_pool_state(seed_db, 5);
+      seed_legacy_vote(seed_db, legacy_vote);
+      seed_legacy_vote(seed_db, foreign_legacy_vote);
+      seed_our_vote(seed_db, late_vote, 11);
+      seed_our_vote(seed_db, early_vote, 3);
+      seed_certificate(seed_db, cert);
+      seed_candidate_resolver_notar(seed_db, resolver_vote.id, resolver_cert);
+      return seed_db.entries();
+    }();
+
+    co_await start_actor(seed_entries);
+
+    EXPECT_EQ(handle_->first_nonannounced_window, static_cast<td::uint32>(5));
+
+    ASSERT_EQ(handle_->bootstrap_votes.size(), static_cast<size_t>(3));
+    EXPECT(std::holds_alternative<simplex::SkipVote>(handle_->bootstrap_votes[0].vote));
+    EXPECT_EQ(std::get<simplex::NotarizeVote>(handle_->bootstrap_votes[1].vote), early_notar);
+    EXPECT_EQ(std::get<simplex::FinalizeVote>(handle_->bootstrap_votes[2].vote), late_final);
+
+    ASSERT_EQ(handle_->bootstrap_certificates.size(), static_cast<size_t>(2));
+    EXPECT(has_certificate_for(handle_->bootstrap_certificates, cert_vote));
+    EXPECT(has_certificate_for(handle_->bootstrap_certificates, resolver_vote));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexDb, RestoresBootstrapStateFromDb);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
