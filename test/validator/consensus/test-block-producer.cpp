@@ -148,5 +148,65 @@ struct SignsGeneratedCandidates : BlockProducerTest {
 };
 REGISTER_TEST(BlockProducer, SignsGeneratedCandidates);
 
+struct GeneratesChainedCandidatesForWholeLeaderWindow : BlockProducerTest {
+  TestOptions options() const override {
+    auto opts = TestOptions{};
+    opts.target_rate_ms = 0;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md §4.2:
+    // "The implementation produces L: generate_candidates loops over all slots in the window,
+    // producing one candidate per slot with each referencing the previous as its parent."
+    // This also covers the next sentence there: later candidates are generated without waiting
+    // for earlier slots to be notarized, because this test publishes no consensus progress events.
+    //
+    // Use a shardchain setup here to avoid the separate masterchain empty-candidate policy from
+    // simplex_docs.md §4.4 interfering with the whole-window full-candidate behavior.
+    auto state1 = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto result2 = make_collation_result(state1, ctx().shard(), 2);
+    auto state2 = state1->apply(result2.candidate);
+    auto result3 = make_collation_result(state2, ctx().shard(), 3);
+    auto state3 = state2->apply(result3.candidate);
+    auto result4 = make_collation_result(state3, ctx().shard(), 4);
+    auto state4 = state3->apply(result4.candidate);
+    auto result5 = make_collation_result(state4, ctx().shard(), 5);
+
+    handle_.publish<Start>(state1);
+    co_await ts_.wait_sync_work();
+
+    mock_->collate.returns(std::move(result2));
+    mock_->collate.returns(std::move(result3));
+    mock_->collate.returns(std::move(result4));
+    mock_->collate.returns(std::move(result5));
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, state1, 0, 4, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    EXPECT_EQ(generated.size(), static_cast<size_t>(4));
+    EXPECT_EQ(mock_->collate.call_count(), 4);
+
+    EXPECT_EQ(generated[0]->candidate->id.slot, static_cast<td::uint32>(0));
+    EXPECT_EQ(generated[1]->candidate->id.slot, static_cast<td::uint32>(1));
+    EXPECT_EQ(generated[2]->candidate->id.slot, static_cast<td::uint32>(2));
+    EXPECT_EQ(generated[3]->candidate->id.slot, static_cast<td::uint32>(3));
+
+    EXPECT_EQ(generated[0]->candidate->parent_id, ParentId{});
+    EXPECT_EQ(generated[1]->candidate->parent_id, ParentId{generated[0]->candidate->id});
+    EXPECT_EQ(generated[2]->candidate->parent_id, ParentId{generated[1]->candidate->id});
+    EXPECT_EQ(generated[3]->candidate->parent_id, ParentId{generated[2]->candidate->id});
+
+    EXPECT(!generated[0]->candidate->is_empty());
+    EXPECT(!generated[1]->candidate->is_empty());
+    EXPECT(!generated[2]->candidate->is_empty());
+    EXPECT(!generated[3]->candidate->is_empty());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, GeneratesChainedCandidatesForWholeLeaderWindow);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test

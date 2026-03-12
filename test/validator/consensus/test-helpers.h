@@ -24,6 +24,7 @@ struct TestOptions {
   ShardIdFull shard = {0, 0xC000'0000'0000'0000ULL};
   std::vector<ValidatorWeight> weight_distribution = {1};
   td::uint32 slots_per_leader_window = 4;
+  td::uint32 target_rate_ms = 1000;
 };
 
 inline Bits256 bits256_pattern(td::uint64 x) {
@@ -91,6 +92,7 @@ class ValidatorSetup {
     bus.validator_set_hash = 0xDEADBEEF;
     bus.local_id = validator_set_[idx];
     bus.config = NewConsensusConfig{
+        .target_rate_ms = options_.target_rate_ms,
         .consensus =
             NewConsensusConfig::Simplex{
                 .slots_per_leader_window = options_.slots_per_leader_window,
