@@ -72,6 +72,7 @@ enum class TestCase {
   CertificateRebroadcast,
   FinalRequiresObservedNotar,
   LeaderWindowSchedule,
+  NoMisbehaviorReports,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -98,6 +99,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "leader-window-schedule") {
     return TestCase::LeaderWindowSchedule;
+  }
+  if (s == "no-misbehavior-reports") {
+    return TestCase::NoMisbehaviorReports;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -492,6 +496,20 @@ td::Status verify_leader_window_schedule(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_no_misbehavior_reports(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md honest-validator safety assumptions:
+  // a normal honest run should not trigger local misbehavior proofs.
+  if (snapshot.protocol_votes.empty()) {
+    return td::Status::Error("scenario did not produce any votes");
+  }
+  if (!snapshot.misbehavior_reports.empty()) {
+    const auto& report = snapshot.misbehavior_reports.front();
+    return td::Status::Error(PSTRING() << "validator #" << report.node_idx << "." << report.instance_idx
+                                       << " emitted a misbehavior report for validator #" << report.offender);
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -510,6 +528,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_finalize_requires_observed_notar(snapshot);
     case TestCase::LeaderWindowSchedule:
       return verify_leader_window_schedule(snapshot);
+    case TestCase::NoMisbehaviorReports:
+      return verify_no_misbehavior_reports(snapshot);
   }
   UNREACHABLE();
 }
