@@ -4,7 +4,6 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
-#include "td/actor/Mocks.h"
 #include "td/actor/TestScheduler.h"
 #include "td/utils/tests.h"
 
@@ -13,31 +12,122 @@
 namespace ton::validator::consensus::test {
 namespace {
 
-using td::actor::count_events;
-using td::actor::events_of;
+class ConsensusObserverImpl;
 
-using ConsensusMockBus =
-    td::actor::MockBus<simplex::Bus, simplex::BroadcastVote, simplex::ResolveState, simplex::WaitForParent,
-                       simplex::StoreCandidate, ValidationRequest, OurLeaderWindowStarted, MisbehaviorReport>;
+struct ConsensusBus : simplex::Bus {
+  using Parent = simplex::Bus;
+  using Events = td::TypeList<>;
+
+  ConsensusObserverImpl* observer = nullptr;
+};
 
 template <typename VoteT>
-std::vector<VoteT> published_votes(const ConsensusMockBus& bus) {
+std::vector<VoteT> published_votes(const std::vector<simplex::Vote>& votes) {
   std::vector<VoteT> result;
-  for (const auto& event : bus.actor->events_) {
-    if (auto* vote = std::get_if<std::shared_ptr<const simplex::BroadcastVote>>(&event)) {
-      if (auto* typed = std::get_if<VoteT>(&(*vote)->vote.vote)) {
-        result.push_back(*typed);
-      }
+  for (const auto& vote : votes) {
+    if (auto* typed = std::get_if<VoteT>(&vote.vote)) {
+      result.push_back(*typed);
     }
   }
   return result;
 }
 
+class ConsensusObserverImpl : public td::actor::SpawnsWith<ConsensusBus>, public td::actor::ConnectsTo<ConsensusBus> {
+ public:
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  std::vector<simplex::Vote> broadcast_votes_;
+  std::vector<ParentId> resolve_state_requests_;
+  std::vector<CandidateId> wait_for_parent_candidate_ids_;
+  std::vector<CandidateId> stored_candidate_ids_;
+  std::vector<CandidateId> validation_candidate_ids_;
+  std::vector<simplex::LeaderWindowObserved> observed_windows_;
+  std::vector<OurLeaderWindowStarted> leader_windows_;
+  std::vector<MisbehaviorReport> misbehavior_reports_;
+
+  std::deque<simplex::ResolveState::Result> resolve_state_results_;
+  std::deque<std::optional<MisbehaviorRef>> wait_for_parent_results_;
+  std::deque<ValidateCandidateResult> validation_results_;
+
+  void start_up() override {
+    const_cast<ConsensusBus&>(*owning_bus()).observer = this;
+  }
+
+  template <>
+  void handle(td::actor::BusHandle<ConsensusBus>, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
+  void handle(td::actor::BusHandle<ConsensusBus>, std::shared_ptr<const OurLeaderWindowStarted> event) {
+    leader_windows_.push_back(*event);
+  }
+
+  template <>
+  void handle(td::actor::BusHandle<ConsensusBus>, std::shared_ptr<const MisbehaviorReport> event) {
+    misbehavior_reports_.push_back(*event);
+  }
+
+  template <>
+  td::actor::Task<td::Unit> process(td::actor::BusHandle<ConsensusBus>,
+                                    std::shared_ptr<simplex::BroadcastVote> event) {
+    broadcast_votes_.push_back(event->vote);
+    co_return td::Unit{};
+  }
+
+  template <>
+  td::actor::Task<td::Unit> process(td::actor::BusHandle<ConsensusBus>,
+                                    std::shared_ptr<simplex::LeaderWindowObserved> event) {
+    observed_windows_.push_back(*event);
+    co_return td::Unit{};
+  }
+
+  template <>
+  td::actor::Task<simplex::ResolveState::Result> process(td::actor::BusHandle<ConsensusBus>,
+                                                         std::shared_ptr<simplex::ResolveState> event) {
+    resolve_state_requests_.push_back(event->id);
+    CHECK(!resolve_state_results_.empty());
+    auto result = std::move(resolve_state_results_.front());
+    resolve_state_results_.pop_front();
+    co_return result;
+  }
+
+  template <>
+  td::actor::Task<std::optional<MisbehaviorRef>> process(td::actor::BusHandle<ConsensusBus>,
+                                                         std::shared_ptr<simplex::WaitForParent> event) {
+    wait_for_parent_candidate_ids_.push_back(event->candidate->id);
+    if (wait_for_parent_results_.empty()) {
+      co_return std::nullopt;
+    }
+    auto result = std::move(wait_for_parent_results_.front());
+    wait_for_parent_results_.pop_front();
+    co_return result;
+  }
+
+  template <>
+  td::actor::Task<td::Unit> process(td::actor::BusHandle<ConsensusBus>,
+                                    std::shared_ptr<simplex::StoreCandidate> event) {
+    stored_candidate_ids_.push_back(event->candidate->id);
+    co_return td::Unit{};
+  }
+
+  template <>
+  td::actor::Task<ValidateCandidateResult> process(td::actor::BusHandle<ConsensusBus>,
+                                                   std::shared_ptr<ValidationRequest> event) {
+    validation_candidate_ids_.push_back(event->candidate->id);
+    CHECK(!validation_results_.empty());
+    auto result = std::move(validation_results_.front());
+    validation_results_.pop_front();
+    co_return result;
+  }
+};
+
 class SimplexConsensusTest : public td::Test {
  protected:
   std::unique_ptr<ValidatorSetup> ctx_;
   td::actor::TestScheduler ts_;
-  td::actor::BusHandle<ConsensusMockBus> handle_;
+  td::actor::BusHandle<ConsensusBus> handle_;
+  ConsensusBus* bus_{};
 
   virtual TestOptions options() const {
     return TestOptions{.weight_distribution = {1, 1}};
@@ -48,19 +138,23 @@ class SimplexConsensusTest : public td::Test {
     return *ctx_;
   }
 
-  auto& bus_mock() {
-    return *handle_->actor;
+  ConsensusObserverImpl& observer() {
+    CHECK(bus_ != nullptr);
+    CHECK(bus_->observer != nullptr);
+    return *bus_->observer;
   }
 
   void run() final {
     ts_.run([this]() -> td::actor::Task<td::Unit> {
       ctx_ = std::make_unique<ValidatorSetup>(options());
 
-      auto bus = std::make_shared<ConsensusMockBus>();
+      auto bus = std::make_shared<ConsensusBus>();
       fill_simplex_bus(ctx(), *bus, 0);
       bus->db = std::make_unique<TestDbImpl>();
+      bus_ = bus.get();
 
-      auto runtime = ConsensusMockBus::create_runtime();
+      td::actor::Runtime runtime;
+      runtime.register_actor<ConsensusObserverImpl>("ConsensusObserver");
       simplex::Consensus::register_in(runtime);
       handle_ = runtime.start(std::move(bus));
 
@@ -71,6 +165,7 @@ class SimplexConsensusTest : public td::Test {
       co_await ts_.wait_sync_work();
 
       handle_ = {};
+      bus_ = nullptr;
       runtime = {};
       ctx_.reset();
 
@@ -81,6 +176,43 @@ class SimplexConsensusTest : public td::Test {
 
   virtual td::actor::Task<td::Unit> run_test() = 0;
 };
+
+struct LeaderWindowStartsGenerationOnlyForExpectedLeader : SimplexConsensusTest {
+  TestOptions options() const override {
+    auto opts = SimplexConsensusTest::options();
+    opts.slots_per_leader_window = 2;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 3:
+    // when a window becomes active, only the expected leader starts generation, and the start
+    // event must carry the proved base and exact window bounds.
+    auto first_base = ParentId{make_candidate_id(3, 3003)};
+    auto second_base = ParentId{make_candidate_id(5, 5005)};
+    auto resolved = simplex::ResolveState::Result{.state = make_normal_state(ctx().shard(), 7, min_mc_block_id)};
+
+    observer().resolve_state_results_.push_back(resolved);
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(0, first_base);
+    co_await ts_.wait_sync_work();
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(2, second_base);
+    co_await ts_.wait_sync_work();
+
+    ASSERT_EQ(observer().resolve_state_requests_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().resolve_state_requests_[0], first_base);
+
+    ASSERT_EQ(observer().leader_windows_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().leader_windows_[0].base, first_base);
+    EXPECT_EQ(observer().leader_windows_[0].start_slot, static_cast<td::uint32>(0));
+    EXPECT_EQ(observer().leader_windows_[0].end_slot, static_cast<td::uint32>(2));
+    EXPECT_EQ(observer().leader_windows_[0].state, resolved.state);
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexConsensus, LeaderWindowStartsGenerationOnlyForExpectedLeader);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
