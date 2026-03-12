@@ -12,31 +12,31 @@ under the current policy. In particular:
 - `test-consensus` `standstill-rebroadcast-contents` now passes, so the old standstill-teardown
   entry was removed.
 
-## `simplex::Pool::WaitForParent` stays blocked after the last missing gap skip certificate arrives
+## `simplex::Pool` standstill rebroadcast omits our later local votes
 
-- Documentation / expectation: Rule 4 says a candidate should proceed once its parent notarization
-  and every skipped slot in the gap are locally proven.
-- Observed behavior: `Pool_WaitsForMissingGapSkipCertificates` still fails. The negative gate works
-  at first, but even after the final missing skip certificate is injected, `WaitForParent` never
-  resumes.
+- Documentation / expectation: Rule 8 says standstill rebroadcast must contain the highest final
+  certificate, later certificates, and our own later votes that do not yet have certificates.
+- Observed behavior: `Pool_StandstillBroadcastContainsExpectedVotesAndCertificates` is red.
+  The pool rebroadcasts the expected final certificate and later skip certificate, but omits a
+  later local `NotarizeVote` that was broadcast before standstill fired.
 - Reproduce:
 ```sh
-timeout 20s ./build/test/validator/consensus/test-pool --filter WaitsForMissingGapSkipCertificates --verbosity 0
+./build/test/validator/consensus/test-pool --filter StandstillBroadcastContainsExpectedVotesAndCertificates --verbosity 1
 ```
 - Narrowing evidence:
-  the test sees the new skip certificate pass through `SaveCertificate`, so the failure is not
-  "certificate never decoded" or "request was resolved too early". The actor accepts the new cert
-  and still leaves the request pending.
+  the test starts from bootstrap final/skip certificates, publishes one local later
+  `BroadcastVote(NotarizeVote{slot=2})`, advances exactly to the configured standstill timeout,
+  and then checks outgoing payloads. The outgoing trace contains the expected certificate payloads
+  but not the signed local vote payload for slot 2.
 - Probable cause:
-  the bug is likely in the post-save gap bookkeeping around
-  `validator/consensus/simplex/pool.cpp` `handle_typed_saved_certificate(SkipCertRef)` and
-  `maybe_resolve_requests()`. Either `skip_intervals_` is not transitioning to the expected
-  boundary after the new skip cert, or pending `WaitForParent` requests are not being re-resolved
-  against the updated interval state the way Rule 4 expects.
+  `validator/consensus/simplex/pool.cpp` `alarm()` intends to append local later votes through
+  `state->votes[bus.local_id.idx.value()].serialize_to(messages, state->certs)`, but the local
+  vote state for some later slots is apparently not surviving to the standstill snapshot or is not
+  being serialized as expected once certificates are already present for earlier slots.
 - What should be fixed:
-  instrument `skip_intervals_` and the pending `Request{id,parent}` set around
-  `handle_saved_certificate(SkipCertRef)` and confirm that a request with `parent.slot = 0`,
-  `id.slot = 3`, and newly known skips for slots `1` and `2` transitions from pending to resolved.
+  inspect the per-slot local `Tsentrizbirkom` state at standstill and confirm that later local
+  votes remain present after `BroadcastVote` handling. Then trace why `serialize_to(...)` skips the
+  local vote for slot 2 even though no certificate exists for that vote.
 
 ## `BlockValidator` accepts empty candidates with an unrelated parent link
 

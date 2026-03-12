@@ -284,5 +284,28 @@ struct PersistsLeaderWindowCheckpointAcrossRestart : SimplexDbTest {
 };
 REGISTER_TEST(SimplexDb, PersistsLeaderWindowCheckpointAcrossRestart);
 
+struct RejectsDuplicateSavedCertificates : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the Db-side certificate dedup invariant that still matters under the current
+    // crash-on-write-failure policy:
+    // the same certificate must not be persisted twice, because restart replay assumes a unique
+    // durable image per vote hash.
+    co_await start_actor();
+
+    auto cert = make_simplex_certificate(ctx(), bus(), simplex::NotarizeVote{make_candidate_id(13, 1313)}, {0, 1});
+    auto cert_vote = std::move(cert.unique_write()).consume_and_upcast();
+
+    auto first = co_await handle_.publish<simplex::SaveCertificate>(cert_vote).wrap();
+    auto duplicate = co_await handle_.publish<simplex::SaveCertificate>(cert_vote).wrap();
+
+    ASSERT_TRUE(first.is_ok());
+    ASSERT_TRUE(duplicate.is_error());
+    EXPECT_EQ(db().size(), static_cast<size_t>(1));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(SimplexDb, RejectsDuplicateSavedCertificates);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
