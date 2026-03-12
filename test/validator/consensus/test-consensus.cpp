@@ -108,16 +108,400 @@ std::pair<double, double> DB_DELAY = {0.0, 0.0};
 std::pair<double, double> COLLATION_TIME = {0.0, 0.0};
 std::pair<double, double> VALIDATION_TIME = {0.0, 0.0};
 
+struct ProtocolVoteTraceRecord {
+  double ts = 0.0;
+  size_t src_node_idx = 0;
+  size_t src_instance_idx = 0;
+  std::optional<size_t> dst_node_idx;
+  simplex::Vote vote;
+};
+
+struct ProtocolCertificateTraceRecord {
+  double ts = 0.0;
+  size_t src_node_idx = 0;
+  size_t src_instance_idx = 0;
+  std::optional<size_t> dst_node_idx;
+  simplex::Vote vote;
+  std::vector<PeerValidatorId> signers;
+};
+
+struct OverlayRequestTraceRecord {
+  double ts = 0.0;
+  size_t src_node_idx = 0;
+  size_t src_instance_idx = 0;
+  size_t dst_node_idx = 0;
+  double timeout_s = 0.0;
+  std::optional<CandidateId> candidate_id;
+  bool want_candidate = false;
+  bool want_notar = false;
+};
+
+struct CandidateDeliveryTraceRecord {
+  double ts = 0.0;
+  size_t src_node_idx = 0;
+  size_t src_instance_idx = 0;
+  size_t dst_node_idx = 0;
+  size_t dst_instance_idx = 0;
+  CandidateId candidate_id;
+  ParentId parent_id;
+  PeerValidatorId leader;
+  bool is_empty = false;
+  BlockIdExt block_id;
+};
+
+struct LeaderWindowObservedTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  td::uint32 start_slot = 0;
+  ParentId base;
+};
+
+struct LeaderWindowStartedTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  td::uint32 start_slot = 0;
+  td::uint32 end_slot = 0;
+  ParentId base;
+};
+
+struct NotarizationObservedTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  CandidateId id;
+  std::vector<PeerValidatorId> signers;
+};
+
+struct FinalizationObservedTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  CandidateId id;
+  std::vector<PeerValidatorId> signers;
+};
+
+struct CandidateGeneratedTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  CandidateId candidate_id;
+  ParentId parent_id;
+  PeerValidatorId leader;
+  bool is_empty = false;
+  BlockIdExt block_id;
+};
+
+struct MisbehaviorTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  PeerValidatorId offender;
+};
+
+struct NetworkToggleTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  bool disabled = false;
+};
+
+struct LifecycleTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  bool started = false;
+};
+
+struct TraceSnapshot {
+  std::vector<ProtocolVoteTraceRecord> protocol_votes;
+  std::vector<ProtocolCertificateTraceRecord> protocol_certificates;
+  std::vector<OverlayRequestTraceRecord> overlay_requests;
+  std::vector<CandidateDeliveryTraceRecord> candidate_deliveries;
+  std::vector<LeaderWindowObservedTraceRecord> leader_windows_observed;
+  std::vector<LeaderWindowStartedTraceRecord> leader_windows_started;
+  std::vector<NotarizationObservedTraceRecord> notarizations_observed;
+  std::vector<FinalizationObservedTraceRecord> finalizations_observed;
+  std::vector<CandidateGeneratedTraceRecord> candidates_generated;
+  std::vector<MisbehaviorTraceRecord> misbehavior_reports;
+  std::vector<NetworkToggleTraceRecord> network_toggles;
+  std::vector<LifecycleTraceRecord> lifecycle;
+};
+
+class TestTraceSink : public td::actor::Actor {
+ public:
+  void record_protocol_vote(size_t src_node_idx, size_t src_instance_idx, std::optional<size_t> dst_node_idx,
+                            simplex::Vote vote) {
+    protocol_votes_.push_back(ProtocolVoteTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .src_node_idx = src_node_idx,
+        .src_instance_idx = src_instance_idx,
+        .dst_node_idx = dst_node_idx,
+        .vote = std::move(vote),
+    });
+  }
+
+  void record_protocol_certificate(size_t src_node_idx, size_t src_instance_idx, std::optional<size_t> dst_node_idx,
+                                   simplex::Vote vote, std::vector<PeerValidatorId> signers) {
+    protocol_certificates_.push_back(ProtocolCertificateTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .src_node_idx = src_node_idx,
+        .src_instance_idx = src_instance_idx,
+        .dst_node_idx = dst_node_idx,
+        .vote = std::move(vote),
+        .signers = std::move(signers),
+    });
+  }
+
+  void record_overlay_request(size_t src_node_idx, size_t src_instance_idx, size_t dst_node_idx, double timeout_s,
+                              std::optional<CandidateId> candidate_id, bool want_candidate, bool want_notar) {
+    overlay_requests_.push_back(OverlayRequestTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .src_node_idx = src_node_idx,
+        .src_instance_idx = src_instance_idx,
+        .dst_node_idx = dst_node_idx,
+        .timeout_s = timeout_s,
+        .candidate_id = std::move(candidate_id),
+        .want_candidate = want_candidate,
+        .want_notar = want_notar,
+    });
+  }
+
+  void record_candidate_delivery(size_t src_node_idx, size_t src_instance_idx, size_t dst_node_idx,
+                                 size_t dst_instance_idx, CandidateId candidate_id, ParentId parent_id,
+                                 PeerValidatorId leader, bool is_empty, BlockIdExt block_id) {
+    candidate_deliveries_.push_back(CandidateDeliveryTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .src_node_idx = src_node_idx,
+        .src_instance_idx = src_instance_idx,
+        .dst_node_idx = dst_node_idx,
+        .dst_instance_idx = dst_instance_idx,
+        .candidate_id = std::move(candidate_id),
+        .parent_id = std::move(parent_id),
+        .leader = leader,
+        .is_empty = is_empty,
+        .block_id = std::move(block_id),
+    });
+  }
+
+  void record_leader_window_observed(size_t node_idx, size_t instance_idx, td::uint32 start_slot, ParentId base) {
+    leader_windows_observed_.push_back(LeaderWindowObservedTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .start_slot = start_slot,
+        .base = std::move(base),
+    });
+  }
+
+  void record_leader_window_started(size_t node_idx, size_t instance_idx, td::uint32 start_slot, td::uint32 end_slot,
+                                    ParentId base) {
+    leader_windows_started_.push_back(LeaderWindowStartedTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .start_slot = start_slot,
+        .end_slot = end_slot,
+        .base = std::move(base),
+    });
+  }
+
+  void record_notarization_observed(size_t node_idx, size_t instance_idx, CandidateId id,
+                                    std::vector<PeerValidatorId> signers) {
+    notarizations_observed_.push_back(NotarizationObservedTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .id = std::move(id),
+        .signers = std::move(signers),
+    });
+  }
+
+  void record_finalization_observed(size_t node_idx, size_t instance_idx, CandidateId id,
+                                    std::vector<PeerValidatorId> signers) {
+    finalizations_observed_.push_back(FinalizationObservedTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .id = std::move(id),
+        .signers = std::move(signers),
+    });
+  }
+
+  void record_candidate_generated(size_t node_idx, size_t instance_idx, CandidateId candidate_id, ParentId parent_id,
+                                  PeerValidatorId leader, bool is_empty, BlockIdExt block_id) {
+    candidates_generated_.push_back(CandidateGeneratedTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .candidate_id = std::move(candidate_id),
+        .parent_id = std::move(parent_id),
+        .leader = leader,
+        .is_empty = is_empty,
+        .block_id = std::move(block_id),
+    });
+  }
+
+  void record_misbehavior(size_t node_idx, size_t instance_idx, PeerValidatorId offender) {
+    misbehavior_reports_.push_back(MisbehaviorTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .offender = offender,
+    });
+  }
+
+  void record_network_toggle(size_t node_idx, size_t instance_idx, bool disabled) {
+    network_toggles_.push_back(NetworkToggleTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .disabled = disabled,
+    });
+  }
+
+  void record_lifecycle(size_t node_idx, size_t instance_idx, bool started) {
+    lifecycle_.push_back(LifecycleTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .started = started,
+    });
+  }
+
+  void clear() {
+    protocol_votes_.clear();
+    protocol_certificates_.clear();
+    overlay_requests_.clear();
+    candidate_deliveries_.clear();
+    leader_windows_observed_.clear();
+    leader_windows_started_.clear();
+    notarizations_observed_.clear();
+    finalizations_observed_.clear();
+    candidates_generated_.clear();
+    misbehavior_reports_.clear();
+    network_toggles_.clear();
+    lifecycle_.clear();
+  }
+
+  td::actor::Task<TraceSnapshot> snapshot() {
+    co_return TraceSnapshot{
+        .protocol_votes = protocol_votes_,
+        .protocol_certificates = protocol_certificates_,
+        .overlay_requests = overlay_requests_,
+        .candidate_deliveries = candidate_deliveries_,
+        .leader_windows_observed = leader_windows_observed_,
+        .leader_windows_started = leader_windows_started_,
+        .notarizations_observed = notarizations_observed_,
+        .finalizations_observed = finalizations_observed_,
+        .candidates_generated = candidates_generated_,
+        .misbehavior_reports = misbehavior_reports_,
+        .network_toggles = network_toggles_,
+        .lifecycle = lifecycle_,
+    };
+  }
+
+ private:
+  std::vector<ProtocolVoteTraceRecord> protocol_votes_;
+  std::vector<ProtocolCertificateTraceRecord> protocol_certificates_;
+  std::vector<OverlayRequestTraceRecord> overlay_requests_;
+  std::vector<CandidateDeliveryTraceRecord> candidate_deliveries_;
+  std::vector<LeaderWindowObservedTraceRecord> leader_windows_observed_;
+  std::vector<LeaderWindowStartedTraceRecord> leader_windows_started_;
+  std::vector<NotarizationObservedTraceRecord> notarizations_observed_;
+  std::vector<FinalizationObservedTraceRecord> finalizations_observed_;
+  std::vector<CandidateGeneratedTraceRecord> candidates_generated_;
+  std::vector<MisbehaviorTraceRecord> misbehavior_reports_;
+  std::vector<NetworkToggleTraceRecord> network_toggles_;
+  std::vector<LifecycleTraceRecord> lifecycle_;
+};
+
 class TestSimplexBus : public simplex::Bus {
  public:
   using Parent = simplex::Bus;
   size_t instance_idx = 0;
+  td::actor::ActorId<TestTraceSink> trace_sink;
 };
+
+std::optional<ProtocolVoteTraceRecord> try_decode_protocol_vote(const TestSimplexBus& bus, size_t src_node_idx,
+                                                                size_t src_instance_idx, size_t dst_node_idx,
+                                                                td::Slice data) {
+  auto maybe_tl_vote = fetch_tl_object<simplex::tl::vote>(data, true);
+  if (maybe_tl_vote.is_error()) {
+    return std::nullopt;
+  }
+  auto maybe_vote =
+      simplex::Signed<simplex::Vote>::from_tl(std::move(*maybe_tl_vote.move_as_ok()), PeerValidatorId{src_node_idx}, bus);
+  if (maybe_vote.is_error()) {
+    return std::nullopt;
+  }
+  return ProtocolVoteTraceRecord{
+      .ts = td::Time::now_unadjusted(),
+      .src_node_idx = src_node_idx,
+      .src_instance_idx = src_instance_idx,
+      .dst_node_idx = dst_node_idx,
+      .vote = maybe_vote.move_as_ok().vote,
+  };
+}
+
+std::optional<ProtocolCertificateTraceRecord> try_decode_protocol_certificate(const TestSimplexBus& bus,
+                                                                              size_t src_node_idx,
+                                                                              size_t src_instance_idx,
+                                                                              size_t dst_node_idx, td::Slice data) {
+  auto maybe_tl_certificate = fetch_tl_object<simplex::tl::certificate>(data, true);
+  if (maybe_tl_certificate.is_error()) {
+    return std::nullopt;
+  }
+  auto maybe_certificate =
+      simplex::Certificate<simplex::Vote>::from_tl(std::move(*maybe_tl_certificate.move_as_ok()), bus);
+  if (maybe_certificate.is_error()) {
+    return std::nullopt;
+  }
+  auto certificate = maybe_certificate.move_as_ok();
+  std::vector<PeerValidatorId> signers;
+  for (const auto& signature : certificate->signatures) {
+    signers.push_back(signature.validator);
+  }
+  return ProtocolCertificateTraceRecord{
+      .ts = td::Time::now_unadjusted(),
+      .src_node_idx = src_node_idx,
+      .src_instance_idx = src_instance_idx,
+      .dst_node_idx = dst_node_idx,
+      .vote = certificate->vote,
+      .signers = std::move(signers),
+  };
+}
+
+OverlayRequestTraceRecord decode_overlay_request(size_t src_node_idx, size_t src_instance_idx, size_t dst_node_idx,
+                                                 td::Timestamp timeout, td::Slice data) {
+  OverlayRequestTraceRecord record{
+      .ts = td::Time::now_unadjusted(),
+      .src_node_idx = src_node_idx,
+      .src_instance_idx = src_instance_idx,
+      .dst_node_idx = dst_node_idx,
+      .timeout_s = timeout ? std::max(0.0, timeout.at() - td::Time::now()) : 0.0,
+      .candidate_id = std::nullopt,
+      .want_candidate = false,
+      .want_notar = false,
+  };
+  if (auto maybe_request = fetch_tl_object<ton_api::consensus_simplex_requestCandidate>(data, true);
+      maybe_request.is_ok()) {
+    auto request = maybe_request.move_as_ok();
+    record.candidate_id = CandidateId::from_tl(request->id_);
+    record.want_candidate = request->want_candidate_;
+    record.want_notar = request->want_notar_;
+  }
+  return record;
+}
 
 class TestOverlayNode;
 
 class TestOverlay : public td::actor::Actor {
  public:
+  explicit TestOverlay(td::actor::ActorId<TestTraceSink> trace_sink) : trace_sink_(trace_sink) {
+  }
+
   void register_node(size_t idx, size_t instance_idx, td::actor::ActorId<TestOverlayNode> node) {
     Instance &inst = get_inst(idx, instance_idx);
     CHECK(inst.actor.empty());
@@ -132,6 +516,9 @@ class TestOverlay : public td::actor::Actor {
 
   td::actor::Task<> set_instance_disabled(size_t idx, size_t instance_idx, bool value) {
     get_inst(idx, instance_idx).disabled = value;
+    if (!trace_sink_.empty()) {
+      td::actor::send_closure(trace_sink_, &TestTraceSink::record_network_toggle, idx, instance_idx, value);
+    }
     LOG(ERROR) << "Node #" << idx << "." << instance_idx << ": " << (value ? "disable" : "enable") << " network";
     co_return td::Unit{};
   }
@@ -147,6 +534,7 @@ class TestOverlay : public td::actor::Actor {
     bool disabled = false;
   };
   std::vector<std::vector<Instance>> nodes_;
+  td::actor::ActorId<TestTraceSink> trace_sink_;
 
   Instance &get_inst(size_t idx, size_t instance_idx) {
     if (nodes_.size() <= idx) {
@@ -194,14 +582,34 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
 
   template <>
   void handle(BusHandle bus, std::shared_ptr<const OutgoingProtocolMessage> message) {
+    auto trace_message = [&](size_t dst_idx) {
+      auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+      if (test_bus.trace_sink.empty()) {
+        return;
+      }
+      if (auto vote =
+              try_decode_protocol_vote(test_bus, bus->local_id.idx.value(), instance_idx_, dst_idx, message->message.data.as_slice())) {
+        td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_protocol_vote, vote->src_node_idx,
+                                vote->src_instance_idx, vote->dst_node_idx, std::move(vote->vote));
+        return;
+      }
+      if (auto cert = try_decode_protocol_certificate(test_bus, bus->local_id.idx.value(), instance_idx_, dst_idx,
+                                                      message->message.data.as_slice())) {
+        td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_protocol_certificate, cert->src_node_idx,
+                                cert->src_instance_idx, cert->dst_node_idx, std::move(cert->vote),
+                                std::move(cert->signers));
+      }
+    };
     if (message->recipient.has_value()) {
       CHECK(message->recipient.value() != bus->local_id.idx);
+      trace_message(message->recipient->value());
       td::actor::ask(test_overlay, &TestOverlay::send_message, bus->local_id, instance_idx_,
                      message->recipient->value(), message->message.data.clone())
           .detach_silent();
     } else {
       for (size_t i = 0; i < bus->validator_set.size(); ++i) {
         if (bus->local_id.idx.value() != i) {
+          trace_message(i);
           td::actor::ask(test_overlay, &TestOverlay::send_message, bus->local_id, instance_idx_, i,
                          message->message.data.clone())
               .detach_silent();
@@ -222,6 +630,14 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
 
   template <>
   td::actor::Task<ProtocolMessage> process(BusHandle bus, std::shared_ptr<OutgoingOverlayRequest> message) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      auto record = decode_overlay_request(bus->local_id.idx.value(), instance_idx_, message->destination.value(),
+                                           message->timeout, message->request.data.as_slice());
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_overlay_request, record.src_node_idx,
+                              record.src_instance_idx, record.dst_node_idx, record.timeout_s, record.candidate_id,
+                              record.want_candidate, record.want_notar);
+    }
     auto [task, promise] = td::actor::StartedTask<ProtocolMessage>::make_bridge();
     auto promise_ptr = std::make_shared<td::Promise<ProtocolMessage>>(std::move(promise));
     process_query_inner1(bus, message, promise_ptr).start().detach();
@@ -277,6 +693,90 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
   size_t instance_idx_ = 0;
 };
 
+class TestSimplexObserver : public td::actor::SpawnsWith<simplex::Bus>, public td::actor::ConnectsTo<simplex::Bus> {
+ public:
+  using BusHandle = simplex::BusHandle;
+
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  void start_up() override {
+    instance_idx_ = dynamic_cast<const TestSimplexBus&>(*owning_bus()).instance_idx;
+  }
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
+  td::actor::Task<> process(BusHandle bus, std::shared_ptr<simplex::LeaderWindowObserved> event) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_leader_window_observed,
+                              bus->local_id.idx.value(), instance_idx_, event->start_slot, event->base);
+    }
+    co_return td::Unit{};
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const OurLeaderWindowStarted> event) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_leader_window_started,
+                              bus->local_id.idx.value(), instance_idx_, event->start_slot, event->end_slot,
+                              event->base);
+    }
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const CandidateGenerated> event) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_candidate_generated,
+                              bus->local_id.idx.value(), instance_idx_, event->candidate->id, event->candidate->parent_id,
+                              event->candidate->leader, event->candidate->is_empty(), event->candidate->block_id());
+    }
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const simplex::NotarizationObserved> event) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      std::vector<PeerValidatorId> signers;
+      for (const auto& signature : event->certificate->signatures) {
+        signers.push_back(signature.validator);
+      }
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_notarization_observed,
+                              bus->local_id.idx.value(), instance_idx_, event->id, std::move(signers));
+    }
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const simplex::FinalizationObserved> event) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      std::vector<PeerValidatorId> signers;
+      for (const auto& signature : event->certificate->signatures) {
+        signers.push_back(signature.validator);
+      }
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_finalization_observed,
+                              bus->local_id.idx.value(), instance_idx_, event->id, std::move(signers));
+    }
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const MisbehaviorReport> event) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_misbehavior, bus->local_id.idx.value(),
+                              instance_idx_, event->id);
+    }
+  }
+
+ private:
+  size_t instance_idx_ = 0;
+};
+
 td::actor::Task<> TestOverlay::send_message(PeerValidator src, size_t src_instance_idx, size_t dst_idx,
                                             td::BufferSlice message) {
   co_await before_receive(src.idx.value(), src_instance_idx, dst_idx, false);
@@ -292,9 +792,15 @@ td::actor::Task<> TestOverlay::send_message(PeerValidator src, size_t src_instan
 td::actor::Task<> TestOverlay::send_candidate(PeerValidator src, size_t src_instance_idx, size_t dst_idx,
                                               CandidateRef candidate) {
   co_await before_receive(src.idx.value(), src_instance_idx, dst_idx, true);
-  for (const auto &instance : nodes_[dst_idx]) {
+  for (size_t dst_instance_idx = 0; dst_instance_idx < nodes_[dst_idx].size(); ++dst_instance_idx) {
+    const auto& instance = nodes_[dst_idx][dst_instance_idx];
     if (instance.actor.empty() || instance.disabled) {
       continue;
+    }
+    if (!trace_sink_.empty()) {
+      td::actor::send_closure(trace_sink_, &TestTraceSink::record_candidate_delivery, src.idx.value(), src_instance_idx,
+                              dst_idx, dst_instance_idx, candidate->id, candidate->parent_id, candidate->leader,
+                              candidate->is_empty(), candidate->block_id());
     }
     td::actor::send_closure(instance.actor, &TestOverlayNode::receive_candidate, candidate);
   }
@@ -334,6 +840,11 @@ class CandidateStorage : public td::actor::Actor {
     std::tuple key{candidate.pubkey.as_bits256(), candidate.id, candidate.collated_file_hash};
     candidates_.emplace(key, std::move(candidate));
     co_return {};
+  }
+
+  td::actor::Task<> clear() {
+    candidates_.clear();
+    co_return td::Unit{};
   }
 
  private:
@@ -601,6 +1112,38 @@ class TestConsensus : public td::actor::Actor {
     co_return it->second;
   }
 
+  td::actor::Task<TraceSnapshot> get_trace_snapshot() {
+    co_return co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+  }
+
+  td::actor::Task<> clear_traces() {
+    co_return co_await td::actor::ask(trace_sink_, &TestTraceSink::clear);
+  }
+
+  td::actor::Task<> clear_instance_candidate_storage(size_t node_idx, size_t instance_idx) {
+    co_return co_await td::actor::ask(nodes_[node_idx].instances[instance_idx].candidate_storage, &CandidateStorage::clear);
+  }
+
+  td::actor::Task<> clear_instance_db(size_t node_idx, size_t instance_idx) {
+    auto& db_inner = nodes_[node_idx].instances[instance_idx].db_inner;
+    std::scoped_lock lock(db_inner->mutex);
+    db_inner->map.clear();
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_instance_network_disabled_for_test(size_t node_idx, size_t instance_idx, bool value) {
+    co_return co_await td::actor::ask(test_overlay, &TestOverlay::set_instance_disabled, node_idx, instance_idx, value);
+  }
+
+  td::actor::Task<> start_instance_for_test(size_t node_idx, size_t instance_idx) {
+    start_instance(node_idx, instance_idx);
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> stop_instance_for_test(size_t node_idx, size_t instance_idx) {
+    co_return co_await stop_instance(node_idx, instance_idx);
+  }
+
  private:
   td::actor::Task<> run_inner() {
     keyring_ = keyring::Keyring::create("");
@@ -637,7 +1180,8 @@ class TestConsensus : public td::actor::Actor {
     }
     validator_set_ = td::Ref<block::ValidatorSet>{true, CC_SEQNO, SHARD, std::move(validator_descrs)};
 
-    test_overlay = td::actor::create_actor<TestOverlay>("test-overlay");
+    trace_sink_ = td::actor::create_actor<TestTraceSink>("test-trace-sink");
+    test_overlay = td::actor::create_actor<TestOverlay>("test-overlay", trace_sink_.get());
 
     for (size_t idx = 0; idx < N_NODES; ++idx) {
       Node &node = nodes_[idx];
@@ -678,6 +1222,7 @@ class TestConsensus : public td::actor::Actor {
     BlockProducer::register_in(runtime);
     BlockValidator::register_in(runtime);
     runtime.register_actor<TestOverlayNode>("PrivateOverlay");
+    runtime.register_actor<TestSimplexObserver>("TestSimplexObserver");
     simplex::CandidateResolver::register_in(runtime);
     simplex::Consensus::register_in(runtime);
     simplex::Pool::register_in(runtime);
@@ -690,6 +1235,7 @@ class TestConsensus : public td::actor::Actor {
     auto bus = std::make_shared<TestSimplexBus>();
     inst.stop_waiter = std::move(stop_task);
     bus->instance_idx = instance_idx;
+    bus->trace_sink = trace_sink_.get();
     bus->stop_promise = std::move(stop_promise);
     bus->shard = SHARD;
     bus->manager = inst.manager_facade.get();
@@ -712,6 +1258,7 @@ class TestConsensus : public td::actor::Actor {
     inst.bus = runtime.start(std::static_pointer_cast<simplex::Bus>(bus),
                              PSTRING() << "consensus." << node_idx << "." << instance_idx);
     inst.status = Instance::Running;
+    td::actor::send_closure(trace_sink_, &TestTraceSink::record_lifecycle, node_idx, instance_idx, true);
     inst.bus.publish<BlockFinalizedInMasterchain>(last_accepted_block_);
     inst.bus.publish<Start>(
         td::make_ref<ChainState>(ChainState::ZerostateTip{FIRST_PARENT, gen_shard_state(0)}, MIN_MC_BLOCK_ID));
@@ -739,6 +1286,7 @@ class TestConsensus : public td::actor::Actor {
     //co_await td::actor::coro_sleep(td::Timestamp::in(0.5));
     inst.status = Instance::Stopped;
     inst.runtime = {};
+    td::actor::send_closure(trace_sink_, &TestTraceSink::record_lifecycle, node_idx, instance_idx, false);
     LOG(ERROR) << "Stopped node #" << node_idx << "." << instance_idx;
     for (auto &promise : inst.extra_stop_waiters) {
       promise.set_value(td::Unit{});
@@ -844,7 +1392,7 @@ class TestConsensus : public td::actor::Actor {
     LOG(WARNING) << "TEST FINISHED";
     std::vector<td::actor::Task<>> tasks;
     for (size_t idx = 0; idx < N_NODES; ++idx) {
-      for (size_t i = 0; i < nodes_[i].instances.size(); ++i) {
+      for (size_t i = 0; i < nodes_[idx].instances.size(); ++i) {
         tasks.push_back(stop_instance(idx, i));
       }
     }
@@ -890,6 +1438,7 @@ class TestConsensus : public td::actor::Actor {
   ValidatorWeight total_weight_ = 0;
 
   td::actor::ActorOwn<keyring::Keyring> keyring_;
+  td::actor::ActorOwn<TestTraceSink> trace_sink_;
 
   std::map<BlockSeqno, td::Ref<BlockData>> accepted_blocks_;
   BlockIdExt last_accepted_block_ = FIRST_PARENT;
