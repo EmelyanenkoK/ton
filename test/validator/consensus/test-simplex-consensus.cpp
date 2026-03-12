@@ -288,5 +288,47 @@ struct ValidCandidateNotarizesAndFinalizesOnMatchingNotarCert : SimplexConsensus
 };
 REGISTER_TEST(SimplexConsensus, ValidCandidateNotarizesAndFinalizesOnMatchingNotarCert);
 
+struct Rule6SkipTimeoutUsesLastObservedFinalization : SimplexConsensusTest {
+  TestOptions options() const override {
+    auto opts = SimplexConsensusTest::options();
+    opts.weight_distribution = {1, 1, 1};
+    opts.slots_per_leader_window = 1;
+    opts.target_rate_ms = 1000;
+    opts.first_block_timeout_ms = 1000;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 6 as a red spec test:
+    // skip timeout growth must key off the last observed finalized window, so after a finalization
+    // in window 0 the timeout for window 2 must be strictly larger than the timeout for window 1.
+    auto finalized_id = make_candidate_id(0, 3000);
+
+    ConsensusBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 0);
+    auto final_cert = make_simplex_certificate(ctx(), seed_bus, simplex::FinalizeVote{finalized_id}, {0, 1});
+
+    handle_.publish<simplex::FinalizationObserved>(finalized_id, final_cert);
+    co_await ts_.wait_sync_work();
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(1, ParentId{finalized_id});
+    co_await ts_.wait_sync_work();
+    double window1_timeout_s = ts_.next_timeout_in();
+
+    co_await handle_.publish<simplex::LeaderWindowObserved>(2, ParentId{finalized_id});
+    co_await ts_.wait_sync_work();
+    double window2_timeout_s = ts_.next_timeout_in();
+
+    double expected_window2_min_s =
+        options().target_rate_ms / 1000. + options().first_block_timeout_ms / 1000. * handle_->first_block_timeout_multipler;
+
+    EXPECT(window2_timeout_s >= expected_window2_min_s);
+    EXPECT(window2_timeout_s > window1_timeout_s);
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexConsensus, Rule6SkipTimeoutUsesLastObservedFinalization);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
