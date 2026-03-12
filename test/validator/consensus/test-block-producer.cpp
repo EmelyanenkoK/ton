@@ -271,6 +271,119 @@ struct GeneratesChainedCandidatesForWholeLeaderWindow : BlockProducerTest {
 };
 REGISTER_TEST(BlockProducer, GeneratesChainedCandidatesForWholeLeaderWindow);
 
+struct DoesNotPublishCandidatesFromSupersededLeaderWindow : BlockProducerTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the producer's stale-window guard:
+    // if a later OurLeaderWindowStarted supersedes the current window while collation is still
+    // in flight, the old window must not publish a stale CandidateGenerated event after it
+    // eventually finishes.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto replacement_state = make_normal_state(ctx().shard(), 2, min_mc_block_id);
+    auto replacement_parent = CandidateId{.slot = 41, .hash = bits256_pattern(4141)};
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    auto pending_collation = mock_->collate.expect();
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, finalized_state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto pending_call = co_await std::move(pending_collation);
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{replacement_parent}, replacement_state, 4, 5, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    pending_call.respond.set_value(make_collation_result(finalized_state, ctx().shard(), 2));
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    auto candidate = generated[0]->candidate;
+    EXPECT_EQ(candidate->id.slot, static_cast<td::uint32>(4));
+    EXPECT(candidate->is_empty());
+    EXPECT_EQ(candidate->parent_id, ParentId{replacement_parent});
+    EXPECT_EQ(mock_->collate.call_count(), 1);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, DoesNotPublishCandidatesFromSupersededLeaderWindow);
+
+struct SwitchesToEmptyCandidatesMidMasterchainWindow : BlockProducerTest {
+  TestOptions options() const override {
+    auto opts = BlockProducerTest::options();
+    opts.target_rate_ms = 0;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the edge case at the boundary of simplex_docs.md §4.2 and §4.4:
+    // the implementation keeps producing through the whole leader window, but on masterchain the
+    // window can start with a full candidate and then switch to empty candidates once consensus
+    // finality stops keeping up with the advancing local state.
+    auto finalized_state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto first_result = make_collation_result(finalized_state, ctx().shard(), 2);
+    auto referenced_state = finalized_state->apply(first_result.candidate);
+
+    handle_.publish<Start>(finalized_state);
+    co_await ts_.wait_sync_work();
+
+    mock_->collate.returns(std::move(first_result));
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, finalized_state, 0, 3, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(3));
+
+    EXPECT(!generated[0]->candidate->is_empty());
+    EXPECT(generated[1]->candidate->is_empty());
+    EXPECT(generated[2]->candidate->is_empty());
+    EXPECT_EQ(mock_->collate.call_count(), 1);
+
+    EXPECT_EQ(generated[1]->candidate->parent_id, ParentId{generated[0]->candidate->id});
+    EXPECT_EQ(generated[2]->candidate->parent_id, ParentId{generated[1]->candidate->id});
+    EXPECT_EQ(generated[1]->candidate->block_id(), referenced_state->assert_normal());
+    EXPECT_EQ(generated[2]->candidate->block_id(), referenced_state->assert_normal());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, SwitchesToEmptyCandidatesMidMasterchainWindow);
+
+struct GeneratesEmptyCandidatesBeforeSplit : BlockProducerTest {
+  TestOptions options() const override {
+    return TestOptions{};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the producer's before_split guard:
+    // once the local tip is marked before_split, production must switch to empty candidates even
+    // if masterchain/shardchain finality lag would otherwise still allow a full collation.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id, true);
+    auto parent = CandidateId{.slot = 55, .hash = bits256_pattern(5555)};
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{parent}, state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    auto candidate = generated[0]->candidate;
+    EXPECT(candidate->is_empty());
+    EXPECT_EQ(candidate->parent_id, ParentId{parent});
+    EXPECT_EQ(candidate->block_id(), state->assert_normal());
+    EXPECT_EQ(mock_->collate.call_count(), 0);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, GeneratesEmptyCandidatesBeforeSplit);
+
 struct GeneratesEmptyMasterchainCandidatesWhenConsensusFinalityLags : BlockProducerTest {
   td::actor::Task<td::Unit> run_test() override {
     // Covers simplex_docs.md §4.4, case 2:

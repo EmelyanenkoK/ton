@@ -112,17 +112,19 @@ class ValidatorSetup {
 // Block / state construction helpers
 // =============================================================================
 
-inline td::Ref<BlockData> make_block_data(ShardIdFull shard, BlockSeqno seqno, td::Ref<vm::Cell> state_root) {
+inline td::Ref<BlockData> make_block_data(ShardIdFull shard, BlockSeqno seqno, td::Ref<vm::Cell> state_root,
+                                          bool before_split = false) {
   auto state_update = block::test::make_merkle_update(state_root, state_root);
-  auto cell = block::test::make_block_cell(shard, seqno, std::move(state_update));
+  auto cell = block::test::make_block_cell(shard, seqno, std::move(state_update), before_split);
   auto data = vm::std_boc_serialize(cell, 31).move_as_ok();
   BlockIdExt id(BlockId(shard, seqno), td::Bits256(cell->get_hash().bits()), td::sha256_bits256(data));
   return create_block(id, data.clone()).move_as_ok();
 }
 
-inline ChainStateRef make_normal_state(ShardIdFull shard, BlockSeqno seqno, BlockIdExt mc_block_id) {
+inline ChainStateRef make_normal_state(ShardIdFull shard, BlockSeqno seqno, BlockIdExt mc_block_id,
+                                       bool before_split = false) {
   auto state = create_cell(seqno);
-  auto block = make_block_data(shard, seqno, state);
+  auto block = make_block_data(shard, seqno, state, before_split);
   return td::make_ref<ChainState>(ChainState::NormalTip{std::move(block), std::move(state)}, mc_block_id);
 }
 
