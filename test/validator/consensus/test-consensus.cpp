@@ -512,6 +512,140 @@ class TestSimplexBus : public simplex::Bus {
   td::actor::ActorId<TestTraceSink> trace_sink;
 };
 
+class TestSimplexDb : public td::actor::SpawnsWith<simplex::Bus>, public td::actor::ConnectsTo<simplex::Bus> {
+ public:
+  using BusHandle = simplex::BusHandle;
+
+  TON_RUNTIME_DEFINE_EVENT_HANDLER();
+
+  explicit TestSimplexDb(simplex::Bus& bus) {
+    init_pool_state(bus);
+    init_votes(bus);
+  }
+
+  template <>
+  void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    stop();
+  }
+
+  template <>
+  td::actor::Task<> process(BusHandle, std::shared_ptr<simplex::BroadcastVote> event) {
+    auto vote = event->vote.to_tl();
+    auto hash = sha256_bits256(serialize_tl_object(vote, true));
+
+    if (saved_votes_.contains(hash)) {
+      co_return td::Status::Error(cancelled, "Vote was already casted");
+    }
+    saved_votes_.insert(hash);
+
+    auto key = create_serialize_tl_object<ton_api::consensus_simplex_db_key_vote>(hash);
+    auto value =
+        create_serialize_tl_object<ton_api::consensus_simplex_db_ourVote>(std::move(vote), next_seqno_++);
+    co_return co_await owning_bus()->db->set(std::move(key), std::move(value));
+  }
+
+  template <>
+  td::actor::Task<> process(BusHandle, std::shared_ptr<simplex::SaveCertificate> event) {
+    auto cert = event->cert->to_tl();
+    auto hash = sha256_bits256(serialize_tl_object(cert, true));
+
+    if (saved_votes_.contains(hash)) {
+      co_return td::Status::Error(cancelled, "Certificate was already saved");
+    }
+    saved_votes_.insert(hash);
+
+    auto key = create_serialize_tl_object<ton_api::consensus_simplex_db_key_vote>(hash);
+    auto value = create_serialize_tl_object<ton_api::consensus_simplex_db_cert>(std::move(cert));
+    co_return co_await owning_bus()->db->set(std::move(key), std::move(value));
+  }
+
+  template <>
+  td::actor::Task<> process(BusHandle, std::shared_ptr<simplex::LeaderWindowObserved> event) {
+    auto window = event->start_slot / owning_bus()->simplex_config.slots_per_leader_window;
+    CHECK(first_nonannounced_window_ <= window);
+    first_nonannounced_window_ = window + 1;
+
+    auto value =
+        create_serialize_tl_object<ton_api::consensus_simplex_db_poolState>(first_nonannounced_window_);
+    co_return co_await owning_bus()->db->set(pool_state_key_.clone(), std::move(value));
+  }
+
+ private:
+  void init_pool_state(simplex::Bus& bus) {
+    auto pool_state_str = bus.db->get(pool_state_key_);
+    if (pool_state_str.has_value()) {
+      auto pool_state =
+          fetch_tl_object<ton_api::consensus_simplex_db_poolState>(*pool_state_str, true).move_as_ok();
+      first_nonannounced_window_ = pool_state->first_nonannounced_window_;
+      bus.first_nonannounced_window = first_nonannounced_window_;
+    }
+  }
+
+  void init_votes(simplex::Bus& bus) {
+    struct OurVote {
+      td::int64 seqno;
+      simplex::Vote vote;
+
+      std::strong_ordering operator<=>(const OurVote& other) const {
+        return seqno <=> other.seqno;
+      }
+    };
+
+    std::vector<OurVote> our_votes;
+    std::vector<simplex::CertificateRef<simplex::Vote>> certs;
+
+    auto votes = bus.db->get_by_prefix(ton_api::consensus_simplex_db_key_vote::ID);
+    for (auto& [key_str, value_str] : votes) {
+      auto key = fetch_tl_object<ton_api::consensus_simplex_db_key_vote>(key_str, true).move_as_ok();
+      saved_votes_.insert(key->vote_hash_);
+
+      auto value = fetch_tl_object<ton_api::consensus_simplex_db_Vote>(value_str, true).move_as_ok();
+
+      auto legacy_fn = [&](ton_api::consensus_simplex_db_voteLegacy& vote) {
+        if (static_cast<size_t>(vote.node_idx_) == bus.local_id.idx.value()) {
+          auto signed_vote =
+              simplex::Signed<simplex::Vote>::deserialize(vote.data_, bus.local_id.idx, bus).move_as_ok();
+          our_votes.push_back(OurVote{-1, signed_vote.vote});
+        }
+      };
+      auto our_vote_fn = [&](ton_api::consensus_simplex_db_ourVote& vote) {
+        our_votes.push_back(OurVote{vote.seqno_, simplex::Vote::from_tl(*vote.vote_)});
+      };
+      auto cert_fn = [&](ton_api::consensus_simplex_db_cert& vote) {
+        certs.push_back(simplex::Certificate<simplex::Vote>::from_tl(std::move(*vote.cert_), bus).move_as_ok());
+      };
+      ton_api::downcast_call(*value, td::overloaded(legacy_fn, our_vote_fn, cert_fn));
+    }
+
+    auto notar_certs = bus.db->get_by_prefix(ton_api::consensus_simplex_db_key_candidateResolver_notarCert::ID);
+    for (auto& [key_str, value_str] : notar_certs) {
+      auto key =
+          fetch_tl_object<ton_api::consensus_simplex_db_key_candidateResolver_notarCert>(key_str, true).move_as_ok();
+      CandidateId id = CandidateId::from_tl(key->candidateId_);
+
+      auto value =
+          fetch_tl_object<ton_api::consensus_simplex_db_candidateResolver_notarCert>(value_str, true).move_as_ok();
+      auto cert =
+          simplex::NotarCert::from_tl(std::move(*value->notar_), simplex::NotarizeVote{id}, bus).move_as_ok();
+      certs.push_back(std::move(cert.unique_write()).consume_and_upcast());
+    }
+
+    std::sort(our_votes.begin(), our_votes.end());
+    if (!our_votes.empty()) {
+      next_seqno_ = our_votes.back().seqno + 1;
+    }
+
+    bus.bootstrap_certificates = std::move(certs);
+    bus.bootstrap_votes = td::transform(our_votes, [](const OurVote& vote) { return vote.vote; });
+  }
+
+  const td::BufferSlice pool_state_key_ =
+      create_serialize_tl_object<ton_api::consensus_simplex_db_key_poolState>();
+  std::set<Bits256> saved_votes_;
+  td::uint32 first_nonannounced_window_ = 0;
+  td::int64 next_seqno_ = 0;
+};
+
 std::optional<ProtocolVoteTraceRecord> try_decode_protocol_vote(const TestSimplexBus& bus, size_t src_node_idx,
                                                                 size_t src_instance_idx, size_t dst_node_idx,
                                                                 td::Slice data) {
@@ -1312,7 +1446,7 @@ class TestConsensus : public td::actor::Actor {
     runtime.register_actor<TestSimplexObserver>("TestSimplexObserver");
     simplex::CandidateResolver::register_in(runtime);
     simplex::Consensus::register_in(runtime);
-    simplex::Db::register_in(runtime);
+    runtime.register_actor<TestSimplexDb>("SimplexDb");
     simplex::Pool::register_in(runtime);
     simplex::StateResolver::register_in(runtime);
 
