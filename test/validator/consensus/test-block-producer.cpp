@@ -33,10 +33,19 @@ struct ProducerBus : MockBus {
 
 class BlockProducerTest : public td::Test {
  protected:
-  ValidatorSetup ctx_{TestOptions{.shard = ShardIdFull{masterchainId, shardIdAll}}};
+  std::unique_ptr<ValidatorSetup> ctx_;
   td::actor::TestScheduler ts_;
   MockManagerFacade* mock_{};
   td::actor::BusHandle<ProducerBus> handle_;
+
+  virtual TestOptions options() const {
+    return TestOptions{.shard = ShardIdFull{masterchainId, shardIdAll}};
+  }
+
+  ValidatorSetup& ctx() {
+    CHECK(ctx_ != nullptr);
+    return *ctx_;
+  }
 
   auto& bus_mock() {
     return *handle_->actor;
@@ -44,13 +53,15 @@ class BlockProducerTest : public td::Test {
 
   void run() final {
     ts_.run([this]() -> td::actor::Task<td::Unit> {
+      ctx_ = std::make_unique<ValidatorSetup>(options());
+
       auto mock_own = td::actor::create_actor<MockManagerFacade>("mock_manager");
       mock_ = &mock_own.get_actor_unsafe();
 
-      auto keyring_own = ctx_.create_keyring(0);
+      auto keyring_own = ctx().create_keyring(0);
 
       auto bus = std::make_shared<ProducerBus>();
-      ctx_.fill(*bus, 0);
+      ctx().fill(*bus, 0);
       bus->manager = mock_own.get();
       bus->keyring = keyring_own.get();
 
@@ -59,7 +70,22 @@ class BlockProducerTest : public td::Test {
       handle_ = runtime.start(std::move(bus));
 
       co_await ts_.wait_sync_work();
-      co_return co_await run_test();
+      co_await run_test();
+
+      handle_.publish<StopRequested>();
+      co_await ts_.wait_sync_work();
+
+      handle_ = {};
+      runtime = {};
+      keyring_own = {};
+      mock_own = {};
+
+      co_await ts_.wait_sync_work();
+
+      mock_ = nullptr;
+      ctx_.reset();
+
+      co_return td::Unit{};
     });
   }
 
@@ -72,12 +98,12 @@ class BlockProducerTest : public td::Test {
 
 struct GeneratesFullCandidate : BlockProducerTest {
   td::actor::Task<td::Unit> run_test() override {
-    auto state = make_normal_state(ctx_.shard(), 1, min_mc_block_id);
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
 
     handle_.publish<Start>(state);
     co_await ts_.wait_sync_work();
 
-    mock_->collate.returns(make_collation_result(state, ctx_.shard(), 2));
+    mock_->collate.returns(make_collation_result(state, ctx().shard(), 2));
 
     handle_.publish<OurLeaderWindowStarted>(ParentId{}, state, 0, 4, td::Timestamp::now());
 
@@ -95,6 +121,32 @@ struct GeneratesFullCandidate : BlockProducerTest {
   }
 };
 REGISTER_TEST(BlockProducer, GeneratesFullCandidate);
+
+struct SignsGeneratedCandidates : BlockProducerTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the "Candidates" definition in simplex_docs.md:
+    // every produced candidate includes sigma, a valid leader signature.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    mock_->collate.returns(make_collation_result(state, ctx().shard(), 2));
+
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, state, 0, 4, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto generated = events_of<CandidateGenerated>(bus_mock().events_);
+    ASSERT_EQ(generated.size(), static_cast<size_t>(1));
+
+    auto candidate = generated[0]->candidate;
+    auto id_to_sign = serialize_tl_object(candidate->id.to_tl(), true);
+    EXPECT(handle_->local_id.check_signature(handle_->session_id, id_to_sign, candidate->signature));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, SignsGeneratedCandidates);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
