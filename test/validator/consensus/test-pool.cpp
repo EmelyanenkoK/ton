@@ -238,5 +238,58 @@ struct RejectsCandidateWhoseParentFallsBeforeFinalizedFrontier : PoolTest {
 };
 REGISTER_TEST(Pool, RejectsCandidateWhoseParentFallsBeforeFinalizedFrontier);
 
+struct WaitsForMissingGapSkipCertificates : PoolTest {
+  CandidateId parent_id_ = make_candidate_id(0, 6000);
+  CandidateId candidate_id_ = make_candidate_id(3, 6003);
+
+  void configure_bus(PoolBus& bus) override {
+    auto parent_notar = make_simplex_certificate(ctx(), bus, simplex::NotarizeVote{parent_id_}, {0, 1, 2});
+    auto first_gap_skip = make_simplex_certificate(ctx(), bus, simplex::SkipVote{1}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(parent_notar.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(first_gap_skip.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 4 negative gating:
+    // when a candidate spans skipped slots, WaitForParent must stay blocked until every missing
+    // skip certificate in the gap is locally known, then resume once the final missing skip cert arrives.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto candidate = make_wait_candidate(candidate_id_, ParentId{parent_id_});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    std::optional<td::Result<std::optional<MisbehaviorRef>>> wait_result;
+    bool completed = false;
+    [&]() -> td::actor::Task<td::Unit> {
+      wait_result = co_await handle_.publish<simplex::WaitForParent>(candidate).wrap();
+      completed = true;
+      co_return td::Unit{};
+    }()
+        .start()
+        .detach();
+
+    co_await ts_.wait_sync_work();
+    EXPECT(!completed);
+
+    PoolBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 1);
+    auto second_gap_skip = make_simplex_certificate(ctx(), seed_bus, simplex::SkipVote{2}, {0, 1, 2});
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{1}, ProtocolMessage{second_gap_skip->serialize()});
+    for (int i = 0; i < 3 && !completed; ++i) {
+      co_await ts_.wait_sync_work();
+    }
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(1));
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(wait_result.has_value());
+    ASSERT_TRUE(wait_result->is_ok());
+    EXPECT(!wait_result->ok().has_value());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, WaitsForMissingGapSkipCertificates);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
