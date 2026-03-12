@@ -8,6 +8,7 @@
 #include "td/utils/tests.h"
 
 #include "test-helpers.h"
+#include "validator/consensus/simplex/misbehavior.h"
 
 namespace ton::validator::consensus::test {
 namespace {
@@ -213,6 +214,33 @@ struct LeaderWindowStartsGenerationOnlyForExpectedLeader : SimplexConsensusTest 
   }
 };
 REGISTER_TEST(SimplexConsensus, LeaderWindowStartsGenerationOnlyForExpectedLeader);
+
+struct WaitForParentMisbehaviorShortCircuitsPipeline : SimplexConsensusTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 4:
+    // if parent/gap proofing reports conflicting evidence, consensus must emit misbehavior and
+    // stop before state resolution, validation, or local voting.
+    auto candidate = make_wait_candidate(make_candidate_id(1, 1001), ParentId{make_candidate_id(0, 999)},
+                                         PeerValidatorId{1});
+
+    observer().wait_for_parent_results_.push_back(simplex::ConflictingCandidateAndCertificate::create());
+
+    handle_.publish<CandidateReceived>(candidate);
+    co_await ts_.wait_sync_work();
+
+    ASSERT_EQ(observer().wait_for_parent_candidate_ids_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().wait_for_parent_candidate_ids_[0], candidate->id);
+    EXPECT_EQ(observer().resolve_state_requests_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().validation_candidate_ids_.size(), static_cast<size_t>(0));
+    EXPECT_EQ(observer().broadcast_votes_.size(), static_cast<size_t>(0));
+
+    ASSERT_EQ(observer().misbehavior_reports_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().misbehavior_reports_[0].id, candidate->leader);
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexConsensus, WaitForParentMisbehaviorShortCircuitsPipeline);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
