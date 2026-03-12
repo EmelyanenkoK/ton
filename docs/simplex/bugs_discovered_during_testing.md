@@ -12,6 +12,62 @@ under the current policy. In particular:
 - `test-consensus` `standstill-rebroadcast-contents` now passes, so the old standstill-teardown
   entry was removed.
 
+## End-to-end consensus still notarizes a wrong-leader candidate after `CandidateReceived`
+
+- Documentation / expectation: tracker `Kernel-23` / `Kernel-28` expects an otherwise well-formed
+  candidate with the wrong leader for its slot to stop before local `Notar`.
+- Observed behavior:
+  `wrong-leader-candidate-never-notarizes` is red in `test-consensus.cpp`.
+  A synthetic full candidate injected into validator `#0.0` with the wrong slot leader still
+  causes that validator to broadcast `Notar`.
+- Reproduce:
+```sh
+timeout 45s ./build/test/validator/consensus/test-consensus --test-case wrong-leader-candidate-never-notarizes --verbosity 0
+```
+- Narrowing evidence:
+  the end-to-end scenario isolates a future leader window on validator `#0.0`, injects a full
+  candidate whose `leader` is `(expected_leader + 1) mod N`, and then checks the local vote trace.
+  The run still aborts with:
+  `validator #0.0 sent Notar for wrong-leader candidate ...`
+- Probable cause:
+  `validator/consensus/simplex/consensus.cpp` `handle(CandidateReceived)` does not validate that
+  `candidate->leader` matches the expected collator for the slot before starting `try_notarize()`.
+  The normal parser path already has wrong-leader checks, but the consensus actor itself currently
+  trusts the upstream source too much.
+- What should be fixed:
+  decide whether wrong-leader rejection is parser-only or must also be enforced at the
+  `CandidateReceived` / `try_notarize` boundary. If consensus is meant to be robust against bad
+  internal injections or future bridge regressions, add an explicit leader-schedule check before
+  `WaitForParent` / validation can produce a local `Notar`.
+
+## End-to-end consensus leaves a rejected slot wedged and ignores a replacement candidate
+
+- Documentation / expectation: tracker `Kernel-23` expects that if the first candidate for a slot
+  is rejected by validation, it leaves no residual votes and a later replacement candidate for the
+  same slot can still proceed to `Notar`.
+- Observed behavior:
+  `validation-reject-does-not-leave-residual-votes` is red in `test-consensus.cpp`.
+  The rejected candidate leaves no votes, but the later replacement candidate for the same slot
+  never notarizes.
+- Reproduce:
+```sh
+timeout 45s ./build/test/validator/consensus/test-consensus --test-case validation-reject-does-not-leave-residual-votes --verbosity 0
+```
+- Narrowing evidence:
+  the scenario injects one candidate for a future isolated slot, forces a synthetic validation
+  rejection for that exact `BlockIdExt`, then injects a second candidate for the same slot. The
+  run still aborts with:
+  `replacement candidate ... never notarized after the first candidate was rejected`
+- Probable cause:
+  `validator/consensus/simplex/consensus.cpp` stores the first candidate in
+  `slot->state->pending_block` before validation, but on `CandidateReject` it returns without
+  clearing that pending block. A later `CandidateReceived` for the same slot but a different
+  candidate id then hits the `pending_block` guard and is ignored.
+- What should be fixed:
+  clear or replace the slot-local pending candidate state when validation rejects a candidate, so a
+  later replacement candidate for the same slot can restart the pipeline. Keep the "no vote on
+  rejected candidate" behavior, but do not permanently wedge the slot.
+
 ## `simplex::Pool` standstill rebroadcast omits our later local votes
 
 - Documentation / expectation: Rule 8 says standstill rebroadcast must contain the highest final
