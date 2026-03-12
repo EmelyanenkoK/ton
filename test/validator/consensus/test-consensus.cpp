@@ -67,6 +67,7 @@ enum class TestCase {
   Smoke,
   NoDoubleNotar,
   FinalRequiresOwnNotar,
+  NoSkipFinalConflict,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -78,6 +79,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "final-requires-own-notar") {
     return TestCase::FinalRequiresOwnNotar;
+  }
+  if (s == "no-skip-final-conflict") {
+    return TestCase::NoSkipFinalConflict;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -305,6 +309,48 @@ td::Status verify_finalize_requires_own_notar(const TraceSnapshot& snapshot) {
   return td::Status::OK();
 }
 
+td::Status verify_no_skip_final_conflict(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md §1.4 and Rule 5(3):
+  // an honest validator must never cast both Skip(s) and Final(s, h) for the same slot.
+  std::map<size_t, std::set<td::uint32>> skip_slots_by_validator;
+  std::map<size_t, std::set<td::uint32>> final_slots_by_validator;
+  bool saw_skip_vote = false;
+  bool saw_final_vote = false;
+
+  for (const auto& record : snapshot.protocol_votes) {
+    if (auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote)) {
+      saw_skip_vote = true;
+      skip_slots_by_validator[record.src_node_idx].insert(skip->slot);
+      continue;
+    }
+    if (auto* final = std::get_if<simplex::FinalizeVote>(&record.vote.vote)) {
+      saw_final_vote = true;
+      final_slots_by_validator[record.src_node_idx].insert(final->id.slot);
+    }
+  }
+
+  for (const auto& [validator, skip_slots] : skip_slots_by_validator) {
+    auto final_it = final_slots_by_validator.find(validator);
+    if (final_it == final_slots_by_validator.end()) {
+      continue;
+    }
+    for (td::uint32 slot : skip_slots) {
+      if (final_it->second.contains(slot)) {
+        return td::Status::Error(PSTRING() << "validator #" << validator
+                                           << " sent both Skip and Final for slot " << slot);
+      }
+    }
+  }
+
+  if (!saw_skip_vote) {
+    return td::Status::Error("scenario did not produce any Skip votes");
+  }
+  if (!saw_final_vote) {
+    return td::Status::Error("scenario did not produce any Final votes");
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -313,6 +359,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_no_double_notar(snapshot);
     case TestCase::FinalRequiresOwnNotar:
       return verify_finalize_requires_own_notar(snapshot);
+    case TestCase::NoSkipFinalConflict:
+      return verify_no_skip_final_conflict(snapshot);
   }
   UNREACHABLE();
 }
