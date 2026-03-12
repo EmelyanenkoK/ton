@@ -242,5 +242,51 @@ struct WaitForParentMisbehaviorShortCircuitsPipeline : SimplexConsensusTest {
 };
 REGISTER_TEST(SimplexConsensus, WaitForParentMisbehaviorShortCircuitsPipeline);
 
+struct ValidCandidateNotarizesAndFinalizesOnMatchingNotarCert : SimplexConsensusTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers simplex_docs.md Rule 4 and Rule 5:
+    // once parent proofing, state resolution, and validation succeed, consensus votes Notar; once
+    // the matching notarization certificate is observed and no local skip exists, it votes Final.
+    auto candidate = make_wait_candidate(make_candidate_id(1, 2001), ParentId{make_candidate_id(0, 1999)},
+                                         PeerValidatorId{0});
+    auto parent_state = make_normal_state(ctx().shard(), 10, min_mc_block_id);
+
+    observer().resolve_state_results_.push_back(simplex::ResolveState::Result{.state = parent_state});
+    observer().validation_results_.push_back(CandidateAccept{});
+
+    handle_.publish<CandidateReceived>(candidate);
+    co_await ts_.wait_sync_work();
+
+    ASSERT_EQ(observer().wait_for_parent_candidate_ids_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().wait_for_parent_candidate_ids_[0], candidate->id);
+    ASSERT_EQ(observer().resolve_state_requests_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().resolve_state_requests_[0], candidate->parent_id);
+    ASSERT_EQ(observer().stored_candidate_ids_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().stored_candidate_ids_[0], candidate->id);
+    ASSERT_EQ(observer().validation_candidate_ids_.size(), static_cast<size_t>(1));
+    EXPECT_EQ(observer().validation_candidate_ids_[0], candidate->id);
+
+    auto notar_votes = published_votes<simplex::NotarizeVote>(observer().broadcast_votes_);
+    auto final_votes = published_votes<simplex::FinalizeVote>(observer().broadcast_votes_);
+    ASSERT_EQ(notar_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(notar_votes[0].id, candidate->id);
+    EXPECT_EQ(final_votes.size(), static_cast<size_t>(0));
+
+    ConsensusBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 0);
+    auto notar_cert = make_simplex_certificate(ctx(), seed_bus, simplex::NotarizeVote{candidate->id}, {0, 1});
+
+    handle_.publish<simplex::NotarizationObserved>(candidate->id, notar_cert);
+    co_await ts_.wait_sync_work();
+
+    final_votes = published_votes<simplex::FinalizeVote>(observer().broadcast_votes_);
+    ASSERT_EQ(final_votes.size(), static_cast<size_t>(1));
+    EXPECT_EQ(final_votes[0].id, candidate->id);
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexConsensus, ValidCandidateNotarizesAndFinalizesOnMatchingNotarCert);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
