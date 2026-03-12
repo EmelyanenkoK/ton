@@ -208,6 +208,26 @@ inline CandidateRef make_full_candidate(const BlockCandidate& bc, PeerValidatorI
   return td::Ref<Candidate>(true, id, std::optional<CandidateId>{}, leader, bc.clone(), td::BufferSlice());
 }
 
+inline CandidateRef make_serializable_empty_candidate(const ValidatorSetup& setup, const consensus::Bus& bus,
+                                                      td::uint32 slot, CandidateId parent, BlockIdExt referenced_block,
+                                                      PeerValidatorId leader) {
+  auto hash_data = CandidateHashData::create_empty(referenced_block, parent);
+  auto id = hash_data.build_id_with(slot);
+  auto id_to_sign = serialize_tl_object(id.to_tl(), true);
+  auto signature = sign_consensus_payload(setup, bus, leader.value(), id_to_sign.as_slice());
+  return td::make_ref<Candidate>(id, ParentId{parent}, leader, std::move(referenced_block), std::move(signature));
+}
+
+inline CandidateRef make_serializable_full_candidate(const ValidatorSetup& setup, const consensus::Bus& bus,
+                                                     td::uint32 slot, ParentId parent, const BlockCandidate& block,
+                                                     PeerValidatorId leader) {
+  auto hash_data = CandidateHashData::create_full(block, parent);
+  auto id = hash_data.build_id_with(slot);
+  auto id_to_sign = serialize_tl_object(id.to_tl(), true);
+  auto signature = sign_consensus_payload(setup, bus, leader.value(), id_to_sign.as_slice());
+  return td::make_ref<Candidate>(id, std::move(parent), leader, block.clone(), std::move(signature));
+}
+
 inline CandidateId make_candidate_id(td::uint32 slot, td::uint64 pattern) {
   return CandidateId{.slot = slot, .hash = bits256_pattern(pattern)};
 }
