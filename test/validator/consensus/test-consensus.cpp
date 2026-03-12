@@ -66,6 +66,7 @@ td::Result<std::pair<T, T>> parse_int_range(td::Slice s) {
 enum class TestCase {
   Smoke,
   NoDoubleNotar,
+  CandidateResolutionRecovery,
   NotarRequiresParentNotar,
   EmptyCandidatesConsensus,
   StandstillRebroadcastContents,
@@ -84,6 +85,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "no-double-notar") {
     return TestCase::NoDoubleNotar;
+  }
+  if (s == "candidate-resolution-recovery") {
+    return TestCase::CandidateResolutionRecovery;
   }
   if (s == "notar-requires-parent-notar") {
     return TestCase::NotarRequiresParentNotar;
@@ -164,6 +168,27 @@ bool NET_GREMLIN_KILLS_LEADER = false;
 std::pair<double, double> DB_DELAY = {0.0, 0.0};
 std::pair<double, double> COLLATION_TIME = {0.0, 0.0};
 std::pair<double, double> VALIDATION_TIME = {0.0, 0.0};
+
+struct TestMessageFilters {
+  std::optional<size_t> drop_final_cert_dst_node;
+  std::optional<td::uint32> drop_final_cert_from_slot;
+  std::optional<size_t> drop_candidate_dst_node;
+  std::optional<td::uint32> drop_candidate_start_slot;
+  std::optional<td::uint32> drop_candidate_end_slot;
+  std::optional<size_t> force_candidate_request_src_node;
+  std::optional<size_t> force_candidate_request_src_instance;
+  std::optional<size_t> force_candidate_request_dst_node;
+};
+
+std::mutex test_message_filters_mutex;
+TestMessageFilters test_message_filters;
+
+struct TestExpectations {
+  std::optional<CandidateId> candidate_resolution_target;
+};
+
+std::mutex test_expectations_mutex;
+TestExpectations test_expectations;
 
 struct ProtocolVoteTraceRecord {
   double ts = 0.0;
@@ -278,6 +303,13 @@ struct LifecycleTraceRecord {
   bool started = false;
 };
 
+struct CandidateResolvedTraceRecord {
+  double ts = 0.0;
+  size_t node_idx = 0;
+  size_t instance_idx = 0;
+  CandidateId id;
+};
+
 struct TraceSnapshot {
   std::vector<ProtocolVoteTraceRecord> protocol_votes;
   std::vector<ProtocolCertificateTraceRecord> protocol_certificates;
@@ -292,6 +324,7 @@ struct TraceSnapshot {
   std::vector<MisbehaviorTraceRecord> misbehavior_reports;
   std::vector<NetworkToggleTraceRecord> network_toggles;
   std::vector<LifecycleTraceRecord> lifecycle;
+  std::vector<CandidateResolvedTraceRecord> candidates_resolved;
 };
 
 std::string certificate_trace_key(const ProtocolCertificateTraceRecord& record);
@@ -314,6 +347,101 @@ td::Status verify_no_double_notar(const TraceSnapshot& snapshot) {
                                          << ": first=" << it->second << ", later=" << notar->id);
     }
   }
+  return td::Status::OK();
+}
+
+td::Status verify_candidate_resolution_recovery(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md Rule 2:
+  // after restart and local data loss, a node retries requestCandidate with exponential backoff,
+  // then successfully resolves the requested notarized candidate once a serving peer returns.
+  std::optional<CandidateId> expected_target;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    expected_target = test_expectations.candidate_resolution_target;
+  }
+  if (!expected_target.has_value()) {
+    return td::Status::Error("recovery scenario did not register the target candidate id");
+  }
+
+  std::vector<OverlayRequestTraceRecord> requests;
+  for (const auto& record : snapshot.overlay_requests) {
+    if (record.src_node_idx == 0 && record.src_instance_idx == 0 && record.candidate_id == expected_target) {
+      requests.push_back(record);
+    }
+  }
+  if (requests.empty()) {
+    return td::Status::Error(PSTRING() << "recovery scenario did not produce requestCandidate traffic for target "
+                                       << *expected_target);
+  }
+  if (requests.size() < 3) {
+    return td::Status::Error(PSTRING() << "recovery scenario did not retry target " << *expected_target
+                                       << " enough times to show backoff");
+  }
+  std::sort(requests.begin(), requests.end(), [](const auto& a, const auto& b) { return a.ts < b.ts; });
+  if (requests.front().timeout_s < 0.35 || requests.front().timeout_s > 0.65) {
+    return td::Status::Error(PSTRING() << "unexpected initial requestCandidate timeout for target "
+                                       << *expected_target << ": " << requests.front().timeout_s << "s");
+  }
+  bool saw_backoff = false;
+  double prev_timeout = requests.front().timeout_s;
+  for (size_t i = 1; i < requests.size(); ++i) {
+    double min_expected_timeout = std::min(prev_timeout * 1.35, 30.0);
+    if (requests[i].timeout_s + 0.05 < min_expected_timeout) {
+      return td::Status::Error(PSTRING() << "requestCandidate timeout for target " << *expected_target
+                                         << " failed to back off from " << prev_timeout << "s to at least "
+                                         << min_expected_timeout << "s, got " << requests[i].timeout_s
+                                         << "s");
+    }
+    saw_backoff = saw_backoff || requests[i].timeout_s > prev_timeout + 1e-9;
+    prev_timeout = requests[i].timeout_s;
+  }
+  if (!saw_backoff) {
+    return td::Status::Error(PSTRING() << "recovery scenario did not show exponential requestCandidate backoff for "
+                                       << *expected_target);
+  }
+
+  std::optional<CandidateResolvedTraceRecord> resolved;
+  for (const auto& record : snapshot.candidates_resolved) {
+    if (record.node_idx == 0 && record.instance_idx == 0) {
+      resolved = record;
+      break;
+    }
+  }
+  if (!resolved.has_value()) {
+    return td::Status::Error(PSTRING() << "recovery scenario showed backoff for candidate "
+                                       << *expected_target
+                                       << " but validator #0.0 never resolved any candidate after restart; saw "
+                                       << requests.size() << " request(s) for the target");
+  }
+  if (resolved->id != *expected_target) {
+    return td::Status::Error(PSTRING() << "recovery scenario resolved " << resolved->id << " instead of target "
+                                       << *expected_target);
+  }
+
+  std::optional<double> serving_peer_restart_ts;
+  for (const auto& record : snapshot.lifecycle) {
+    if (record.node_idx == 3 && record.instance_idx == 0 && record.started) {
+      serving_peer_restart_ts = record.ts;
+      break;
+    }
+  }
+  if (!serving_peer_restart_ts.has_value()) {
+    return td::Status::Error("recovery scenario did not record the restart of the only full-data peer");
+  }
+  if (resolved->ts <= *serving_peer_restart_ts) {
+    return td::Status::Error("recovery scenario resolved state before the full-data peer restarted");
+  }
+
+  size_t requests_before_serving_peer_restart = 0;
+  for (size_t i = 0; i < requests.size(); ++i) {
+    if (requests[i].ts < *serving_peer_restart_ts) {
+      ++requests_before_serving_peer_restart;
+    }
+  }
+  if (requests_before_serving_peer_restart < 2) {
+    return td::Status::Error("recovery scenario did not retry while the full-data peer was still offline");
+  }
+
   return td::Status::OK();
 }
 
@@ -778,6 +906,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return td::Status::OK();
     case TestCase::NoDoubleNotar:
       return verify_no_double_notar(snapshot);
+    case TestCase::CandidateResolutionRecovery:
+      return verify_candidate_resolution_recovery(snapshot);
     case TestCase::NotarRequiresParentNotar:
       return verify_notar_requires_parent_notar(snapshot);
     case TestCase::EmptyCandidatesConsensus:
@@ -952,6 +1082,15 @@ class TestTraceSink : public td::actor::Actor {
     });
   }
 
+  void record_candidate_resolved(size_t node_idx, size_t instance_idx, CandidateId id) {
+    candidates_resolved_.push_back(CandidateResolvedTraceRecord{
+        .ts = td::Time::now_unadjusted(),
+        .node_idx = node_idx,
+        .instance_idx = instance_idx,
+        .id = std::move(id),
+    });
+  }
+
   void clear() {
     protocol_votes_.clear();
     protocol_certificates_.clear();
@@ -966,6 +1105,7 @@ class TestTraceSink : public td::actor::Actor {
     misbehavior_reports_.clear();
     network_toggles_.clear();
     lifecycle_.clear();
+    candidates_resolved_.clear();
   }
 
   td::actor::Task<TraceSnapshot> snapshot() {
@@ -983,6 +1123,7 @@ class TestTraceSink : public td::actor::Actor {
         .misbehavior_reports = misbehavior_reports_,
         .network_toggles = network_toggles_,
         .lifecycle = lifecycle_,
+        .candidates_resolved = candidates_resolved_,
     };
   }
 
@@ -1000,6 +1141,7 @@ class TestTraceSink : public td::actor::Actor {
   std::vector<MisbehaviorTraceRecord> misbehavior_reports_;
   std::vector<NetworkToggleTraceRecord> network_toggles_;
   std::vector<LifecycleTraceRecord> lifecycle_;
+  std::vector<CandidateResolvedTraceRecord> candidates_resolved_;
 };
 
 class TestSimplexBus : public simplex::Bus {
@@ -1214,6 +1356,50 @@ OverlayRequestTraceRecord decode_overlay_request(size_t src_node_idx, size_t src
   return record;
 }
 
+bool should_drop_protocol_message(const TestSimplexBus& bus, size_t dst_node_idx, td::Slice data) {
+  auto maybe_certificate = try_decode_protocol_certificate(bus, bus.local_id.idx.value(), 0, dst_node_idx, data);
+  if (!maybe_certificate.has_value()) {
+    return false;
+  }
+  auto* final = std::get_if<simplex::FinalizeVote>(&maybe_certificate->vote.vote);
+  if (final == nullptr) {
+    return false;
+  }
+
+  std::scoped_lock lock(test_message_filters_mutex);
+  return test_message_filters.drop_final_cert_dst_node == dst_node_idx &&
+         test_message_filters.drop_final_cert_from_slot.has_value() &&
+         final->id.slot >= *test_message_filters.drop_final_cert_from_slot;
+}
+
+bool should_drop_candidate_delivery(size_t dst_node_idx, const CandidateRef& candidate) {
+  std::scoped_lock lock(test_message_filters_mutex);
+  if (test_message_filters.drop_candidate_dst_node != dst_node_idx ||
+      !test_message_filters.drop_candidate_start_slot.has_value() ||
+      !test_message_filters.drop_candidate_end_slot.has_value()) {
+    return false;
+  }
+  td::uint32 slot = candidate->id.slot;
+  return slot >= *test_message_filters.drop_candidate_start_slot &&
+         slot < *test_message_filters.drop_candidate_end_slot;
+}
+
+size_t rewrite_candidate_request_destination(size_t src_node_idx, size_t src_instance_idx, size_t dst_node_idx,
+                                             td::Slice data) {
+  auto maybe_request = fetch_tl_object<ton_api::consensus_simplex_requestCandidate>(data, true);
+  if (maybe_request.is_error()) {
+    return dst_node_idx;
+  }
+
+  std::scoped_lock lock(test_message_filters_mutex);
+  if (test_message_filters.force_candidate_request_src_node != src_node_idx ||
+      test_message_filters.force_candidate_request_src_instance != src_instance_idx ||
+      !test_message_filters.force_candidate_request_dst_node.has_value()) {
+    return dst_node_idx;
+  }
+  return *test_message_filters.force_candidate_request_dst_node;
+}
+
 class TestOverlayNode;
 
 class TestOverlay : public td::actor::Actor {
@@ -1301,8 +1487,8 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
 
   template <>
   void handle(BusHandle bus, std::shared_ptr<const OutgoingProtocolMessage> message) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
     auto trace_message = [&](size_t dst_idx) {
-      auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
       if (test_bus.trace_sink.empty()) {
         return;
       }
@@ -1321,6 +1507,9 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
     };
     if (message->recipient.has_value()) {
       CHECK(message->recipient.value() != bus->local_id.idx);
+      if (should_drop_protocol_message(test_bus, message->recipient->value(), message->message.data.as_slice())) {
+        return;
+      }
       trace_message(message->recipient->value());
       td::actor::ask(test_overlay, &TestOverlay::send_message, bus->local_id, instance_idx_,
                      message->recipient->value(), message->message.data.clone())
@@ -1328,6 +1517,9 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
     } else {
       for (size_t i = 0; i < bus->validator_set.size(); ++i) {
         if (bus->local_id.idx.value() != i) {
+          if (should_drop_protocol_message(test_bus, i, message->message.data.as_slice())) {
+            continue;
+          }
           trace_message(i);
           td::actor::ask(test_overlay, &TestOverlay::send_message, bus->local_id, instance_idx_, i,
                          message->message.data.clone())
@@ -1350,8 +1542,10 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
   template <>
   td::actor::Task<ProtocolMessage> process(BusHandle bus, std::shared_ptr<OutgoingOverlayRequest> message) {
     auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    size_t dst_node_idx = rewrite_candidate_request_destination(bus->local_id.idx.value(), instance_idx_,
+                                                                message->destination.value(), message->request.data.as_slice());
     if (!test_bus.trace_sink.empty()) {
-      auto record = decode_overlay_request(bus->local_id.idx.value(), instance_idx_, message->destination.value(),
+      auto record = decode_overlay_request(bus->local_id.idx.value(), instance_idx_, dst_node_idx,
                                            message->timeout, message->request.data.as_slice());
       td::actor::send_closure(test_bus.trace_sink, &TestTraceSink::record_overlay_request, record.src_node_idx,
                               record.src_instance_idx, record.dst_node_idx, record.timeout_s, record.candidate_id,
@@ -1360,7 +1554,7 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
     auto [task, promise] = td::actor::StartedTask<ProtocolMessage>::make_bridge();
     auto promise_ptr = std::make_shared<td::Promise<ProtocolMessage>>(std::move(promise));
     process_query_inner1(bus, message, promise_ptr).start().detach();
-    process_query_inner2(bus, message, promise_ptr).start().detach();
+    process_query_inner2(bus, message, promise_ptr, dst_node_idx).start().detach();
     co_return co_await std::move(task);
   }
 
@@ -1376,9 +1570,10 @@ class TestOverlayNode : public td::actor::SpawnsWith<Bus>, public td::actor::Con
   }
 
   td::actor::Task<> process_query_inner2(BusHandle bus, std::shared_ptr<OutgoingOverlayRequest> message,
-                                         std::shared_ptr<td::Promise<ProtocolMessage>> promise_ptr) {
+                                         std::shared_ptr<td::Promise<ProtocolMessage>> promise_ptr,
+                                         size_t dst_node_idx) {
     auto r_response = co_await td::actor::ask(test_overlay, &TestOverlay::send_query, bus->local_id, instance_idx_,
-                                              message->destination.value(), message->request.data.clone())
+                                              dst_node_idx, message->request.data.clone())
                           .wrap();
     if (r_response.is_ok() && *promise_ptr) {
       td::BufferSlice response = r_response.move_as_ok();
@@ -1510,6 +1705,9 @@ td::actor::Task<> TestOverlay::send_message(PeerValidator src, size_t src_instan
 td::actor::Task<> TestOverlay::send_candidate(PeerValidator src, size_t src_instance_idx, size_t dst_idx,
                                               CandidateRef candidate) {
   co_await before_receive(src.idx.value(), src_instance_idx, dst_idx, true);
+  if (should_drop_candidate_delivery(dst_idx, candidate)) {
+    co_return td::Unit{};
+  }
   for (size_t dst_instance_idx = 0; dst_instance_idx < nodes_[dst_idx].size(); ++dst_instance_idx) {
     const auto& instance = nodes_[dst_idx][dst_instance_idx];
     if (instance.actor.empty() || instance.disabled) {
@@ -1839,6 +2037,42 @@ class TestConsensus : public td::actor::Actor {
     co_return co_await td::actor::ask(trace_sink_, &TestTraceSink::clear);
   }
 
+  td::actor::Task<> clear_test_message_filters() {
+    std::scoped_lock lock(test_message_filters_mutex);
+    test_message_filters = {};
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_drop_final_certs_for_test(size_t dst_node_idx, td::uint32 from_slot) {
+    std::scoped_lock lock(test_message_filters_mutex);
+    test_message_filters.drop_final_cert_dst_node = dst_node_idx;
+    test_message_filters.drop_final_cert_from_slot = from_slot;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_drop_candidates_for_test(size_t dst_node_idx, td::uint32 start_slot, td::uint32 end_slot) {
+    std::scoped_lock lock(test_message_filters_mutex);
+    test_message_filters.drop_candidate_dst_node = dst_node_idx;
+    test_message_filters.drop_candidate_start_slot = start_slot;
+    test_message_filters.drop_candidate_end_slot = end_slot;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_force_candidate_request_destination_for_test(size_t src_node_idx, size_t src_instance_idx,
+                                                                     size_t dst_node_idx) {
+    std::scoped_lock lock(test_message_filters_mutex);
+    test_message_filters.force_candidate_request_src_node = src_node_idx;
+    test_message_filters.force_candidate_request_src_instance = src_instance_idx;
+    test_message_filters.force_candidate_request_dst_node = dst_node_idx;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_candidate_resolution_target_for_test(CandidateId id) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.candidate_resolution_target = id;
+    co_return td::Unit{};
+  }
+
   td::actor::Task<> clear_instance_candidate_storage(size_t node_idx, size_t instance_idx) {
     co_return co_await td::actor::ask(nodes_[node_idx].instances[instance_idx].candidate_storage, &CandidateStorage::clear);
   }
@@ -1847,6 +2081,26 @@ class TestConsensus : public td::actor::Actor {
     auto& db_inner = nodes_[node_idx].instances[instance_idx].db_inner;
     std::scoped_lock lock(db_inner->mutex);
     db_inner->map.clear();
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> clear_instance_candidate_resolver_candidates(size_t node_idx, size_t instance_idx) {
+    auto& db_inner = nodes_[node_idx].instances[instance_idx].db_inner;
+    std::scoped_lock lock(db_inner->mutex);
+    auto erase_by_prefix = [&](td::uint32 prefix) {
+      std::vector<td::BufferSlice> keys_to_erase;
+      td::BufferSlice begin{reinterpret_cast<const char*>(&prefix), 4};
+      td::uint32 prefix2 = prefix + 1;
+      td::BufferSlice end{reinterpret_cast<const char*>(&prefix2), 4};
+      for (auto it = db_inner->map.lower_bound(begin); it != db_inner->map.end() && it->first < end; ++it) {
+        keys_to_erase.push_back(it->first.clone());
+      }
+      for (auto& key : keys_to_erase) {
+        db_inner->map.erase(key);
+      }
+    };
+    erase_by_prefix(ton_api::consensus_simplex_db_key_candidateResolver_candidateInfo::ID);
+    erase_by_prefix(ton_api::consensus_simplex_db_key_candidate::ID);
     co_return td::Unit{};
   }
 
@@ -1861,6 +2115,13 @@ class TestConsensus : public td::actor::Actor {
 
   td::actor::Task<> stop_instance_for_test(size_t node_idx, size_t instance_idx) {
     co_return co_await stop_instance(node_idx, instance_idx);
+  }
+
+  td::actor::Task<> resolve_candidate_for_test(size_t node_idx, size_t instance_idx, CandidateId id) {
+    auto resolved = co_await nodes_[node_idx].instances[instance_idx].bus.publish<simplex::ResolveCandidate>(id);
+    (void)resolved;
+    td::actor::send_closure(trace_sink_, &TestTraceSink::record_candidate_resolved, node_idx, instance_idx, id);
+    co_return td::Unit{};
   }
 
  private:
@@ -1906,6 +2167,17 @@ class TestConsensus : public td::actor::Actor {
       }
       STANDSTILL_TIMEOUT_S = 1.0;
     }
+    if (TEST_CASE == TestCase::CandidateResolutionRecovery) {
+      if (N_NODES == 8) {
+        N_NODES = 4;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 200;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 5.0;
+      }
+    }
   }
 
   td::actor::Task<> wait_for_finalization_on(size_t node_idx, size_t instance_idx, double timeout_s) {
@@ -1924,7 +2196,7 @@ class TestConsensus : public td::actor::Actor {
   }
 
   bool skip_finalize_for_test_case() const {
-    return TEST_CASE == TestCase::StandstillRebroadcastContents;
+    return TEST_CASE == TestCase::StandstillRebroadcastContents || TEST_CASE == TestCase::CandidateResolutionRecovery;
   }
 
   td::actor::Task<> run_test_case_scenario() {
@@ -1938,6 +2210,48 @@ class TestConsensus : public td::actor::Actor {
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }
+    if (TEST_CASE == TestCase::CandidateResolutionRecovery) {
+      // Drives simplex_docs.md Rule 2:
+      // after a node loses its local simplex state, it must recover by repeatedly requesting a
+      // notarized candidate, backing off between retries, and then resolving that candidate once the only
+      // peer with the candidate body becomes reachable again.
+      co_await wait_for_finalization_on(1, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      std::optional<CandidateId> target_id;
+      for (auto it = snapshot.protocol_votes.rbegin(); it != snapshot.protocol_votes.rend(); ++it) {
+        if (it->src_node_idx != 3 || it->src_instance_idx != 0) {
+          continue;
+        }
+        if (auto* notar = std::get_if<simplex::NotarizeVote>(&it->vote.vote)) {
+          target_id = notar->id;
+          break;
+        }
+      }
+      if (!target_id.has_value()) {
+        co_return td::Status::Error("could not find a candidate notarized by the serving peer for Rule 2 recovery test");
+      }
+      co_await set_candidate_resolution_target_for_test(*target_id);
+
+      co_await stop_instance(0, 0);
+      co_await stop_instance(1, 0);
+      co_await stop_instance(2, 0);
+      co_await stop_instance(3, 0);
+      co_await clear_instance_db(0, 0);
+      co_await clear_instance_candidate_storage(0, 0);
+      co_await clear_instance_candidate_resolver_candidates(1, 0);
+      co_await clear_instance_candidate_resolver_candidates(2, 0);
+      start_instance(1, 0);
+      start_instance(2, 0);
+      co_await set_force_candidate_request_destination_for_test(0, 0, 3);
+      co_await clear_traces();
+      start_instance(0, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.2));
+      resolve_candidate_for_test(0, 0, *target_id).start().detach();
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.5));
+      start_instance(3, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
 
     co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
     if (TEST_CASE == TestCase::NotarRequiresParentNotar || TEST_CASE == TestCase::EmptyCandidatesConsensus) {
@@ -1948,6 +2262,14 @@ class TestConsensus : public td::actor::Actor {
 
   td::actor::Task<> run_inner() {
     apply_test_case_defaults();
+    {
+      std::scoped_lock lock(test_message_filters_mutex);
+      test_message_filters = {};
+    }
+    {
+      std::scoped_lock lock(test_expectations_mutex);
+      test_expectations = {};
+    }
     keyring_ = keyring::Keyring::create("");
 
     for (size_t i = 0; i < N_NODES; ++i) {
