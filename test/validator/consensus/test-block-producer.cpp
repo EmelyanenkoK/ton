@@ -379,6 +379,75 @@ struct GeneratesChainedCandidatesForWholeLeaderWindow : BlockProducerTest {
 };
 REGISTER_TEST(BlockProducer, GeneratesChainedCandidatesForWholeLeaderWindow);
 
+struct PassesRemainingCollationBudgetToManager : BlockProducerTest {
+  TestOptions options() const override {
+    auto opts = TestOptions{};
+    opts.target_rate_ms = 1000;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers Kernel-22 / the producer time-budget contract from tracker-test-plan.md:
+    // the collator should receive the remaining time in the current slot, not a fresh full
+    // target-rate budget when the leader window is already late at the moment collation starts.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto pending_collation = mock_->collate.expect();
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, state, 0, 1, td::Timestamp::in(-0.75));
+    co_await ts_.wait_sync_work();
+
+    auto pending_call = co_await std::move(pending_collation);
+    const auto& params = std::get<0>(pending_call.args);
+
+    EXPECT(params.soft_timeout.in() <= 0.35);
+
+    pending_call.respond.set_value(make_collation_result(state, ctx().shard(), 2));
+    co_await ts_.wait_sync_work();
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, PassesRemainingCollationBudgetToManager);
+
+struct StopsProducingWhenCollationBudgetExpires : BlockProducerTest {
+  TestOptions options() const override {
+    auto opts = TestOptions{};
+    opts.target_rate_ms = 1000;
+    return opts;
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers Kernel-22 timeout handling:
+    // once collation runs past the slot budget, the late result must not still become a produced
+    // candidate for that slot.
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto pending_collation = mock_->collate.expect();
+    handle_.publish<OurLeaderWindowStarted>(ParentId{}, state, 0, 1, td::Timestamp::now());
+    co_await ts_.wait_sync_work();
+
+    auto pending_call = co_await std::move(pending_collation);
+
+    ts_.advance_time(1.5);
+    co_await ts_.wait_sync_work();
+
+    pending_call.respond.set_value(make_collation_result(state, ctx().shard(), 2));
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<CandidateGenerated>(bus_mock().events_), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<CandidateReceived>(bus_mock().events_), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(BlockProducer, StopsProducingWhenCollationBudgetExpires);
+
 struct DoesNotPublishCandidatesFromSupersededLeaderWindow : BlockProducerTest {
   td::actor::Task<td::Unit> run_test() override {
     // Covers the producer's stale-window guard:

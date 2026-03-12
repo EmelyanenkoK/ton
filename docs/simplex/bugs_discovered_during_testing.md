@@ -93,3 +93,31 @@ timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-tim
   observed finalization rather than `previous_window_had_skip_`. Then rerun and tighten the
   `test-consensus` Rule 6 scenario until it reliably reaches the intended timing assertion instead
   of aborting earlier with no later-window `SkipVote`.
+
+## `BlockProducer` does not respect the remaining collation budget of the current slot
+
+- Documentation / expectation: `tracker-test-plan.md` `Kernel-22` says the collator should receive
+  the remaining time budget of the current slot, and a collation result that arrives after the slot
+  budget expires should not still be published for that slot.
+- Observed behavior: both producer time-budget tests are red.
+  `BlockProducer_PassesRemainingCollationBudgetToManager` shows the producer still passes a fresh
+  full `target_rate_` soft timeout even when the leader window starts late.
+  `BlockProducer_StopsProducingWhenCollationBudgetExpires` shows the producer still publishes a
+  candidate after collation returns well after the slot deadline.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-block-producer --verbosity 0
+```
+- Narrowing evidence:
+  `validator/consensus/block-producer.cpp` currently builds `CollateParams` with
+  `soft_timeout = td::Timestamp::in(target_rate_)`, independent of `event->start_time` and the
+  already elapsed portion of the slot. After `collate_block(...)` returns, the code checks only
+  whether the leader window changed, not whether the slot deadline has already passed.
+- Probable cause:
+  the producer treats collation as if every slot starts with a fresh full `target_rate_` budget and
+  lacks a post-collation deadline check before publishing `CandidateGenerated` /
+  `CandidateReceived`.
+- What should be fixed:
+  derive the manager `soft_timeout` from the remaining time until the current slot deadline, not
+  from an unconditional full `target_rate_`, and after collation/signing re-check that the result
+  is still within the slot budget before publishing it.
