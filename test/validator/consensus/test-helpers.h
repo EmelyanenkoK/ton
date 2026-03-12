@@ -27,6 +27,8 @@ struct TestOptions {
   std::vector<ValidatorWeight> weight_distribution = {1};
   td::uint32 slots_per_leader_window = 4;
   td::uint32 target_rate_ms = 1000;
+  td::uint32 first_block_timeout_ms = 1000;
+  td::uint32 max_leader_window_desync = 1;
 };
 
 inline Bits256 bits256_pattern(td::uint64 x) {
@@ -98,6 +100,8 @@ class ValidatorSetup {
         .consensus =
             NewConsensusConfig::Simplex{
                 .slots_per_leader_window = options_.slots_per_leader_window,
+                .first_block_timeout_ms = options_.first_block_timeout_ms,
+                .max_leader_window_desync = options_.max_leader_window_desync,
             },
     };
     bus.stop_promise = [](td::Result<>) {};
@@ -254,6 +258,35 @@ class TestDbImpl : public consensus::Db {
     map_[std::move(key)] = std::move(value);
   }
 
+  void seed_all(const std::vector<std::pair<td::BufferSlice, td::BufferSlice>>& entries) {
+    for (const auto& [key, value] : entries) {
+      seed(key.clone(), value.clone());
+    }
+  }
+
+  std::vector<std::pair<td::BufferSlice, td::BufferSlice>> entries() const {
+    std::vector<std::pair<td::BufferSlice, td::BufferSlice>> result;
+    result.reserve(map_.size());
+    for (const auto& [key, value] : map_) {
+      result.emplace_back(key.clone(), value.clone());
+    }
+    return result;
+  }
+
+  size_t size() const {
+    return map_.size();
+  }
+
+  void fail_next_sets(size_t count, td::Slice message = "db set failed") {
+    fail_next_set_count_ = count;
+    fail_message_ = message.str();
+  }
+
+  void clear_set_failures() {
+    fail_next_set_count_ = 0;
+    fail_message_ = "db set failed";
+  }
+
   std::optional<td::BufferSlice> get(td::Slice key) const override {
     auto it = map_.find(td::BufferSlice{key});
     if (it == map_.end()) {
@@ -274,12 +307,18 @@ class TestDbImpl : public consensus::Db {
   }
 
   td::actor::Task<> set(td::BufferSlice key, td::BufferSlice value) override {
+    if (fail_next_set_count_ > 0) {
+      --fail_next_set_count_;
+      co_return td::Status::Error(fail_message_);
+    }
     map_[std::move(key)] = std::move(value);
     co_return {};
   }
 
  private:
   std::map<td::BufferSlice, td::BufferSlice> map_;
+  size_t fail_next_set_count_ = 0;
+  std::string fail_message_ = "db set failed";
 };
 
 // =============================================================================
