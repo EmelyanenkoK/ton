@@ -71,6 +71,7 @@ enum class TestCase {
   CertificateRequiresQuorum,
   CertificateRebroadcast,
   FinalRequiresObservedNotar,
+  LeaderWindowSchedule,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -94,6 +95,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "final-requires-observed-notar") {
     return TestCase::FinalRequiresObservedNotar;
+  }
+  if (s == "leader-window-schedule") {
+    return TestCase::LeaderWindowSchedule;
   }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
@@ -461,6 +465,33 @@ td::Status verify_finalize_requires_observed_notar(const TraceSnapshot& snapshot
   return td::Status::OK();
 }
 
+td::Status verify_leader_window_schedule(const TraceSnapshot& snapshot) {
+  // Covers simplex_docs.md leader-window scheduling:
+  // window k starts at slot kL, spans exactly L slots, and the designated leader is k mod n.
+  if (snapshot.leader_windows_started.empty()) {
+    return td::Status::Error("scenario did not produce any leader windows");
+  }
+
+  for (const auto& record : snapshot.leader_windows_started) {
+    if (record.start_slot % SLOTS_PER_LEADER_WINDOW != 0) {
+      return td::Status::Error(PSTRING() << "leader window started at non-boundary slot " << record.start_slot);
+    }
+    td::uint32 expected_end_slot = record.start_slot + SLOTS_PER_LEADER_WINDOW;
+    if (record.end_slot != expected_end_slot) {
+      return td::Status::Error(PSTRING() << "leader window [" << record.start_slot << ", " << record.end_slot
+                                         << ") had wrong exclusive end slot, expected " << expected_end_slot);
+    }
+
+    size_t expected_leader = (record.start_slot / SLOTS_PER_LEADER_WINDOW) % N_NODES;
+    if (record.node_idx != expected_leader) {
+      return td::Status::Error(PSTRING() << "window starting at slot " << record.start_slot
+                                         << " was announced by validator #" << record.node_idx
+                                         << ", expected validator #" << expected_leader);
+    }
+  }
+  return td::Status::OK();
+}
+
 td::Status verify_test_case(const TraceSnapshot& snapshot) {
   switch (TEST_CASE) {
     case TestCase::Smoke:
@@ -477,6 +508,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_certificate_rebroadcast(snapshot);
     case TestCase::FinalRequiresObservedNotar:
       return verify_finalize_requires_observed_notar(snapshot);
+    case TestCase::LeaderWindowSchedule:
+      return verify_leader_window_schedule(snapshot);
   }
   UNREACHABLE();
 }
