@@ -73,6 +73,13 @@ bool has_certificate_for(const std::vector<simplex::CertificateRef<simplex::Vote
   return false;
 }
 
+td::int64 stored_our_vote_seqno(const TestDbImpl& db, const simplex::Vote& vote) {
+  auto stored = db.get(db_vote_key(vote).as_slice());
+  CHECK(stored.has_value());
+  auto value = fetch_tl_object<tl::db_ourVote>(*stored, true).move_as_ok();
+  return value->seqno_;
+}
+
 class SimplexDbTest : public td::Test {
  protected:
   std::unique_ptr<ValidatorSetup> ctx_;
@@ -207,6 +214,27 @@ struct RestoresBootstrapStateFromDb : SimplexDbTest {
   }
 };
 REGISTER_TEST(SimplexDb, RestoresBootstrapStateFromDb);
+
+struct PersistsBroadcastVotesWithSequentialSeqno : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the durable local-vote replay image used by Rule 4 and Rule 5:
+    // every locally broadcast vote must be stored once, in a deterministic sequence order, so
+    // restart replay can reconstruct the exact local voting history.
+    co_await start_actor();
+
+    auto first = simplex::Vote{simplex::NotarizeVote{make_candidate_id(10, 1010)}};
+    auto second = simplex::Vote{simplex::FinalizeVote{make_candidate_id(11, 1111)}};
+
+    co_await handle_.publish<simplex::BroadcastVote>(first);
+    co_await handle_.publish<simplex::BroadcastVote>(second);
+    EXPECT_EQ(db().size(), static_cast<size_t>(2));
+    EXPECT_EQ(stored_our_vote_seqno(db(), first), static_cast<td::int64>(0));
+    EXPECT_EQ(stored_our_vote_seqno(db(), second), static_cast<td::int64>(1));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexDb, PersistsBroadcastVotesWithSequentialSeqno);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test
