@@ -236,5 +236,27 @@ struct PersistsBroadcastVotesWithSequentialSeqno : SimplexDbTest {
 };
 REGISTER_TEST(SimplexDb, PersistsBroadcastVotesWithSequentialSeqno);
 
+struct RejectsDuplicateBroadcastVotes : SimplexDbTest {
+  td::actor::Task<td::Unit> run_test() override {
+    // Covers the Db-side local vote uniqueness guard backing simplex's per-slot vote discipline:
+    // if the exact same locally broadcast vote is replayed, the actor must reject the duplicate
+    // instead of writing a second durable copy.
+    co_await start_actor();
+
+    auto vote = simplex::Vote{simplex::NotarizeVote{make_candidate_id(12, 1212)}};
+
+    auto first = co_await handle_.publish<simplex::BroadcastVote>(vote).wrap();
+    auto duplicate = co_await handle_.publish<simplex::BroadcastVote>(vote).wrap();
+
+    ASSERT_TRUE(first.is_ok());
+    ASSERT_TRUE(duplicate.is_error());
+    EXPECT_EQ(db().size(), static_cast<size_t>(1));
+    EXPECT_EQ(stored_our_vote_seqno(db(), vote), static_cast<td::int64>(0));
+
+    co_return td::Unit{};
+  }
+};
+REGISTER_TEST(SimplexDb, RejectsDuplicateBroadcastVotes);
+
 }  // namespace
 }  // namespace ton::validator::consensus::test
