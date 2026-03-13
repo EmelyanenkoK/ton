@@ -1,13 +1,13 @@
 # Bugs Discovered During Simplex Testing
 
-This file tracks red Simplex tests on the current branch, but after rereading the implementation
-and rerunning the failing cases it now separates them into five buckets:
+This file tracks issues discovered during Simplex testing on the current branch. After rereading
+the implementation and rerunning the previously failing cases, it now separates them into three
+buckets:
 
 - `Confirmed code issue`: the implementation is missing a check or keeps incorrect state.
 - `Mixed`: there is a real code issue, but the current test also needs tightening.
-- `Test / harness issue`: the red test does not currently demonstrate a live product bug.
-- `Hardening opportunity`: the behavior is only wrong if a wider actor contract is allowed.
-- `Resolved test / harness update`: the earlier red test was fixed locally and is now green.
+- `Resolved test / harness update`: the earlier red case was caused by test or harness assumptions
+  rather than a demonstrated live product bug, and the updated test is now green.
 
 Consolidated duplicates:
 
