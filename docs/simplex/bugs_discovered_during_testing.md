@@ -33,6 +33,17 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case wrong-le
   candidate in `pending_block`, it only emits a trace if the leader is not us and still starts
   `try_notarize()`. The injected wrong-leader candidate therefore goes through `WaitForParent`,
   `ResolveState`, validation, and finally local `BroadcastVote(NotarizeVote{...})`.
+- Bigger-picture impact:
+  the normal remote-entry path is partially protective: `PrivateOverlay` and `CandidateResolver`
+  both call `Candidate::deserialize(...)`, and that parser already derives the expected leader from
+  the slot and rejects a broadcast whose source does not match `expected_collator_for(slot)`.
+  `BlockProducer` also self-publishes only locally scheduled candidates. So a remote peer cannot
+  exploit this through the standard overlay path today. The residual risk is the internal contract:
+  any future actor, replay tool, fuzz harness, DB corruption, or refactor that injects
+  `CandidateReceived` directly can make honest validators spend validation work and cast `Notar`
+  for an unauthorized leader. If that bypass reached enough validators, the wrong-leader candidate
+  could crowd out the scheduled leader for that slot and turn a fairness / schedule violation into a
+  real liveness fault or even an accepted block under a leader the wire parser would have rejected.
 - Proposed production change:
   reject the candidate before setting `pending_block` if its declared leader does not match the slot
   schedule. If the intent is parser-only enforcement, then the `CandidateReceived` contract should
@@ -82,6 +93,17 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
   `test-simplex-consensus.cpp` already proves "reject does not cast a vote or report
   misbehavior", but there was no unit test for rolling back slot-local pending state after a
   rejection. The end-to-end test is catching exactly that missing rollback.
+- Bigger-picture impact:
+  this is a liveness / participation bug, not a direct safety bug. The rejecting validator does not
+  vote for the bad candidate, and the later skip path still works because `alarm()` ignores
+  `pending_block` and can mark the slot skipped. If only a minority of validators wedge on the
+  rejected candidate, the healthy majority can still notarize a replacement and the wedged nodes can
+  catch up from later certificates. The worst case is when the same doomed candidate reaches a large
+  fraction of validators first: then the whole network can lose the replacement candidate for that
+  slot, fail to form quorum there, and fall back to skip / later windows instead of using the valid
+  replacement. In other words, the bug turns one rejected candidate into avoidable throughput loss
+  and a stronger adversarial stall amplifier, but it does not by itself create conflicting finalized
+  blocks.
 - Proposed production change:
   keep the current deduplication behavior for an in-flight candidate, but clear `pending_block` on
   rejection so a later replacement can restart the pipeline. Delaying the initial assignment until
@@ -125,6 +147,18 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
   `event->signatures->is_final()` before advancing its own masterchain watermark. The missing guard
   in `BlockValidator` is therefore a real boundary inconsistency even if the current Simplex
   publisher usually sends final signatures on masterchain.
+- Bigger-picture impact:
+  under the current Simplex wiring, the live risk is lower than the raw actor bug: in
+  `simplex/state-resolver.cpp`, masterchain `finalize_blocks_inner(...)` returns early when it has
+  only a notar certificate, so the normal Simplex publisher does not emit non-final
+  `FinalizeBlock` events for masterchain blocks. `BlockProducer` also already distinguishes final
+  from non-final signatures. So today this mostly remains an actor-boundary footgun. The worst case
+  appears if another publisher or a future refactor violates that implicit contract: then a
+  masterchain validator could start validating children of a merely notarized parent, wasting work
+  on one node and, if repeated across many validators, allowing child candidates to be considered
+  too early relative to true masterchain finality. That would still be a liveness / ordering fault
+  first, but it is exactly the kind of boundary inconsistency that can become consensus-visible once
+  the surrounding assumptions change.
 - Proposed production change:
   guard `handle(FinalizeBlock)` with `is_final()`. If the event is meant to be final-only, also
   document that contract explicitly in `bus.h`.
@@ -163,6 +197,17 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
   `validator/consensus/simplex/certificate.cpp`, the parser verifies signatures over the raw TL vote
   and only then converts it into the internal `Vote`, so the negative `int32` survives long enough
   to become a wrapped `uint32` instead of a parse error.
+- Bigger-picture impact:
+  the live-network blast radius is narrower than the parser unit failure alone suggests. Honest
+  nodes serialize skip slots from local `uint32` values, so they do not naturally emit negative TL
+  slots; a malformed vote also still needs a valid signature from the claimed validator, and a
+  malformed certificate needs a real quorum of signatures before `Certificate::from_tl(...)` will
+  accept it. A single bad peer therefore cannot cheaply push this through the normal protocol. The
+  remaining risk is at corruption / Byzantine boundaries: malformed signed votes are treated as
+  gigantic future slots instead of parse failures, and malformed quorum certificates can be saved to
+  DB and rebroadcast rather than quarantined. That can pollute persistent local state with
+  impossible future-slot certificates and distort recovery / observability, but it is not a cheap
+  safety break against an otherwise honest network.
 - Proposed production change:
   reject negative slot values before the cast. This should be a parser error, not a `CHECK`, so
   the likely implementation shape is to make `SkipVote::from_tl` and `Vote::from_tl` return
@@ -207,6 +252,15 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
   `soft_timeout = td::Timestamp::in(target_rate_)`, effectively giving the collator a fresh full
   budget even if the window started late. After collation returns, the code checks only whether the
   leader window changed; it never re-checks whether the slot deadline itself has already passed.
+- Bigger-picture impact:
+  this bug does not let arbitrary invalid blocks bypass consensus. A late candidate still goes
+  through the normal validation, notarization, and finalization pipeline, and if the leader window
+  has already been superseded then the existing `current_leader_window_` guard drops the stale
+  result. The real system-level consequence is timing distortion inside an still-active leader
+  window: a slow or overloaded collator gets more wall-clock time than configured, can still publish
+  a late candidate for the expired slot, and can delay the protocol's intended handoff to skip /
+  empty-block fallback. At scale, that hurts throughput and makes performance under overload or
+  adversarial slowdown worse, but quorum-based safety is still enforced downstream.
 - Proposed production change:
   derive the collator deadline from the actual end of the current slot and drop late collation
   results before publishing `CandidateGenerated` / `CandidateReceived`.
@@ -258,6 +312,16 @@ timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-tim
   intermediate clear window still had no local skip. With those setup conditions satisfied, the
   current code still fails to emit a `SkipVote` in the first stalled window and only does so much
   later (`[4,8]` in the current run). That is a product failure, not a harness ambiguity.
+- Bigger-picture impact:
+  this is a recovery / liveness bug, not a direct safety break. The rest of Simplex still enforces
+  certificate quorums, single-slot local voting invariants, and finalization-before-state-advance
+  rules; the bad state variable only changes when a validator gives up and casts `Skip`. The
+  consequence is that fallback timing becomes unpredictable under intermittent progress: some
+  patterns reset too aggressively after a clean-but-nonfinal window, while the currently reproduced
+  pattern delays the first skip until much later windows (`[4,8]`) after finalization froze. In the
+  larger system that means targeted leader outages, packet loss, or temporary validator stalls can
+  hold the network in nonfinal progress longer than the protocol model assumes, reducing throughput
+  and delaying recovery, even though safety thresholds remain intact.
 - Proposed production change:
   track the last window in which a finalization was observed and derive `first_block_timeout_s_`
   from that value instead of from `previous_window_had_skip_`.
