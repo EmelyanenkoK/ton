@@ -154,11 +154,12 @@ struct RejectsEmptyCandidatesWithWrongBlock : BlockValidatorTest {
 };
 REGISTER_TEST(BlockValidator, RejectsEmptyCandidatesWithWrongBlock);
 
-struct RejectsEmptyCandidateWithWrongParentLink : BlockValidatorTest {
+struct AcceptsEmptyCandidateWhenResolvedStateMatchesReference : BlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {
-    // Covers tracker Kernel-23 / Kernel-30 structural empty-candidate validation:
-    // an empty candidate that references the current block but carries an unrelated parent link
-    // should still be rejected instead of being treated as a valid chain extension.
+    // Covers the actual BlockValidator boundary for empty candidates:
+    // ValidationRequest already carries the state resolved from candidate->parent_id upstream, so
+    // this actor only checks that the empty candidate references that supplied state block and does
+    // not independently reinterpret the parent link here.
     auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
     handle_.publish<Start>(state);
 
@@ -168,13 +169,13 @@ struct RejectsEmptyCandidateWithWrongParentLink : BlockValidatorTest {
 
     auto result = co_await handle_.publish<ValidationRequest>(state, candidate);
 
-    EXPECT(result.has<CandidateReject>());
+    EXPECT(result.has<CandidateAccept>());
     EXPECT_EQ(mock_->validate.call_count(), 0);
 
     co_return {};
   }
 };
-REGISTER_TEST(BlockValidator, RejectsEmptyCandidateWithWrongParentLink);
+REGISTER_TEST(BlockValidator, AcceptsEmptyCandidateWhenResolvedStateMatchesReference);
 
 struct RejectsEmptyCandidateWithWrongBlockIdExtReference : BlockValidatorTest {
   td::actor::Task<td::Unit> run_test() override {

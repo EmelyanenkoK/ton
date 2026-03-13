@@ -399,6 +399,7 @@ struct TestExpectations {
   std::optional<double> standstill_recovery_release_ts;
   std::optional<CandidateId> wrong_parent_hash_candidate_id;
   std::optional<td::uint32> restart_reaccept_stop_slot;
+  std::optional<td::uint32> synthetic_mc_finalization_freeze_seqno;
 };
 
 std::mutex test_expectations_mutex;
@@ -3246,7 +3247,8 @@ td::Status verify_restart_after_eight_non_mc_finalized_blocks_reaccepts_pending_
   }
 
   bool saw_accept_after_empty = false;
-  for (td::uint32 seqno = *stop_slot + 1; seqno <= *stop_slot + 8; ++seqno) {
+  // Finalized slot k corresponds to accepted block seqno k + 1 in this harness.
+  for (td::uint32 seqno = *stop_slot + 2; seqno <= *stop_slot + 9; ++seqno) {
     auto it = accepted_ts_by_seqno.find(seqno);
     if (it == accepted_ts_by_seqno.end()) {
       return td::Status::Error(PSTRING() << "restarted validator #0.0 never reaccepted pending shard block seqno "
@@ -4774,10 +4776,20 @@ class TestConsensus : public td::actor::Actor {
     if (last_accepted_block_.seqno() < seqno && signatures->is_final()) {
       last_accepted_block_ = block_id;
       last_accepted_block_leader_idx_ = creator_idx;
-      for (Node &node : nodes_) {
-        for (Instance &inst : node.instances) {
-          if (inst.status == Instance::Running) {
-            inst.bus.publish<BlockFinalizedInMasterchain>(block_id);
+      bool freeze_synthetic_mc_finalization = false;
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        freeze_synthetic_mc_finalization =
+            test_expectations.synthetic_mc_finalization_freeze_seqno.has_value() &&
+            seqno > *test_expectations.synthetic_mc_finalization_freeze_seqno;
+      }
+      if (!freeze_synthetic_mc_finalization) {
+        synthetic_mc_finalized_block_ = block_id;
+        for (Node &node : nodes_) {
+          for (Instance &inst : node.instances) {
+            if (inst.status == Instance::Running) {
+              inst.bus.publish<BlockFinalizedInMasterchain>(block_id);
+            }
           }
         }
       }
@@ -6196,11 +6208,15 @@ class TestConsensus : public td::actor::Actor {
       {
         std::scoped_lock lock(test_expectations_mutex);
         test_expectations.restart_reaccept_stop_slot = highest_finalized_slot;
+        test_expectations.synthetic_mc_finalization_freeze_seqno = highest_finalized_slot;
+      }
+      if (auto it = accepted_blocks_.find(highest_finalized_slot); it != accepted_blocks_.end()) {
+        synthetic_mc_finalized_block_ = it->second->block_id();
       }
 
       co_await stop_instance(0, 0);
       co_await clear_traces();
-      co_await wait_for_accepted_block_seqno_on(1, 0, highest_finalized_slot + 8, 10.0);
+      co_await wait_for_accepted_block_seqno_on(1, 0, highest_finalized_slot + 9, 10.0);
       co_await set_force_candidate_request_destination_for_test(0, 0, 1);
       start_instance(0, 0);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
@@ -6930,7 +6946,7 @@ class TestConsensus : public td::actor::Actor {
                              PSTRING() << "consensus." << node_idx << "." << instance_idx);
     inst.status = Instance::Running;
     td::actor::send_closure(trace_sink_, &TestTraceSink::record_lifecycle, node_idx, instance_idx, true);
-    inst.bus.publish<BlockFinalizedInMasterchain>(last_accepted_block_);
+    inst.bus.publish<BlockFinalizedInMasterchain>(synthetic_mc_finalized_block_);
     inst.bus.publish<Start>(
         td::make_ref<ChainState>(ChainState::ZerostateTip{FIRST_PARENT, gen_shard_state(0)}, MIN_MC_BLOCK_ID));
     LOG(ERROR) << "Starting node #" << node_idx << "." << instance_idx;
@@ -7118,6 +7134,7 @@ class TestConsensus : public td::actor::Actor {
 
   std::map<BlockSeqno, td::Ref<BlockData>> accepted_blocks_;
   BlockIdExt last_accepted_block_ = FIRST_PARENT;
+  BlockIdExt synthetic_mc_finalized_block_ = FIRST_PARENT;
   td::optional<size_t> last_accepted_block_leader_idx_;
   bool finishing_ = false;
 };

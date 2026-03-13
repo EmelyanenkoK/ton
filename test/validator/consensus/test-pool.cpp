@@ -183,6 +183,18 @@ bool contains_outgoing_payload(const ObservedEvents& events, td::Slice payload) 
   return false;
 }
 
+bool contains_outgoing_vote(const ObservedEvents& events, const simplex::Vote& expected_vote, PeerValidatorId src,
+                            const consensus::Bus& bus) {
+  auto expected_serialized = serialize_tl_object(expected_vote.to_tl(), true);
+  for (const auto& event : events_of<OutgoingProtocolMessage>(events)) {
+    auto decoded = decode_simplex_signed_vote(event->message, src, bus);
+    if (decoded.is_ok() && serialize_tl_object(decoded.ok().vote.to_tl(), true) == expected_serialized) {
+      return true;
+    }
+  }
+  return false;
+}
+
 struct ResolvesWaitForParentFromBootstrapProofs : PoolTest {
   CandidateId parent_id_ = make_candidate_id(1, 1001);
 
@@ -384,11 +396,17 @@ struct StandstillBroadcastContainsExpectedVotesAndCertificates : PoolTest {
   td::actor::Task<td::Unit> run_test() override {
     auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
     auto local_vote = simplex::NotarizeVote{make_candidate_id(2, 6202)};
+    auto expected_local_vote = simplex::Vote{local_vote};
+    auto signed_local_vote = make_signed_simplex_vote(ctx(), *bus_, 0, local_vote);
+    auto serialized_local_vote =
+        simplex::Signed<simplex::Vote>{signed_local_vote.validator, simplex::Vote{signed_local_vote.vote},
+                                       signed_local_vote.signature.clone()}
+            .serialize();
 
     handle_.publish<Start>(state);
     co_await ts_.wait_sync_work();
 
-    (void)handle_.publish<simplex::BroadcastVote>(local_vote);
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{std::move(serialized_local_vote)});
     co_await ts_.wait_sync_work();
     clear_events();
 
@@ -397,18 +415,7 @@ struct StandstillBroadcastContainsExpectedVotesAndCertificates : PoolTest {
 
     EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
     EXPECT(contains_outgoing_payload(events(), skip_payload_.as_slice()));
-    bool saw_local_vote = false;
-    for (const auto& event : events_of<OutgoingProtocolMessage>(events())) {
-      auto decoded = decode_simplex_signed_vote(event->message, PeerValidatorId{0}, *bus_);
-      if (decoded.is_ok()) {
-        if (auto* notar = std::get_if<simplex::NotarizeVote>(&decoded.ok().vote.vote);
-            notar != nullptr && *notar == local_vote) {
-          saw_local_vote = true;
-          break;
-        }
-      }
-    }
-    EXPECT(saw_local_vote);
+    EXPECT(contains_outgoing_vote(events(), expected_local_vote, PeerValidatorId{0}, *bus_));
 
     co_return {};
   }

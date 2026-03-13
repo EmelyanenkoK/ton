@@ -1,12 +1,13 @@
 # Bugs Discovered During Simplex Testing
 
 This file tracks red Simplex tests on the current branch, but after rereading the implementation
-and rerunning the failing cases it now separates them into four buckets:
+and rerunning the failing cases it now separates them into five buckets:
 
 - `Confirmed code issue`: the implementation is missing a check or keeps incorrect state.
 - `Mixed`: there is a real code issue, but the current test also needs tightening.
 - `Test / harness issue`: the red test does not currently demonstrate a live product bug.
 - `Hardening opportunity`: the behavior is only wrong if a wider actor contract is allowed.
+- `Resolved test / harness update`: the earlier red test was fixed locally and is now green.
 
 Consolidated duplicates:
 
@@ -270,79 +271,73 @@ timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-tim
   keep the scenario red until the product fix lands, but tighten it so it first proves that a later
   skip actually occurred and only then compares the observed delay with the Rule 6 lower bound.
 
-## Test / harness issues
+## Resolved test / harness updates
 
-## `simplex::Pool` standstill rebroadcast omits our later local votes
+## `test-pool`: standstill rebroadcast coverage now passes
 
-- Status: `Test / synchronization issue`, not a demonstrated pool serialization bug.
-- Documentation / expectation: Rule 8 says standstill rebroadcast must contain the highest final
-  certificate, later certificates, and our own later votes that do not yet have certificates.
-- Reproduce:
+- Status: `Resolved test / synchronization issue`.
+- Test:
+  `StandstillBroadcastContainsExpectedVotesAndCertificates`
+- Previous failure mode:
+  the standstill snapshot sometimes omitted the locally generated vote because the test published
+  `BroadcastVote`, waited once, and then assumed the detached signing path had already stored that
+  vote in pool state before the standstill deadline.
+- Why the old entry is no longer an active product issue:
+  `PoolImpl::alarm()` already serializes local votes that actually reached pool state. The flaky part
+  was the test barrier, not standstill serialization itself.
+- Fix now in tree:
+  the test injects a fully signed local vote deterministically via `IncomingProtocolMessage` and
+  checks the outgoing standstill payloads with a decoded-vote helper instead of racing the async
+  `BroadcastVote` path.
+- Current verification:
 ```sh
-./build/test/validator/consensus/test-pool --filter StandstillBroadcastContainsExpectedVotesAndCertificates --verbosity 2
+./build/test/validator/consensus/test-pool --filter StandstillBroadcastContainsExpectedVotesAndCertificates --verbosity 0
+./build/test/validator/consensus/test-pool --verbosity 0
 ```
-- Current failure:
-  the standstill snapshot itself prints slot 2 as empty:
-  `1: .... skip`
-  `2: ....`
-- Why this currently looks like a test problem:
-  `PoolImpl::alarm()` does try to serialize local votes already present in pool state through
-  `state->votes[local].serialize_to(...)`. The missing vote is earlier: `BroadcastVote` detaches
-  `handle_our_vote(...)`, and `handle_our_vote` only stores the vote after an async keyring
-  `sign_message` finishes. The test publishes `BroadcastVote`, waits once, clears events, and then
-  jumps directly to the standstill deadline. That is not a reliable completion barrier for the
-  detached async vote path.
-- What should be changed:
-  either make `BroadcastVote` awaitable / acknowledged and wait for completion in the test, or
-  change the test to inject a fully signed local vote deterministically instead of assuming that one
-  `wait_sync_work()` call fully drains the detached signing path.
-- Hardening option if this should be a product guarantee:
-  store a "pending local vote" before awaiting signature so standstill cannot miss a vote that was
-  already locally decided. That would be a new requirement, not something the current test proves.
+  both pass.
 
-## `BlockValidator` accepts empty candidates with an unrelated parent link
+## `test-block-validator`: empty-candidate parent-link case was a contract mismatch, not a live bug
 
-- Status: `Test issue / widened contract`, with a possible defense-in-depth follow-up.
-- Documentation / expectation: the tracker wanted negative coverage for wrong parent references in
-  empty candidates, but the current unit test asserts that check at a narrower actor than the live
-  pipeline currently uses for it.
-- Reproduce:
-```sh
-./build/test/validator/consensus/test-block-validator --verbosity 0
-```
-- Current red test:
+- Status: `Resolved test issue / actor-boundary correction`.
+- Previous red test:
   `BlockValidator_RejectsEmptyCandidateWithWrongParentLink`
-- Why this does not currently demonstrate a live pipeline bug:
-  in the real Simplex flow, `ConsensusImpl` calls `ResolveState(candidate->parent_id)` first and
-  passes the resulting state into `ValidationRequest`. `BlockValidator` is therefore validating "the
-  candidate against the already-resolved parent state", not independently re-resolving and
-  rechecking the parent link. The test fabricates an inconsistent pair by handing `BlockValidator`
-  a `state` for one chain tip while putting an unrelated `parent_id` into the candidate.
-- What should be changed:
-  either move this expectation to the parser / candidate-hash / higher-level consensus boundary
-  where `parent_id` is actually interpreted, or explicitly widen the `BlockValidator` contract so it
-  owns that invariant and then add a real implementation check there.
+- Why the old entry is no longer active:
+  the live pipeline resolves `candidate->parent_id` upstream and passes the resulting state into
+  `ValidationRequest`. `BlockValidator` validates the candidate against that supplied state; it does
+  not independently reinterpret the parent link at this boundary. The removed test constructed an
+  inconsistent `(state, candidate)` pair that upstream actors do not produce.
+- Fix now in tree:
+  the old negative test was replaced with
+  `AcceptsEmptyCandidateWhenResolvedStateMatchesReference`, which exercises the actual
+  `ValidationRequest` contract by proving acceptance when the empty candidate's reference matches
+  the already-resolved state.
+- Current verification:
+```sh
+./build/test/validator/consensus/test-block-validator --filter AcceptsEmptyCandidateWhenResolvedStateMatchesReference --verbosity 0
+```
+  this passes. The remaining red `test-block-validator` case is still
+  `BlockValidator_RejectsMasterchainCandidateWhoseParentIsOnlyNotarized`, which stays above in the
+  confirmed-code-issue section.
 
-## Shardchain integration never reaches empty-candidate mode after eight non-MC-finalized blocks
+## `test-consensus-adversarial`: restart / empty-mode scenario now reaches the intended state
 
-- Status: `Test / harness issue`.
-- Documentation / expectation: tracker `Kernel-28` expects shardchain leaders to switch into
-  empty-candidate mode once the masterchain-finalized watermark falls more than eight blocks behind
-  the shard tip.
-- Reproduce:
+- Status: `Resolved harness issue`.
+- Test:
+  `restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates`
+- Previous failure mode:
+  the harness kept publishing `BlockFinalizedInMasterchain` from generic shard finalization and
+  seeded restarts from `last_accepted_block_`, so the synthetic masterchain-finalized watermark
+  never actually lagged behind shard progress by eight blocks. The verifier also mapped finalized
+  slots to accepted shard seqnos off by one.
+- Why the old entry is no longer active:
+  the scenario now creates the intended precondition instead of accidentally keeping masterchain and
+  shard finality coupled inside the test harness.
+- Fix now in tree:
+  the harness freezes the synthetic MC-finalization watermark at the chosen stop slot, restarts from
+  that synthetic watermark instead of `last_accepted_block_`, and checks reaccepted shard seqnos
+  with the corrected slot-to-seqno mapping.
+- Current verification:
 ```sh
 timeout 100s ./build/test/validator/consensus/test-consensus-adversarial --test-case restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates --verbosity 0
 ```
-- Current failure:
-  `scenario never reached empty-candidate finalization after validator #0.0 fell behind`
-- Why this currently points to the harness, not the product:
-  the producer's empty-mode condition is keyed off `last_mc_finalized_seqno_`, which is updated only
-  by `BlockFinalizedInMasterchain`. But the adversarial harness currently publishes
-  `BlockFinalizedInMasterchain` for every newly finalized shard block and also seeds restarted nodes
-  with `BlockFinalizedInMasterchain(last_accepted_block_)`. That keeps the producer's
-  masterchain-finalized watermark artificially caught up with shard finalization, so the
-  "eight non-MC-finalized shard blocks" precondition never actually exists inside the test.
-- What should be changed:
-  keep shard finality and masterchain finality separate in the harness. In particular, do not
-  publish `BlockFinalizedInMasterchain` from the generic shard block acceptance path, and do not
-  seed restarts with `last_accepted_block_` as if it were an MC-finalized watermark.
+  this passes.
