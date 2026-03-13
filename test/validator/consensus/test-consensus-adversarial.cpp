@@ -1301,18 +1301,68 @@ td::Status verify_skip_timeout_uses_last_finalization(const TraceSnapshot& snaps
   // skip timeout in window k must be lower-bounded by T0 * alpha^(k-k*-1), where k* is determined
   // by the last observed finalization when window k becomes active.
   std::optional<td::uint32> last_finalized_window;
-  std::optional<td::uint32> earliest_expected_skip_window;
+  std::optional<td::uint32> expected_stalled_window;
   {
     std::scoped_lock lock(test_expectations_mutex);
     last_finalized_window = test_expectations.skip_timeout_last_finalized_window;
-    earliest_expected_skip_window = test_expectations.skip_timeout_stalled_window;
+    expected_stalled_window = test_expectations.skip_timeout_stalled_window;
   }
-  if (!last_finalized_window.has_value() || !earliest_expected_skip_window.has_value()) {
+  if (!last_finalized_window.has_value() || !expected_stalled_window.has_value()) {
     return td::Status::Error("Rule 6 scenario did not register the expected windows");
   }
 
-  std::optional<td::uint32> actual_skip_window;
-  double first_skip_ts = 0.0;
+  auto windows_to_string = [](const std::set<td::uint32>& windows) {
+    td::StringBuilder sb;
+    sb << "[";
+    bool first = true;
+    for (td::uint32 window : windows) {
+      if (!first) {
+        sb << ",";
+      }
+      first = false;
+      sb << window;
+    }
+    sb << "]";
+    return sb.as_cslice().str();
+  };
+
+  td::uint32 clear_without_skip_window = *last_finalized_window + 1;
+  std::set<td::uint32> later_finalization_windows;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx != 0 || record.instance_idx != 0) {
+      continue;
+    }
+    td::uint32 window = record.id.slot / SLOTS_PER_LEADER_WINDOW;
+    if (window > *last_finalized_window) {
+      later_finalization_windows.insert(window);
+    }
+  }
+  if (!later_finalization_windows.empty()) {
+    return td::Status::Error(PSTRING() << "Rule 6 scenario failed to freeze validator #0.0 finalization after window "
+                                       << *last_finalized_window << "; observed later finalization windows="
+                                       << windows_to_string(later_finalization_windows));
+  }
+
+  std::set<td::uint32> observed_leader_windows;
+  bool saw_stalled_window = false;
+  for (const auto& record : snapshot.leader_windows_observed) {
+    if (record.node_idx != 0 || record.instance_idx != 0) {
+      continue;
+    }
+    td::uint32 window = record.start_slot / SLOTS_PER_LEADER_WINDOW;
+    observed_leader_windows.insert(window);
+    if (window == *expected_stalled_window) {
+      saw_stalled_window = true;
+    }
+  }
+  if (!saw_stalled_window) {
+    return td::Status::Error(PSTRING() << "Rule 6 scenario never reached stalled window "
+                                       << *expected_stalled_window << " on validator #0.0; observed leader windows="
+                                       << windows_to_string(observed_leader_windows));
+  }
+
+  std::set<td::uint32> skip_windows;
+  std::optional<double> first_skip_ts;
   for (const auto& record : snapshot.protocol_votes) {
     if (record.src_node_idx != 0 || record.src_instance_idx != 0) {
       continue;
@@ -1322,45 +1372,36 @@ td::Status verify_skip_timeout_uses_last_finalization(const TraceSnapshot& snaps
       continue;
     }
     td::uint32 window = skip->slot / SLOTS_PER_LEADER_WINDOW;
-    if (window < *earliest_expected_skip_window) {
-      continue;
-    }
-    if (!actual_skip_window.has_value() || window < *actual_skip_window ||
-        (window == *actual_skip_window && record.ts < first_skip_ts)) {
-      actual_skip_window = window;
+    skip_windows.insert(window);
+    if (window == *expected_stalled_window &&
+        (!first_skip_ts.has_value() || record.ts < *first_skip_ts)) {
       first_skip_ts = record.ts;
     }
   }
-  if (!actual_skip_window.has_value()) {
-    std::set<td::uint32> skip_windows;
-    for (const auto& record : snapshot.protocol_votes) {
-      if (record.src_node_idx != 0 || record.src_instance_idx != 0) {
-        continue;
-      }
-      auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote);
-      if (skip == nullptr) {
-        continue;
-      }
-      skip_windows.insert(skip->slot / SLOTS_PER_LEADER_WINDOW);
+
+  if (skip_windows.contains(clear_without_skip_window)) {
+    return td::Status::Error(PSTRING() << "Rule 6 scenario unexpectedly produced SkipVote in clear window "
+                                       << clear_without_skip_window << " before stalled window "
+                                       << *expected_stalled_window);
+  }
+  for (td::uint32 window = *last_finalized_window + 1; window < *expected_stalled_window; ++window) {
+    if (skip_windows.contains(window)) {
+      return td::Status::Error(PSTRING() << "scenario unexpectedly produced SkipVote in intermediate window "
+                                         << window << " before the intended stalled window "
+                                         << *expected_stalled_window);
     }
-    td::StringBuilder sb;
-    sb << "[";
-    bool first = true;
-    for (td::uint32 window : skip_windows) {
-      if (!first) {
-        sb << ",";
-      }
-      first = false;
-      sb << window;
-    }
-    sb << "]";
-    return td::Status::Error(PSTRING() << "scenario did not produce any SkipVote in window "
-                                       << *earliest_expected_skip_window << " or later; observed skip windows="
-                                       << sb.as_cslice());
+  }
+
+  if (!first_skip_ts.has_value()) {
+    return td::Status::Error(PSTRING() << "validator #0.0 emitted no SkipVote in stalled window "
+                                       << *expected_stalled_window
+                                       << " even though finalization stayed frozen after window "
+                                       << *last_finalized_window << "; observed skip windows="
+                                       << windows_to_string(skip_windows));
   }
 
   std::optional<double> stalled_window_start_ts;
-  td::uint32 stalled_window_start_slot = *actual_skip_window * SLOTS_PER_LEADER_WINDOW;
+  td::uint32 stalled_window_start_slot = *expected_stalled_window * SLOTS_PER_LEADER_WINDOW;
   for (const auto& record : snapshot.leader_windows_observed) {
     if (record.node_idx == 0 && record.instance_idx == 0 && record.start_slot == stalled_window_start_slot) {
       stalled_window_start_ts = record.ts;
@@ -1368,16 +1409,16 @@ td::Status verify_skip_timeout_uses_last_finalization(const TraceSnapshot& snaps
     }
   }
   if (!stalled_window_start_ts.has_value()) {
-    return td::Status::Error(PSTRING() << "scenario did not observe skip window " << *actual_skip_window
+    return td::Status::Error(PSTRING() << "scenario did not observe stalled window " << *expected_stalled_window
                                        << " on validator #0.0");
   }
 
-  double observed_delay_s = first_skip_ts - *stalled_window_start_ts;
+  double observed_delay_s = *first_skip_ts - *stalled_window_start_ts;
   double spec_lower_bound_s =
       FIRST_BLOCK_TIMEOUT_S *
-      std::pow(FIRST_BLOCK_TIMEOUT_MULTIPLIER, *actual_skip_window - *last_finalized_window - 1);
+      std::pow(FIRST_BLOCK_TIMEOUT_MULTIPLIER, *expected_stalled_window - *last_finalized_window - 1);
   if (observed_delay_s + 0.15 < spec_lower_bound_s) {
-    return td::Status::Error(PSTRING() << "validator #0.0 skipped window " << *actual_skip_window << " after "
+    return td::Status::Error(PSTRING() << "validator #0.0 skipped window " << *expected_stalled_window << " after "
                                        << observed_delay_s << "s, below Rule 6 lower bound " << spec_lower_bound_s
                                        << "s from last finalized window " << *last_finalized_window);
   }
@@ -4853,6 +4894,19 @@ class TestConsensus : public td::actor::Actor {
     co_return td::Unit{};
   }
 
+  td::actor::Task<> set_drop_final_votes_for_test(size_t dst_node_idx, td::uint32 from_slot) {
+    std::scoped_lock lock(test_message_filters_mutex);
+    test_message_filters.protocol_drop_rules.push_back(TestMessageFilters::ProtocolDropRule{
+        .src_node_idx = std::nullopt,
+        .src_instance_idx = std::nullopt,
+        .dst_node_indices = {dst_node_idx},
+        .start_slot = from_slot,
+        .end_slot = std::numeric_limits<td::uint32>::max(),
+        .kind = TestMessageFilters::ProtocolKind::FinalVote,
+    });
+    co_return td::Unit{};
+  }
+
   td::actor::Task<> set_drop_notar_certs_for_test(size_t dst_node_idx, td::uint32 start_slot, td::uint32 end_slot) {
     std::scoped_lock lock(test_message_filters_mutex);
     test_message_filters.protocol_drop_rules.push_back(TestMessageFilters::ProtocolDropRule{
@@ -6770,8 +6824,9 @@ class TestConsensus : public td::actor::Actor {
     if (TEST_CASE == TestCase::SkipTimeoutUsesLastFinalization) {
       // Drives simplex_docs.md Rule 6 and the §4.2 known implementation deviation:
       // freeze validator #0.0's last observed finalization after one finalized window, let the
-      // next window clear normally, then withhold all candidates in the following window and check
-      // whether Skip is delayed according to the last reached finalization rather than reset.
+      // next window clear normally, then force the first later stalled window whose leader is not
+      // validator #0.0 and keep later windows stalled long enough that future notarizations cannot
+      // postpone the first local Skip.
       co_await wait_for_finalization_on(0, 0, 5.0);
       auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
       std::optional<td::uint32> finalized_slot;
@@ -6787,15 +6842,24 @@ class TestConsensus : public td::actor::Actor {
       td::uint32 last_finalized_window = *finalized_slot / SLOTS_PER_LEADER_WINDOW;
       td::uint32 clear_without_skip_start_slot = (last_finalized_window + 1) * SLOTS_PER_LEADER_WINDOW;
       td::uint32 stalled_window = last_finalized_window + 2;
+      if (N_NODES > 1) {
+        while (stalled_window % N_NODES == 0) {
+          ++stalled_window;
+        }
+      }
       td::uint32 stalled_window_start_slot = stalled_window * SLOTS_PER_LEADER_WINDOW;
+      td::uint32 stalled_end_slot =
+          stalled_window_start_slot +
+          static_cast<td::uint32>(std::ceil(DURATION * 1000.0 / static_cast<double>(TARGET_RATE_MS))) +
+          SLOTS_PER_LEADER_WINDOW;
       co_await set_skip_timeout_expectations_for_test(last_finalized_window, stalled_window);
+      co_await set_drop_final_votes_for_test(0, clear_without_skip_start_slot);
       co_await set_drop_final_certs_for_test(0, clear_without_skip_start_slot);
+      co_await set_drop_candidates_for_test(0, stalled_window_start_slot, stalled_end_slot);
+      co_await set_drop_notar_certs_for_test(0, stalled_window_start_slot, stalled_end_slot);
       co_await clear_traces();
       co_await wait_for_leader_window_observed_on(0, 0, clear_without_skip_start_slot, 5.0);
-      co_await set_drop_candidates_for_test(0, stalled_window_start_slot,
-                                            stalled_window_start_slot + SLOTS_PER_LEADER_WINDOW);
-      co_await set_drop_notar_certs_for_test(0, stalled_window_start_slot,
-                                             stalled_window_start_slot + SLOTS_PER_LEADER_WINDOW);
+      co_await wait_for_leader_window_observed_on(0, 0, stalled_window_start_slot, 5.0);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }

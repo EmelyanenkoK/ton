@@ -1,13 +1,6 @@
 # Bugs Discovered During Simplex Testing
 
-This file tracks issues discovered during Simplex testing on the current branch. After rereading
-the implementation and rerunning the previously failing cases, it now separates them into three
-buckets:
-
-- `Confirmed code issue`: the implementation is missing a check or keeps incorrect state.
-- `Mixed`: there is a real code issue, but the current test also needs tightening.
-- `Resolved test / harness update`: the earlier red case was caused by test or harness assumptions
-  rather than a demonstrated live product bug, and the updated test is now green.
+This file tracks still-open issues discovered during Simplex testing on the current branch.
 
 Consolidated duplicates:
 
@@ -241,11 +234,9 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
        }
 ```
 
-## Mixed: real code issue, but the current test also needs tightening
+## `ConsensusImpl` resets skip timeout from `previous_window_had_skip_` instead of the last observed finalization
 
-## Rule 6 skip-timeout integration scenario is still red in `test-consensus`
-
-- Status: `Mixed`.
+- Status: `Confirmed code issue`.
 - Documentation / expectation: Rule 6 says the skip timeout in window `k` must be lower-bounded by
   the last observed finalization, not by whether the immediately previous window happened to have a
   skip. `simplex_docs.md` already documents the current implementation as wrong here.
@@ -254,90 +245,26 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
 timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-timeout-uses-last-finalization --n-nodes 4 --target-rate-ms 100 --duration 6 --verbosity 0
 ```
 - Current failure:
-  `scenario did not produce any SkipVote in window 2 or later; observed skip windows=[]`
+  `validator #0.0 emitted no SkipVote in stalled window 2 even though finalization stayed frozen after window 0; observed skip windows=[4,8]`
 - Why the product bug is real:
   `validator/consensus/simplex/consensus.cpp` still derives timeout growth from
   `previous_window_had_skip_`. On each `LeaderWindowObserved`, a clean window resets
   `first_block_timeout_s_` to the default, which is exactly the deviation called out in
   `simplex_docs.md`.
-- Why the current end-to-end test also needs work:
-  the scenario currently aborts before it reaches the intended lower-bound timing assertion. So it
-  still proves "Rule 6 behavior is wrong enough that the scenario breaks", but it no longer cleanly
-  isolates the exact late-window timing violation by itself.
+- Why this is now code-only rather than mixed:
+  the integration harness now drops both `FinalizeVote` and final-cert traffic to validator `#0.0`
+  from the "clear without skip" window onward, proves that no later finalization was observed,
+  proves that validator `#0.0` reached the intended stalled window, and proves that the
+  intermediate clear window still had no local skip. With those setup conditions satisfied, the
+  current code still fails to emit a `SkipVote` in the first stalled window and only does so much
+  later (`[4,8]` in the current run). That is a product failure, not a harness ambiguity.
 - Proposed production change:
   track the last window in which a finalization was observed and derive `first_block_timeout_s_`
   from that value instead of from `previous_window_had_skip_`.
-- Proposed test change:
-  keep the scenario red until the product fix lands, but tighten it so it first proves that a later
-  skip actually occurred and only then compares the observed delay with the Rule 6 lower bound.
-
-## Resolved test / harness updates
-
-## `test-pool`: standstill rebroadcast coverage now passes
-
-- Status: `Resolved test / synchronization issue`.
-- Test:
-  `StandstillBroadcastContainsExpectedVotesAndCertificates`
-- Previous failure mode:
-  the standstill snapshot sometimes omitted the locally generated vote because the test published
-  `BroadcastVote`, waited once, and then assumed the detached signing path had already stored that
-  vote in pool state before the standstill deadline.
-- Why the old entry is no longer an active product issue:
-  `PoolImpl::alarm()` already serializes local votes that actually reached pool state. The flaky part
-  was the test barrier, not standstill serialization itself.
-- Fix now in tree:
-  the test injects a fully signed local vote deterministically via `IncomingProtocolMessage` and
-  checks the outgoing standstill payloads with a decoded-vote helper instead of racing the async
-  `BroadcastVote` path.
-- Current verification:
-```sh
-./build/test/validator/consensus/test-pool --filter StandstillBroadcastContainsExpectedVotesAndCertificates --verbosity 0
-./build/test/validator/consensus/test-pool --verbosity 0
-```
-  both pass.
-
-## `test-block-validator`: empty-candidate parent-link case was a contract mismatch, not a live bug
-
-- Status: `Resolved test issue / actor-boundary correction`.
-- Previous red test:
-  `BlockValidator_RejectsEmptyCandidateWithWrongParentLink`
-- Why the old entry is no longer active:
-  the live pipeline resolves `candidate->parent_id` upstream and passes the resulting state into
-  `ValidationRequest`. `BlockValidator` validates the candidate against that supplied state; it does
-  not independently reinterpret the parent link at this boundary. The removed test constructed an
-  inconsistent `(state, candidate)` pair that upstream actors do not produce.
-- Fix now in tree:
-  the old negative test was replaced with
-  `AcceptsEmptyCandidateWhenResolvedStateMatchesReference`, which exercises the actual
-  `ValidationRequest` contract by proving acceptance when the empty candidate's reference matches
-  the already-resolved state.
-- Current verification:
-```sh
-./build/test/validator/consensus/test-block-validator --filter AcceptsEmptyCandidateWhenResolvedStateMatchesReference --verbosity 0
-```
-  this passes. The remaining red `test-block-validator` case is still
-  `BlockValidator_RejectsMasterchainCandidateWhoseParentIsOnlyNotarized`, which stays above in the
-  confirmed-code-issue section.
-
-## `test-consensus-adversarial`: restart / empty-mode scenario now reaches the intended state
-
-- Status: `Resolved harness issue`.
-- Test:
-  `restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates`
-- Previous failure mode:
-  the harness kept publishing `BlockFinalizedInMasterchain` from generic shard finalization and
-  seeded restarts from `last_accepted_block_`, so the synthetic masterchain-finalized watermark
-  never actually lagged behind shard progress by eight blocks. The verifier also mapped finalized
-  slots to accepted shard seqnos off by one.
-- Why the old entry is no longer active:
-  the scenario now creates the intended precondition instead of accidentally keeping masterchain and
-  shard finality coupled inside the test harness.
-- Fix now in tree:
-  the harness freezes the synthetic MC-finalization watermark at the chosen stop slot, restarts from
-  that synthetic watermark instead of `last_accepted_block_`, and checks reaccepted shard seqnos
-  with the corrected slot-to-seqno mapping.
-- Current verification:
-```sh
-timeout 100s ./build/test/validator/consensus/test-consensus-adversarial --test-case restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates --verbosity 0
-```
-  this passes.
+- Test tightening now in tree:
+  `test-consensus.cpp` and `test-consensus-adversarial.cpp` both choose the first later stalled
+  window with a non-local leader, freeze validator `#0.0`'s observed finalization by dropping
+  final votes and final certificates from the preceding clear window onward, keep later windows
+  stalled long enough that the product must either skip there or visibly fail to do so, and verify
+  the setup invariants before judging the skip behavior. If the implementation begins skipping in
+  the stalled window, the same verifier still checks the Rule 6 lower-bound timing next.
