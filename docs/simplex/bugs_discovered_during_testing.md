@@ -1,327 +1,348 @@
 # Bugs Discovered During Simplex Testing
 
-This file tracks issues that still reproduce on the current branch.
-Older entries were removed when they either stopped reproducing or were no longer considered bugs
-under the current policy. In particular:
+This file tracks red Simplex tests on the current branch, but after rereading the implementation
+and rerunning the failing cases it now separates them into four buckets:
 
-- `simplex::Db` now handles `StopRequested`, so the old shutdown-hang note was stale.
-- DB write-failure retry tests are no longer tracked as bugs because current production policy is to
-  crash on write failure instead of retrying.
-- `test-consensus` `candidate-resolution-recovery` now passes, so the old restart-teardown entry was
-  removed.
-- `test-consensus` `standstill-rebroadcast-contents` now passes, so the old standstill-teardown
-  entry was removed.
+- `Confirmed code issue`: the implementation is missing a check or keeps incorrect state.
+- `Mixed`: there is a real code issue, but the current test also needs tightening.
+- `Test / harness issue`: the red test does not currently demonstrate a live product bug.
+- `Hardening opportunity`: the behavior is only wrong if a wider actor contract is allowed.
 
-## End-to-end consensus still notarizes a wrong-leader candidate after `CandidateReceived`
+Consolidated duplicates:
 
-- Documentation / expectation: tracker `Kernel-23` / `Kernel-28` expects an otherwise well-formed
-  candidate with the wrong leader for its slot to stop before local `Notar`.
-- Observed behavior:
-  `wrong-leader-candidate-never-notarizes` is red in `test-consensus.cpp`.
-  A synthetic full candidate injected into validator `#0.0` with the wrong slot leader still
-  causes that validator to broadcast `Notar`.
+- The two wrong-leader entries were the same issue and are merged below.
+- The two validation-reject / stuck `pending_block` entries were the same issue and are merged below.
+- The two oversized skip-slot parser entries were the same issue and are merged below.
+
+## Confirmed code issues
+
+## `ConsensusImpl` still notarizes a wrong-leader candidate after `CandidateReceived`
+
+- Status: `Confirmed code issue`.
+- Coverage note: this merges the earlier "End-to-end consensus still notarizes a wrong-leader candidate after `CandidateReceived`" and "`ConsensusImpl` still notarizes a candidate that names the wrong slot leader" sections.
+- Documentation / expectation: tracker `Kernel-23` / `Kernel-28` expects an otherwise well-formed candidate with the wrong leader for its slot to stop before local `Notar`.
 - Reproduce:
 ```sh
 timeout 45s ./build/test/validator/consensus/test-consensus --test-case wrong-leader-candidate-never-notarizes --verbosity 0
 ```
-- Narrowing evidence:
-  the end-to-end scenario isolates a future leader window on validator `#0.0`, injects a full
-  candidate whose `leader` is `(expected_leader + 1) mod N`, and then checks the local vote trace.
-  The run still aborts with:
+- Current failure:
   `validator #0.0 sent Notar for wrong-leader candidate ...`
-- Probable cause:
-  `validator/consensus/simplex/consensus.cpp` `handle(CandidateReceived)` does not validate that
-  `candidate->leader` matches the expected collator for the slot before starting `try_notarize()`.
-  The normal parser path already has wrong-leader checks, but the consensus actor itself currently
-  trusts the upstream source too much.
-- What should be fixed:
-  decide whether wrong-leader rejection is parser-only or must also be enforced at the
-  `CandidateReceived` / `try_notarize` boundary. If consensus is meant to be robust against bad
-  internal injections or future bridge regressions, add an explicit leader-schedule check before
-  `WaitForParent` / validation can produce a local `Notar`.
+- Why this is not just a bad test:
+  the network parser already rejects wrong-leader broadcasts in `validator/consensus/types.cpp`, but
+  `CandidateReceived` explicitly promises only "a valid signature from `candidate->leader`". That
+  means the consensus actor itself still has to decide whether to trust the slot leader field at
+  this boundary.
+- How the failure arises:
+  `validator/consensus/simplex/consensus.cpp` `handle(CandidateReceived)` checks only "too new",
+  "future parent", and "slot already has `pending_block`". It does not compare
+  `candidate->leader` with `collator_schedule->expected_collator_for(slot_idx)`. After storing the
+  candidate in `pending_block`, it only emits a trace if the leader is not us and still starts
+  `try_notarize()`. The injected wrong-leader candidate therefore goes through `WaitForParent`,
+  `ResolveState`, validation, and finally local `BroadcastVote(NotarizeVote{...})`.
+- Proposed production change:
+  reject the candidate before setting `pending_block` if its declared leader does not match the slot
+  schedule. If the intent is parser-only enforcement, then the `CandidateReceived` contract should
+  be tightened and this integration test should move to the parser boundary instead of staying red
+  here.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/simplex/consensus.cpp
++++ b/validator/consensus/simplex/consensus.cpp
+@@
+   const auto& candidate = event->candidate;
++  auto expected_leader = owning_bus()->collator_schedule->expected_collator_for(slot_idx);
++  if (candidate->leader != expected_leader) {
++    // FIXME: report misbehavior or trace the rejected candidate
++    return;
++  }
+ 
+   if (candidate->parent_id.has_value() && candidate->parent_id->slot >= candidate->id.slot) {
+     // FIXME: report misbehavior
+     return;
+   }
+```
 
-## End-to-end consensus leaves a rejected slot wedged and ignores a replacement candidate
+## `ConsensusImpl` leaves a rejected candidate stuck as the slot's pending block
 
-- Documentation / expectation: tracker `Kernel-23` expects that if the first candidate for a slot
-  is rejected by validation, it leaves no residual votes and a later replacement candidate for the
-  same slot can still proceed to `Notar`.
-- Observed behavior:
-  `validation-reject-does-not-leave-residual-votes` is red in `test-consensus.cpp`.
-  The rejected candidate leaves no votes, but the later replacement candidate for the same slot
-  never notarizes.
+- Status: `Confirmed code issue`.
+- Coverage note: this merges the earlier "End-to-end consensus leaves a rejected slot wedged and
+  ignores a replacement candidate" and "`ConsensusImpl` leaves a rejected candidate stuck as the
+  slot's pending block" sections.
+- Documentation / expectation: tracker `Kernel-23` expects a validation rejection to leave no
+  residual votes or slot state, so a later replacement candidate for the same slot can still
+  progress normally through notarization.
 - Reproduce:
 ```sh
 timeout 45s ./build/test/validator/consensus/test-consensus --test-case validation-reject-does-not-leave-residual-votes --verbosity 0
 ```
-- Narrowing evidence:
-  the scenario injects one candidate for a future isolated slot, forces a synthetic validation
-  rejection for that exact `BlockIdExt`, then injects a second candidate for the same slot. The
-  run still aborts with:
+- Current failure:
   `replacement candidate ... never notarized after the first candidate was rejected`
-- Probable cause:
+- How the failure arises:
   `validator/consensus/simplex/consensus.cpp` stores the first candidate in
-  `slot->state->pending_block` before validation, but on `CandidateReject` it returns without
-  clearing that pending block. A later `CandidateReceived` for the same slot but a different
-  candidate id then hits the `pending_block` guard and is ignored.
-- What should be fixed:
-  clear or replace the slot-local pending candidate state when validation rejects a candidate, so a
-  later replacement candidate for the same slot can restart the pipeline. Keep the "no vote on
-  rejected candidate" behavior, but do not permanently wedge the slot.
-
-## `simplex::Pool` standstill rebroadcast omits our later local votes
-
-- Documentation / expectation: Rule 8 says standstill rebroadcast must contain the highest final
-  certificate, later certificates, and our own later votes that do not yet have certificates.
-- Observed behavior: `Pool_StandstillBroadcastContainsExpectedVotesAndCertificates` is red.
-  The pool rebroadcasts the expected final certificate and later skip certificate, but omits a
-  later local `NotarizeVote` that was broadcast before standstill fired.
-- Reproduce:
-```sh
-./build/test/validator/consensus/test-pool --filter StandstillBroadcastContainsExpectedVotesAndCertificates --verbosity 1
+  `slot->state->pending_block` before validation begins. `try_notarize()` then awaits
+  `WaitForParent`, `ResolveState`, and `ValidationRequest`. If validation returns
+  `CandidateReject`, the coroutine logs the rejection and returns, but it never clears
+  `pending_block`. A later candidate for the same slot but a different id immediately hits the
+  early `pending_block.has_value()` guard in `handle(CandidateReceived)` and is ignored.
+- Why the current green unit tests were not enough:
+  `test-simplex-consensus.cpp` already proves "reject does not cast a vote or report
+  misbehavior", but there was no unit test for rolling back slot-local pending state after a
+  rejection. The end-to-end test is catching exactly that missing rollback.
+- Proposed production change:
+  keep the current deduplication behavior for an in-flight candidate, but clear `pending_block` on
+  rejection so a later replacement can restart the pipeline. Delaying the initial assignment until
+  after validation is also possible, but then some other "in flight" marker is still needed to
+  avoid duplicate concurrent validation of the same candidate.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/simplex/consensus.cpp
++++ b/validator/consensus/simplex/consensus.cpp
+@@
+   if (validation_result.has<CandidateReject>()) {
+     LOG(WARNING) << "Candidate " << candidate->id
+                  << " is rejected: " << validation_result.get<CandidateReject>().reason;
++    if (slot.state->pending_block == candidate) {
++      slot.state->pending_block.reset();
++    }
+     // FIXME: Report misbehavior
+     co_return {};
+   }
 ```
-- Narrowing evidence:
-  the test starts from bootstrap final/skip certificates, publishes one local later
-  `BroadcastVote(NotarizeVote{slot=2})`, advances exactly to the configured standstill timeout,
-  and then checks outgoing payloads. The outgoing trace contains the expected certificate payloads
-  but not the signed local vote payload for slot 2.
-- Probable cause:
-  `validator/consensus/simplex/pool.cpp` `alarm()` intends to append local later votes through
-  `state->votes[bus.local_id.idx.value()].serialize_to(messages, state->certs)`, but the local
-  vote state for some later slots is apparently not surviving to the standstill snapshot or is not
-  being serialized as expected once certificates are already present for earlier slots.
-- What should be fixed:
-  inspect the per-slot local `Tsentrizbirkom` state at standstill and confirm that later local
-  votes remain present after `BroadcastVote` handling. Then trace why `serialize_to(...)` skips the
-  local vote for slot 2 even though no certificate exists for that vote.
-
-## `ConsensusImpl` still notarizes a candidate that names the wrong slot leader
-
-- Documentation / expectation: tracker `Kernel-23` / `Kernel-28` expects an otherwise well-formed
-  candidate with the wrong `leader` for the slot to be rejected by the consensus pipeline and to
-  never produce `Notar`.
-- Observed behavior: `wrong-leader-candidate-never-notarizes` is red in `test-consensus.cpp`.
-  Validator `#0.0` still sends `Notar` for a synthetic full candidate whose `leader` field names a
-  different validator than the one assigned to that slot.
-- Reproduce:
-```sh
-timeout 40s ./build/test/validator/consensus/test-consensus --test-case wrong-leader-candidate-never-notarizes --verbosity 0
-```
-- Narrowing evidence:
-  `validator/consensus/simplex/consensus.cpp` stores the candidate in `pending_block`, then only
-  emits a trace event when `candidate->leader != owning_bus()->local_id.idx` before continuing into
-  `try_notarize(...)`. There is no local leader-ownership rejection on the `CandidateReceived`
-  path before `WaitForParent`, validation, and `BroadcastVote(NotarizeVote{...})`.
-- Probable cause:
-  leader mismatch is currently treated as an informational trace condition rather than a consensus
-  validity gate, so a wrong-leader candidate can still pass the rest of the notarization pipeline.
-- What should be fixed:
-  reject or report misbehavior for candidates whose `leader` does not match the expected slot
-  leader before they reach `try_notarize(...)`. The wrong-leader integration regression should stay
-  red until that guard exists in the live pipeline.
-
-## `ConsensusImpl` leaves a rejected candidate stuck as the slot's pending block
-
-- Documentation / expectation: tracker `Kernel-23` expects a validation rejection to leave no
-  residual votes or slot state, so a later replacement candidate for the same slot can still
-  progress normally through notarization.
-- Observed behavior: `validation-reject-does-not-leave-residual-votes` is red in
-  `test-consensus.cpp`. The first candidate is synthetically rejected by validation as intended,
-  but the later replacement candidate for the same slot never produces `Notar`.
-- Reproduce:
-```sh
-timeout 40s ./build/test/validator/consensus/test-consensus --test-case validation-reject-does-not-leave-residual-votes --verbosity 0
-```
-- Narrowing evidence:
-  `validator/consensus/simplex/consensus.cpp` sets `slot->state->pending_block = candidate` before
-  validation starts. When validation returns `CandidateReject`, the actor logs and returns, but it
-  does not clear `pending_block`. A later candidate for the same slot then hits the early
-  `pending_block.has_value()` guard in `CandidateReceived` and is ignored.
-- Probable cause:
-  the slot-level pending-candidate state is mutated before validation is known to have succeeded,
-  and the reject path does not roll that state back.
-- What should be fixed:
-  clear `pending_block` on validation rejection, or delay setting it until the candidate has passed
-  the validation gate. The integration regression should remain red until the replacement
-  candidate can notarize after an earlier reject.
-
-## Shardchain integration never reaches empty-candidate mode after eight non-MC-finalized blocks
-
-- Documentation / expectation: tracker `Kernel-28` expects shardchain leaders to switch into
-  empty-candidate mode after eight accepted shard blocks that are still not finalized in the
-  masterchain, and a restarted validator should then reaccept the pending block chain.
-- Observed behavior:
-  `restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates` is red in
-  `test-consensus-adversarial.cpp`.
-  The scenario waits until a live validator has accepted eight later shard blocks while validator
-  `#0.0` is down, restarts `#0.0`, and then expects empty-candidate finalization plus catch-up.
-  Instead the run still aborts with:
-  `scenario never reached empty-candidate finalization after validator #0.0 fell behind`.
-- Reproduce:
-```sh
-timeout 80s ./build/test/validator/consensus/test-consensus-adversarial --test-case restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates --verbosity 0
-```
-- Probable cause:
-  either shardchain block production is not switching into the documented empty-candidate mode once
-  the accepted-block lag reaches eight, or the later empty candidates are not making it through the
-  end-to-end notarization/finalization path that the restarted validator depends on for reaccept.
-- What should be fixed:
-  inspect the end-to-end shardchain lag path around `validator/consensus/block-producer.cpp` and
-  the subsequent state-resolution / acceptance flow. Once honest peers have accepted eight
-  non-MC-finalized shard blocks, later leader windows should enter empty-candidate mode and a
-  restarted validator should be able to reaccept the pending chain from that point.
-
-## `BlockValidator` accepts empty candidates with an unrelated parent link
-
-- Documentation / expectation: tracker `Kernel-23` / `Kernel-30` still expects malformed empty
-  candidates to be rejected rather than accepted as valid chain extensions.
-- Observed behavior: `BlockValidator_RejectsEmptyCandidateWithWrongParentLink` is red. An empty
-  candidate that references the local `BlockIdExt` but carries an unrelated `parent_id` is still
-  accepted.
-- Reproduce:
-```sh
-./build/test/validator/consensus/test-block-validator --verbosity 0
-```
-- Narrowing evidence:
-  `validator/consensus/block-validator.cpp` handles empty candidates by comparing only
-  `candidate->block` to `event->state->as_normal()` and never inspects `candidate->parent_id`.
-- Probable cause:
-  empty-candidate structural validation is incomplete at the validator boundary. The actor accepts
-  any empty candidate whose referenced block matches the local state, even if the candidate chain
-  link is inconsistent.
-- What should be fixed:
-  decide which layer owns empty-candidate chain-link validation, then reject inconsistent
-  `parent_id` values before acceptance. If the ownership remains in `BlockValidator`, extend the
-  empty-candidate branch to validate the parent link against the expected chain context instead of
-  checking only `BlockIdExt`.
 
 ## `BlockValidator` wakes masterchain child validation on non-final `FinalizeBlock`
 
+- Status: `Confirmed code issue`, but specifically at the actor boundary.
 - Documentation / expectation: tracker `Kernel-20` / `Kernel-23` expects a masterchain child to
   wait for true parent finalization, not merely notarization / approve-level progress.
-- Observed behavior: `BlockValidator_RejectsMasterchainCandidateWhoseParentIsOnlyNotarized` is
-  red. Publishing `FinalizeBlock` with a non-final signature set is enough to wake the waiter and
-  let the child validate.
 - Reproduce:
 ```sh
 ./build/test/validator/consensus/test-block-validator --verbosity 0
 ```
-- Narrowing evidence:
-  `validator/consensus/block-validator.cpp` handles every `FinalizeBlock` event with
-  `on_new_accepted_block(event->candidate->block_id())` and never checks
-  `event->signatures->is_final()`.
-- Probable cause:
-  the validator assumes every `FinalizeBlock` bus event already represents a locally accepted final
-  block. That makes it vulnerable to premature wake-up if upstream ever emits the event before the
-  signature set is actually final.
-- What should be fixed:
-  either tighten the event contract so non-final `FinalizeBlock` can never reach `BlockValidator`,
-  or add a local `is_final()` guard before advancing `last_accepted_block_` for masterchain waiters.
+- Current red test:
+  `BlockValidator_RejectsMasterchainCandidateWhoseParentIsOnlyNotarized`
+- How the failure arises:
+  `validator/consensus/block-validator.cpp` handles every `FinalizeBlock` event by calling
+  `on_new_accepted_block(event->candidate->block_id())` without checking
+  `event->signatures->is_final()`. That lets a non-final `FinalizeBlock` advance
+  `last_accepted_block_`, which can wake a waiting masterchain child early.
+- Why this is still worth treating as code, not just test shape:
+  `FinalizeBlock` does not carry a contract saying that its signatures must already be final, and
+  another production actor, `BlockProducer`, already treats that distinction as important and checks
+  `event->signatures->is_final()` before advancing its own masterchain watermark. The missing guard
+  in `BlockValidator` is therefore a real boundary inconsistency even if the current Simplex
+  publisher usually sends final signatures on masterchain.
+- Proposed production change:
+  guard `handle(FinalizeBlock)` with `is_final()`. If the event is meant to be final-only, also
+  document that contract explicitly in `bus.h`.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/block-validator.cpp
++++ b/validator/consensus/block-validator.cpp
+@@
+   template <>
+   void handle(BusHandle, std::shared_ptr<const FinalizeBlock> event) {
+-    on_new_accepted_block(event->candidate->block_id());
++    if (event->signatures->is_final()) {
++      on_new_accepted_block(event->candidate->block_id());
++    }
+   }
+```
 
 ## `simplex::Certificate::from_tl` accepts malformed skip-slot values after signed `int32 -> uint32` wraparound
 
-- Documentation / expectation: the tracker parser row (`Kernel-27`, `Kernel-31` `4c5eda7cb`) says
-  malformed or oversized window-slot values must be rejected instead of being silently reinterpreted.
-- Observed behavior: `SimplexParser_CertificateFromTlRejectsOversizedWindowSlot` is red. A
-  certificate carrying `skipVote(-1)` is accepted and ends up as slot `4294967295` after the
-  signed-to-unsigned cast in the vote parser.
+- Status: `Confirmed code issue`.
+- Coverage note: this merges the earlier wraparound section and the later "Simplex vote /
+  certificate parsing still accepts an oversized skip slot" section.
+- Documentation / expectation: tracker parser rows `Kernel-27` / `Kernel-31` require malformed or
+  oversized window-slot values to be rejected rather than silently reinterpreted.
 - Reproduce:
 ```sh
 ./build/test/validator/consensus/test-simplex-parser --verbosity 0
 ```
-- Narrowing evidence:
-  `validator/consensus/simplex/votes.cpp` parses `skipVote.slot_` with
-  `static_cast<td::uint32>(vote.slot_)`, and the certificate parser then validates signatures and
-  quorum against that wrapped value instead of rejecting it as malformed input.
-- Probable cause:
-  the TL `int32` slot field is trusted too early. Negative values survive the TL parse and then
-  wrap into large `uint32` slot numbers before any range check runs.
-- What should be fixed:
-  validate `skipVote.slot_ >= 0` when converting from TL to `SkipVote` and return a parse error on
-  negative / out-of-domain slot values before signature or quorum handling continues.
-  Smallest intended production patch shape:
+- Current red test:
+  `SimplexParser_CertificateFromTlRejectsOversizedWindowSlot`
+- Current failure:
+  `skipVote(-1)` is accepted and becomes slot `4294967295`.
+- How the failure arises:
+  `validator/consensus/simplex/votes.cpp` converts TL `skipVote.slot_` with
+  `static_cast<td::uint32>(vote.slot_)` and performs no range check first. In
+  `validator/consensus/simplex/certificate.cpp`, the parser verifies signatures over the raw TL vote
+  and only then converts it into the internal `Vote`, so the negative `int32` survives long enough
+  to become a wrapped `uint32` instead of a parse error.
+- Proposed production change:
+  reject negative slot values before the cast. This should be a parser error, not a `CHECK`, so
+  the likely implementation shape is to make `SkipVote::from_tl` and `Vote::from_tl` return
+  `td::Result<...>` and propagate that through `Signed::from_tl` and `Certificate::from_tl`.
+- Smallest intended patch shape:
 ```diff
+--- a/validator/consensus/simplex/votes.h
++++ b/validator/consensus/simplex/votes.h
+@@
+-  static SkipVote from_tl(const tl::skipVote& vote);
++  static td::Result<SkipVote> from_tl(const tl::skipVote& vote);
+
 --- a/validator/consensus/simplex/votes.cpp
 +++ b/validator/consensus/simplex/votes.cpp
 @@
- SkipVote SkipVote::from_tl(const tl::skipVote& vote) {
-+  CHECK(vote.slot_ >= 0);
-   return {static_cast<td::uint32>(vote.slot_)};
+-SkipVote SkipVote::from_tl(const tl::skipVote& vote) {
+-  return {static_cast<td::uint32>(vote.slot_)};
++td::Result<SkipVote> SkipVote::from_tl(const tl::skipVote& vote) {
++  if (vote.slot_ < 0) {
++    return td::Status::Error("Negative skip slot");
++  }
++  return SkipVote{static_cast<td::uint32>(vote.slot_)};
  }
 ```
 
-## Rule 6 skip-timeout integration scenario is still red in `test-consensus`
-
-- Documentation / expectation: Rule 6 requires skip timeout in window `k` to be derived from the
-  last observed finalization, not from whether the immediately previous window had a skip.
-- Observed behavior: the `test-consensus` Rule 6 case still fails on this branch. At the moment it
-  aborts before the final lower-bound comparison and reports:
-  `scenario did not produce any SkipVote in window 2 or later; observed skip windows=[]`.
-- Reproduce:
-```sh
-timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-timeout-uses-last-finalization --n-nodes 4 --target-rate-ms 100 --duration 6 --verbosity 0
-```
-- Narrowing evidence:
-  production `ConsensusImpl` still derives the next timeout from `previous_window_had_skip_` in
-  `validator/consensus/simplex/consensus.cpp`, while `simplex_docs.md` explicitly calls that reset
-  behavior unsupported. The current integration scenario is therefore still red, even though on this
-  branch it now fails earlier with "no SkipVote" instead of reaching the older timing-mismatch
-  assertion.
-- Probable cause:
-  there are likely two issues layered together:
-  `ConsensusImpl` still implements the documented Rule 6 deviation, and the current
-  `test-consensus` scenario is not yet robust enough to drive the run all the way to the intended
-  later-window skip on every execution.
-- What should be fixed:
-  first, update `validator/consensus/simplex/consensus.cpp` so timeout growth is keyed off the last
-  observed finalization rather than `previous_window_had_skip_`. Then rerun and tighten the
-  `test-consensus` Rule 6 scenario until it reliably reaches the intended timing assertion instead
-  of aborting earlier with no later-window `SkipVote`.
-
 ## `BlockProducer` does not respect the remaining collation budget of the current slot
 
+- Status: `Confirmed code issue`.
 - Documentation / expectation: `tracker-test-plan.md` `Kernel-22` says the collator should receive
   the remaining time budget of the current slot, and a collation result that arrives after the slot
   budget expires should not still be published for that slot.
-- Observed behavior: both producer time-budget tests are red.
-  `BlockProducer_PassesRemainingCollationBudgetToManager` shows the producer still passes a fresh
-  full `target_rate_` soft timeout even when the leader window starts late.
-  `BlockProducer_StopsProducingWhenCollationBudgetExpires` shows the producer still publishes a
-  candidate after collation returns well after the slot deadline.
 - Reproduce:
 ```sh
 ./build/test/validator/consensus/test-block-producer --verbosity 0
 ```
-- Narrowing evidence:
-  `validator/consensus/block-producer.cpp` currently builds `CollateParams` with
-  `soft_timeout = td::Timestamp::in(target_rate_)`, independent of `event->start_time` and the
-  already elapsed portion of the slot. After `collate_block(...)` returns, the code checks only
-  whether the leader window changed, not whether the slot deadline has already passed.
-- Probable cause:
-  the producer treats collation as if every slot starts with a fresh full `target_rate_` budget and
-  lacks a post-collation deadline check before publishing `CandidateGenerated` /
-  `CandidateReceived`.
-- What should be fixed:
-  derive the manager `soft_timeout` from the remaining time until the current slot deadline, not
-  from an unconditional full `target_rate_`, and after collation/signing re-check that the result
-  is still within the slot budget before publishing it.
+- Current red tests:
+  `BlockProducer_PassesRemainingCollationBudgetToManager`
+  `BlockProducer_StopsProducingWhenCollationBudgetExpires`
+- How the failure arises:
+  `validator/consensus/block-producer.cpp` starts each slot with `target_time = event->start_time`,
+  but when it builds `CollateParams` it ignores how much of the slot has already elapsed and passes
+  `soft_timeout = td::Timestamp::in(target_rate_)`, effectively giving the collator a fresh full
+  budget even if the window started late. After collation returns, the code checks only whether the
+  leader window changed; it never re-checks whether the slot deadline itself has already passed.
+- Proposed production change:
+  derive the collator deadline from the actual end of the current slot and drop late collation
+  results before publishing `CandidateGenerated` / `CandidateReceived`.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/block-producer.cpp
++++ b/validator/consensus/block-producer.cpp
+@@
+-      td::Timestamp target_time = event->start_time;
++      td::Timestamp target_time = event->start_time;
+@@
+-        CollateParams params{
++        td::Timestamp slot_deadline = td::Timestamp::in(target_rate_, target_time);
++        CollateParams params{
+             .shard = bus.shard,
+@@
+-            .soft_timeout = td::Timestamp::in(target_rate_),
++            .soft_timeout = slot_deadline,
+@@
+         auto block_candidate = co_await td::actor::ask(...);
+@@
+-      if (current_leader_window_ != window) {
++      if (current_leader_window_ != window || td::Timestamp::now() > td::Timestamp::in(target_rate_, target_time)) {
+         break;
+       }
+```
 
-## Simplex vote / certificate parsing still accepts an oversized skip slot
+## Mixed: real code issue, but the current test also needs tightening
 
-- Documentation / expectation: `tracker-test-plan.md` `Kernel-27` / `Kernel-31` requires malformed
-  or oversized window-slot values to be rejected at parse time rather than silently reinterpreted.
-- Observed behavior: `SimplexParser_CertificateFromTlRejectsOversizedWindowSlot` is red.
-  A certificate carrying `skipVote(-1)` is still accepted and interpreted as slot `0xffffffff`.
+## Rule 6 skip-timeout integration scenario is still red in `test-consensus`
+
+- Status: `Mixed`.
+- Documentation / expectation: Rule 6 says the skip timeout in window `k` must be lower-bounded by
+  the last observed finalization, not by whether the immediately previous window happened to have a
+  skip. `simplex_docs.md` already documents the current implementation as wrong here.
 - Reproduce:
 ```sh
-./build/test/validator/consensus/test-simplex-parser --verbosity 0
+timeout 60s ./build/test/validator/consensus/test-consensus --test-case skip-timeout-uses-last-finalization --n-nodes 4 --target-rate-ms 100 --duration 6 --verbosity 0
 ```
-- Narrowing evidence:
-  `validator/consensus/simplex/votes.cpp` currently does
-  `SkipVote::from_tl(const tl::skipVote& vote) { return {static_cast<td::uint32>(vote.slot_)}; }`.
-  That means negative `int32` input is silently wrapped into a huge `uint32` slot before later
-  certificate logic sees it.
-- Probable cause:
-  there is no range check when converting TL `skipVote.slot_` into the internal `td::uint32 slot`.
-- What should be fixed:
-  reject negative or otherwise invalid slot values in the vote parser before constructing
-  `SkipVote`, and keep the parser-level regression red until that check is in place.
+- Current failure:
+  `scenario did not produce any SkipVote in window 2 or later; observed skip windows=[]`
+- Why the product bug is real:
+  `validator/consensus/simplex/consensus.cpp` still derives timeout growth from
+  `previous_window_had_skip_`. On each `LeaderWindowObserved`, a clean window resets
+  `first_block_timeout_s_` to the default, which is exactly the deviation called out in
+  `simplex_docs.md`.
+- Why the current end-to-end test also needs work:
+  the scenario currently aborts before it reaches the intended lower-bound timing assertion. So it
+  still proves "Rule 6 behavior is wrong enough that the scenario breaks", but it no longer cleanly
+  isolates the exact late-window timing violation by itself.
+- Proposed production change:
+  track the last window in which a finalization was observed and derive `first_block_timeout_s_`
+  from that value instead of from `previous_window_had_skip_`.
+- Proposed test change:
+  keep the scenario red until the product fix lands, but tighten it so it first proves that a later
+  skip actually occurred and only then compares the observed delay with the Rule 6 lower bound.
+
+## Test / harness issues
+
+## `simplex::Pool` standstill rebroadcast omits our later local votes
+
+- Status: `Test / synchronization issue`, not a demonstrated pool serialization bug.
+- Documentation / expectation: Rule 8 says standstill rebroadcast must contain the highest final
+  certificate, later certificates, and our own later votes that do not yet have certificates.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-pool --filter StandstillBroadcastContainsExpectedVotesAndCertificates --verbosity 2
+```
+- Current failure:
+  the standstill snapshot itself prints slot 2 as empty:
+  `1: .... skip`
+  `2: ....`
+- Why this currently looks like a test problem:
+  `PoolImpl::alarm()` does try to serialize local votes already present in pool state through
+  `state->votes[local].serialize_to(...)`. The missing vote is earlier: `BroadcastVote` detaches
+  `handle_our_vote(...)`, and `handle_our_vote` only stores the vote after an async keyring
+  `sign_message` finishes. The test publishes `BroadcastVote`, waits once, clears events, and then
+  jumps directly to the standstill deadline. That is not a reliable completion barrier for the
+  detached async vote path.
+- What should be changed:
+  either make `BroadcastVote` awaitable / acknowledged and wait for completion in the test, or
+  change the test to inject a fully signed local vote deterministically instead of assuming that one
+  `wait_sync_work()` call fully drains the detached signing path.
+- Hardening option if this should be a product guarantee:
+  store a "pending local vote" before awaiting signature so standstill cannot miss a vote that was
+  already locally decided. That would be a new requirement, not something the current test proves.
+
+## `BlockValidator` accepts empty candidates with an unrelated parent link
+
+- Status: `Test issue / widened contract`, with a possible defense-in-depth follow-up.
+- Documentation / expectation: the tracker wanted negative coverage for wrong parent references in
+  empty candidates, but the current unit test asserts that check at a narrower actor than the live
+  pipeline currently uses for it.
+- Reproduce:
+```sh
+./build/test/validator/consensus/test-block-validator --verbosity 0
+```
+- Current red test:
+  `BlockValidator_RejectsEmptyCandidateWithWrongParentLink`
+- Why this does not currently demonstrate a live pipeline bug:
+  in the real Simplex flow, `ConsensusImpl` calls `ResolveState(candidate->parent_id)` first and
+  passes the resulting state into `ValidationRequest`. `BlockValidator` is therefore validating "the
+  candidate against the already-resolved parent state", not independently re-resolving and
+  rechecking the parent link. The test fabricates an inconsistent pair by handing `BlockValidator`
+  a `state` for one chain tip while putting an unrelated `parent_id` into the candidate.
+- What should be changed:
+  either move this expectation to the parser / candidate-hash / higher-level consensus boundary
+  where `parent_id` is actually interpreted, or explicitly widen the `BlockValidator` contract so it
+  owns that invariant and then add a real implementation check there.
+
+## Shardchain integration never reaches empty-candidate mode after eight non-MC-finalized blocks
+
+- Status: `Test / harness issue`.
+- Documentation / expectation: tracker `Kernel-28` expects shardchain leaders to switch into
+  empty-candidate mode once the masterchain-finalized watermark falls more than eight blocks behind
+  the shard tip.
+- Reproduce:
+```sh
+timeout 100s ./build/test/validator/consensus/test-consensus-adversarial --test-case restart-after-eight-non-mc-finalized-blocks-reaccepts-pending-candidates --verbosity 0
+```
+- Current failure:
+  `scenario never reached empty-candidate finalization after validator #0.0 fell behind`
+- Why this currently points to the harness, not the product:
+  the producer's empty-mode condition is keyed off `last_mc_finalized_seqno_`, which is updated only
+  by `BlockFinalizedInMasterchain`. But the adversarial harness currently publishes
+  `BlockFinalizedInMasterchain` for every newly finalized shard block and also seeds restarted nodes
+  with `BlockFinalizedInMasterchain(last_accepted_block_)`. That keeps the producer's
+  masterchain-finalized watermark artificially caught up with shard finalization, so the
+  "eight non-MC-finalized shard blocks" precondition never actually exists inside the test.
+- What should be changed:
+  keep shard finality and masterchain finality separate in the harness. In particular, do not
+  publish `BlockFinalizedInMasterchain` from the generic shard block acceptance path, and do not
+  seed restarts with `last_accepted_block_` as if it were an MC-finalized watermark.
