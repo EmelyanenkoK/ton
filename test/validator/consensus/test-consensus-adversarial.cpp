@@ -113,6 +113,8 @@ enum class TestCase {
   RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates,
   StandstillWithoutCertificateRebroadcastRequiresRecovery,
   GoodCandidateWithWrongSlotParentHashDoesNotResolve,
+  OfflineCohortNetworkHandoffStillFinalizes,
+  OfflineCohortRestartHandoffStillFinalizes,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -254,6 +256,12 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   if (s == "good-candidate-with-wrong-slot-parent-hash-does-not-resolve") {
     return TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve;
   }
+  if (s == "offline-cohort-network-handoff-still-finalizes") {
+    return TestCase::OfflineCohortNetworkHandoffStillFinalizes;
+  }
+  if (s == "offline-cohort-restart-handoff-still-finalizes") {
+    return TestCase::OfflineCohortRestartHandoffStillFinalizes;
+  }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
 
@@ -368,6 +376,22 @@ ValidatorWeight configured_quorum_weight() {
   return (configured_total_weight() * 2) / 3 + 1;
 }
 
+constexpr td::uint32 COHORT_HANDOFF_BLOCK_COUNT = 100;
+constexpr td::uint32 COHORT_HANDOFF_RECOVERY_BLOCK_DELTA = 50;
+
+std::vector<size_t> cohort_handoff_first_offline_nodes() {
+  return {1, 2, 3};
+}
+
+std::vector<size_t> cohort_handoff_second_offline_nodes() {
+  return {4, 5, 6};
+}
+
+bool is_notar_or_final_vote(const simplex::Vote& vote) {
+  return std::holds_alternative<simplex::NotarizeVote>(vote.vote) ||
+         std::holds_alternative<simplex::FinalizeVote>(vote.vote);
+}
+
 struct TestExpectations {
   std::optional<CandidateId> candidate_resolution_target;
   std::optional<td::uint32> skip_timeout_last_finalized_window;
@@ -400,6 +424,8 @@ struct TestExpectations {
   std::optional<CandidateId> wrong_parent_hash_candidate_id;
   std::optional<td::uint32> restart_reaccept_stop_slot;
   std::optional<td::uint32> synthetic_mc_finalization_freeze_seqno;
+  std::optional<td::uint32> cohort_handoff_phase1_target_seqno;
+  std::optional<td::uint32> cohort_handoff_recovery_target_seqno;
 };
 
 std::mutex test_expectations_mutex;
@@ -2049,6 +2075,381 @@ td::Status verify_sleeping_validator_recovers_after_honest_progress(const TraceS
   return td::Status::OK();
 }
 
+td::Status verify_offline_cohort_network_handoff_still_finalizes(const TraceSnapshot& snapshot) {
+  // Covers a weighted online-cohort handoff under pure network isolation:
+  // - validator #0 carries slightly more weight and stays online for the whole test
+  // - cohort A = {1, 2, 3} is network-disabled first
+  // - the remaining online validators must still accept 100 more blocks while A is offline
+  // - then A is re-enabled and cohort B = {4, 5, 6} is disabled immediately, with no grace period
+  // - after that handoff, consensus must keep accepting later blocks and every rejoined A validator
+  //   must actively rejoin voting and later observe a much more distant post-handoff finalized
+  //   height; they need that longer runway to replay backlog and restore steady-state work before
+  //   their local trace fully catches up with the live tip again
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> target_seqno;
+  std::optional<td::uint32> recovery_target_seqno;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    target_seqno = test_expectations.cohort_handoff_phase1_target_seqno;
+    recovery_target_seqno = test_expectations.cohort_handoff_recovery_target_seqno;
+  }
+  if (!target_seqno.has_value()) {
+    return td::Status::Error("scenario did not register the phase-1 cohort-handoff target seqno");
+  }
+  if (!recovery_target_seqno.has_value()) {
+    return td::Status::Error("scenario did not register the post-handoff recovery target seqno");
+  }
+
+  std::map<size_t, double> disable_ts_by_first_cohort;
+  std::map<size_t, double> reenable_ts_by_first_cohort;
+  std::map<size_t, double> disable_ts_by_second_cohort;
+  std::map<size_t, double> reenable_ts_by_second_cohort;
+
+  for (const auto& record : snapshot.network_toggles) {
+    for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (record.disabled && !disable_ts_by_first_cohort.contains(node_idx)) {
+        disable_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+      if (!record.disabled && disable_ts_by_first_cohort.contains(node_idx) &&
+          !reenable_ts_by_first_cohort.contains(node_idx)) {
+        reenable_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+    }
+    for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (record.disabled && !disable_ts_by_second_cohort.contains(node_idx)) {
+        disable_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+      if (!record.disabled && disable_ts_by_second_cohort.contains(node_idx) &&
+          !reenable_ts_by_second_cohort.contains(node_idx)) {
+        reenable_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+    }
+  }
+
+  double phase1_start_ts = 0.0;
+  double phase1_end_ts = std::numeric_limits<double>::infinity();
+  double latest_reenable_ts = 0.0;
+  for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+    auto disable_it = disable_ts_by_first_cohort.find(node_idx);
+    auto reenable_it = reenable_ts_by_first_cohort.find(node_idx);
+    if (disable_it == disable_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not disable first offline cohort node #" << node_idx);
+    }
+    if (reenable_it == reenable_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not re-enable first offline cohort node #" << node_idx);
+    }
+    if (reenable_it->second <= disable_it->second) {
+      return td::Status::Error(PSTRING() << "first offline cohort node #" << node_idx
+                                         << " has invalid disable/re-enable ordering");
+    }
+    phase1_start_ts = std::max(phase1_start_ts, disable_it->second);
+    phase1_end_ts = std::min(phase1_end_ts, reenable_it->second);
+    latest_reenable_ts = std::max(latest_reenable_ts, reenable_it->second);
+  }
+  if (!std::isfinite(phase1_end_ts) || phase1_end_ts <= phase1_start_ts) {
+    return td::Status::Error("scenario did not create a valid interval where the whole first cohort was offline");
+  }
+
+  double earliest_second_disable_ts = std::numeric_limits<double>::infinity();
+  double phase2_start_ts = 0.0;
+  double phase2_end_ts = std::numeric_limits<double>::infinity();
+  for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+    auto disable_it = disable_ts_by_second_cohort.find(node_idx);
+    if (disable_it == disable_ts_by_second_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not disable second offline cohort node #" << node_idx);
+    }
+    earliest_second_disable_ts = std::min(earliest_second_disable_ts, disable_it->second);
+    phase2_start_ts = std::max(phase2_start_ts, disable_it->second);
+    if (auto reenable_it = reenable_ts_by_second_cohort.find(node_idx); reenable_it != reenable_ts_by_second_cohort.end()) {
+      phase2_end_ts = std::min(phase2_end_ts, reenable_it->second);
+    }
+  }
+  if (earliest_second_disable_ts + 1e-9 < latest_reenable_ts) {
+    return td::Status::Error("scenario started disabling the second cohort before the first cohort fully rejoined");
+  }
+  if (phase2_end_ts <= phase2_start_ts + 1e-9) {
+    return td::Status::Error("scenario did not leave any pure handoff interval before restoring cohort B");
+  }
+
+  bool saw_phase1_progress = false;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > phase1_start_ts + 1e-9 &&
+        record.ts < phase1_end_ts - 1e-9 && record.block_id.seqno() >= *target_seqno) {
+      saw_phase1_progress = true;
+      break;
+    }
+  }
+  if (!saw_phase1_progress) {
+    return td::Status::Error(PSTRING() << "always-online validator #0.0 never accepted block seqno >= "
+                                       << *target_seqno << " while cohort A was offline");
+  }
+
+  bool saw_phase2_progress = false;
+  td::uint32 highest_phase2_seqno = 0;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+        record.ts + 1e-9 < phase2_end_ts) {
+      highest_phase2_seqno = std::max(highest_phase2_seqno, record.block_id.seqno());
+      if (record.block_id.seqno() >= *recovery_target_seqno) {
+        saw_phase2_progress = true;
+      }
+    }
+  }
+  if (!saw_phase2_progress) {
+    return td::Status::Error(PSTRING() << "always-online validator #0.0 never accepted block seqno >= "
+                                       << *recovery_target_seqno
+                                       << " while cohort B was disabled; highest phase-2 seqno="
+                                       << highest_phase2_seqno);
+  }
+
+  for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+    bool saw_post_handoff_vote = false;
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+          record.ts + 1e-9 < phase2_end_ts &&
+          is_notar_or_final_vote(record.vote)) {
+        saw_post_handoff_vote = true;
+        break;
+      }
+    }
+    if (!saw_post_handoff_vote) {
+      return td::Status::Error(PSTRING() << "rejoined cohort-A validator #" << node_idx
+                                         << ".0 emitted no Notar/Final vote after the handoff");
+    }
+
+    bool saw_post_handoff_finalization = false;
+    for (const auto& record : snapshot.finalizations_observed) {
+      if (record.node_idx == node_idx && record.instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+          record.id.slot >= *recovery_target_seqno) {
+        saw_post_handoff_finalization = true;
+        break;
+      }
+    }
+    if (!saw_post_handoff_finalization) {
+      return td::Status::Error(PSTRING() << "rejoined cohort-A validator #" << node_idx
+                                         << ".0 never observed post-handoff finalization at seqno "
+                                         << *recovery_target_seqno);
+    }
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_offline_cohort_restart_handoff_still_finalizes(const TraceSnapshot& snapshot) {
+  // Covers the same weighted handoff, but with real process restarts instead of mere network loss:
+  // - validator #0 stays online throughout and carries slightly more weight than the others
+  // - cohort A = {1, 2, 3} is fully stopped first, while the remaining validators must still
+  //   accept 100 more blocks
+  // - then A is started again and cohort B = {4, 5, 6} is stopped immediately, without waiting for
+  //   the restarted nodes to pre-sync first
+  // - after that hard handoff, consensus must keep finalizing and every restarted A validator must
+  //   both emit Notar/Final traffic and later observe a much more distant post-handoff finalized
+  //   height; restarting validators need that extra time to rebuild their working frontier before
+  //   their local trace fully catches up with the live tip again
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> target_seqno;
+  std::optional<td::uint32> recovery_target_seqno;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    target_seqno = test_expectations.cohort_handoff_phase1_target_seqno;
+    recovery_target_seqno = test_expectations.cohort_handoff_recovery_target_seqno;
+  }
+  if (!target_seqno.has_value()) {
+    return td::Status::Error("scenario did not register the phase-1 restart-handoff target seqno");
+  }
+  if (!recovery_target_seqno.has_value()) {
+    return td::Status::Error("scenario did not register the post-handoff restart recovery target seqno");
+  }
+
+  std::map<size_t, double> stop_ts_by_first_cohort;
+  std::map<size_t, double> start_ts_by_first_cohort;
+  std::map<size_t, double> stop_ts_by_second_cohort;
+  std::map<size_t, double> restart_ts_by_second_cohort;
+
+  for (const auto& record : snapshot.lifecycle) {
+    for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (!record.started && !stop_ts_by_first_cohort.contains(node_idx)) {
+        stop_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+      if (record.started && stop_ts_by_first_cohort.contains(node_idx) && !start_ts_by_first_cohort.contains(node_idx)) {
+        start_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+    }
+    for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (!record.started && !stop_ts_by_second_cohort.contains(node_idx)) {
+        stop_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+      if (record.started && stop_ts_by_second_cohort.contains(node_idx) &&
+          !restart_ts_by_second_cohort.contains(node_idx)) {
+        restart_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+    }
+  }
+
+  double phase1_start_ts = 0.0;
+  double phase1_end_ts = std::numeric_limits<double>::infinity();
+  double latest_restart_ts = 0.0;
+  for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+    auto stop_it = stop_ts_by_first_cohort.find(node_idx);
+    auto start_it = start_ts_by_first_cohort.find(node_idx);
+    if (stop_it == stop_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not stop first restart cohort node #" << node_idx);
+    }
+    if (start_it == start_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not restart first restart cohort node #" << node_idx);
+    }
+    if (start_it->second <= stop_it->second) {
+      return td::Status::Error(PSTRING() << "restart cohort node #" << node_idx
+                                         << " has invalid stop/start ordering");
+    }
+    phase1_start_ts = std::max(phase1_start_ts, stop_it->second);
+    phase1_end_ts = std::min(phase1_end_ts, start_it->second);
+    latest_restart_ts = std::max(latest_restart_ts, start_it->second);
+  }
+  if (!std::isfinite(phase1_end_ts) || phase1_end_ts <= phase1_start_ts) {
+    return td::Status::Error("scenario did not create a valid interval where the whole first cohort was stopped");
+  }
+
+  double earliest_second_stop_ts = std::numeric_limits<double>::infinity();
+  double phase2_start_ts = 0.0;
+  double phase2_end_ts = std::numeric_limits<double>::infinity();
+  for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+    auto stop_it = stop_ts_by_second_cohort.find(node_idx);
+    if (stop_it == stop_ts_by_second_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not stop second restart cohort node #" << node_idx);
+    }
+    earliest_second_stop_ts = std::min(earliest_second_stop_ts, stop_it->second);
+    phase2_start_ts = std::max(phase2_start_ts, stop_it->second);
+    if (auto restart_it = restart_ts_by_second_cohort.find(node_idx); restart_it != restart_ts_by_second_cohort.end()) {
+      phase2_end_ts = std::min(phase2_end_ts, restart_it->second);
+    }
+  }
+  if (earliest_second_stop_ts + 1e-9 < latest_restart_ts) {
+    return td::Status::Error("scenario stopped the second cohort before the first cohort fully restarted");
+  }
+  if (phase2_end_ts <= phase2_start_ts + 1e-9) {
+    return td::Status::Error("scenario did not leave any pure restart handoff interval before restoring cohort B");
+  }
+
+  bool saw_phase1_progress = false;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > phase1_start_ts + 1e-9 &&
+        record.ts < phase1_end_ts - 1e-9 && record.block_id.seqno() >= *target_seqno) {
+      saw_phase1_progress = true;
+      break;
+    }
+  }
+  if (!saw_phase1_progress) {
+    return td::Status::Error(PSTRING() << "always-online validator #0.0 never accepted block seqno >= "
+                                       << *target_seqno << " while cohort A was stopped");
+  }
+
+  bool saw_phase2_progress = false;
+  td::uint32 highest_phase2_seqno = 0;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+        record.ts + 1e-9 < phase2_end_ts) {
+      highest_phase2_seqno = std::max(highest_phase2_seqno, record.block_id.seqno());
+      if (record.block_id.seqno() >= *recovery_target_seqno) {
+        saw_phase2_progress = true;
+      }
+    }
+  }
+  if (!saw_phase2_progress) {
+    return td::Status::Error(PSTRING() << "always-online validator #0.0 never accepted block seqno >= "
+                                       << *recovery_target_seqno
+                                       << " while cohort B was stopped; highest phase-2 seqno="
+                                       << highest_phase2_seqno);
+  }
+
+  for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+    bool saw_post_handoff_vote = false;
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+          record.ts + 1e-9 < phase2_end_ts &&
+          is_notar_or_final_vote(record.vote)) {
+        saw_post_handoff_vote = true;
+        break;
+      }
+    }
+    if (!saw_post_handoff_vote) {
+      return td::Status::Error(PSTRING() << "restarted cohort-A validator #" << node_idx
+                                         << ".0 emitted no Notar/Final vote after the handoff");
+    }
+
+    bool saw_post_handoff_finalization = false;
+    for (const auto& record : snapshot.finalizations_observed) {
+      if (record.node_idx == node_idx && record.instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+          record.id.slot >= *recovery_target_seqno) {
+        saw_post_handoff_finalization = true;
+        break;
+      }
+    }
+    if (!saw_post_handoff_finalization) {
+      return td::Status::Error(PSTRING() << "restarted cohort-A validator #" << node_idx
+                                         << ".0 never observed post-handoff finalization at seqno "
+                                         << *recovery_target_seqno);
+    }
+  }
+
+  for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+    double stop_ts = stop_ts_by_second_cohort[node_idx];
+    double restart_ts = restart_ts_by_second_cohort.contains(node_idx) ? restart_ts_by_second_cohort[node_idx]
+                                                                       : std::numeric_limits<double>::infinity();
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped cohort-B validator #" << node_idx
+                                           << ".0 still emitted a vote after stop");
+      }
+    }
+    for (const auto& record : snapshot.protocol_certificates) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped cohort-B validator #" << node_idx
+                                           << ".0 still emitted a certificate after stop");
+      }
+    }
+    for (const auto& record : snapshot.candidate_deliveries) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped cohort-B validator #" << node_idx
+                                           << ".0 still delivered a candidate after stop");
+      }
+    }
+    for (const auto& record : snapshot.overlay_requests) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped cohort-B validator #" << node_idx
+                                           << ".0 still sent an overlay request after stop");
+      }
+    }
+    for (const auto& record : snapshot.accepted_blocks) {
+      if (record.node_idx == node_idx && record.instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped cohort-B validator #" << node_idx
+                                           << ".0 still accepted a block after stop");
+      }
+    }
+  }
+
+  return td::Status::OK();
+}
+
 td::Status verify_standstill_with_byzantine_withholding_still_recovers(const TraceSnapshot& snapshot) {
   // Covers C5/C9/C11 from the adversarial plan:
   // one Byzantine validator withholds throughout, one honest validator disappears long enough to
@@ -3543,6 +3944,10 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_standstill_without_certificate_rebroadcast_requires_recovery(snapshot);
     case TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve:
       return verify_good_candidate_with_wrong_slot_parent_hash_does_not_resolve(snapshot);
+    case TestCase::OfflineCohortNetworkHandoffStillFinalizes:
+      return verify_offline_cohort_network_handoff_still_finalizes(snapshot);
+    case TestCase::OfflineCohortRestartHandoffStillFinalizes:
+      return verify_offline_cohort_restart_handoff_still_finalizes(snapshot);
   }
   UNREACHABLE();
 }
@@ -5418,6 +5823,34 @@ class TestConsensus : public td::actor::Actor {
         DURATION = 4.0;
       }
     }
+    if (TEST_CASE == TestCase::OfflineCohortNetworkHandoffStillFinalizes ||
+        TEST_CASE == TestCase::OfflineCohortRestartHandoffStillFinalizes) {
+      if (N_NODES == 8) {
+        N_NODES = 9;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 50;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 5.0;
+      }
+      if (NET_PING == std::pair<double, double>{0.05, 0.1}) {
+        NET_PING = {0.005, 0.01};
+      }
+      if (FIRST_BLOCK_TIMEOUT_S == 1.0) {
+        FIRST_BLOCK_TIMEOUT_S = 0.1;
+      }
+      if (FIRST_BLOCK_TIMEOUT_MULTIPLIER == 1.05) {
+        FIRST_BLOCK_TIMEOUT_MULTIPLIER = 1.2;
+      }
+      if (FIRST_BLOCK_MAX_TIMEOUT_S == 100.0) {
+        FIRST_BLOCK_MAX_TIMEOUT_S = 0.2;
+      }
+      NODE_WEIGHTS_OVERRIDE = {15, 11, 11, 11, 11, 11, 11, 11, 11};
+    }
     if (TEST_CASE == TestCase::StandstillWithByzantineWithholdingStillRecovers) {
       if (N_NODES == 8) {
         N_NODES = 4;
@@ -5864,7 +6297,9 @@ class TestConsensus : public td::actor::Actor {
            TEST_CASE == TestCase::EquivocatingLeaderDoesNotCreateTwoNotarsOrFinals ||
            TEST_CASE == TestCase::MultiSlotEquivocationWindowPreservesSafety ||
            TEST_CASE == TestCase::StandstillFloodStillRecovers ||
-           TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery;
+           TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery ||
+           TEST_CASE == TestCase::OfflineCohortNetworkHandoffStillFinalizes ||
+           TEST_CASE == TestCase::OfflineCohortRestartHandoffStillFinalizes;
   }
 
   td::actor::Task<> run_test_case_scenario() {
@@ -6488,6 +6923,108 @@ class TestConsensus : public td::actor::Actor {
       co_await td::actor::coro_sleep(td::Timestamp::in(1.5));
       co_await set_instance_network_disabled_for_test(3, 0, false);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::OfflineCohortNetworkHandoffStillFinalizes) {
+      // This is the stronger rotating-online-cohort liveness test under pure network isolation:
+      // - 9 validators participate, and validator #0 carries slightly more weight than the others
+      // - cohort A = {1, 2, 3} is disconnected first
+      // - with validator #0 still online, the remaining online validators must keep going long
+      //   enough to accept 100 more blocks despite the permanently recurring skipped leader slots
+      // - then cohort A is re-enabled and cohort B = {4, 5, 6} is disconnected immediately,
+      //   without any grace period in between
+      // - after that hard handoff, we require continued progress on validator #0 immediately and
+      //   then keep cohort B offline until validator #0 reaches a much later block; the rejoined
+      //   validators need that longer runway to replay backlog, restore steady-state work, and
+      //   observe finalized height near the live tip again
+      // - once that observation window is over, cohort B is re-enabled purely as cleanup so the
+      //   harness can shut the whole test network down without leaving peers stuck on dead links
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_accepted_seqno = FIRST_PARENT.seqno();
+      for (const auto& record : snapshot.accepted_blocks) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_accepted_seqno = std::max(highest_accepted_seqno, record.block_id.seqno());
+        }
+      }
+      td::uint32 target_seqno = highest_accepted_seqno + COHORT_HANDOFF_BLOCK_COUNT;
+      td::uint32 recovery_target_seqno = target_seqno + COHORT_HANDOFF_RECOVERY_BLOCK_DELTA;
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.cohort_handoff_phase1_target_seqno = target_seqno;
+        test_expectations.cohort_handoff_recovery_target_seqno = recovery_target_seqno;
+      }
+
+      co_await clear_traces();
+      for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, true);
+      }
+      co_await wait_for_accepted_block_seqno_on(0, 0, target_seqno, 25.0);
+
+      for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, false);
+      }
+      for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, true);
+      }
+
+      co_await wait_for_accepted_block_seqno_on(0, 0, recovery_target_seqno, 25.0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, false);
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::OfflineCohortRestartHandoffStillFinalizes) {
+      // This is the same rotating-online-cohort handoff, but with real restarts instead of just
+      // cutting the network:
+      // - validator #0 again stays online and carries slightly more weight
+      // - cohort A = {1, 2, 3} is fully stopped first, but the rest of the network must still
+      //   accept 100 more blocks
+      // - then cohort A is started again and cohort B = {4, 5, 6} is stopped immediately, with
+      //   no waiting for the restarted nodes to pre-sync before the old cohort disappears
+      // - the expected outcome is that consensus keeps finalizing later blocks after the swap, and
+      //   we keep cohort B stopped until validator #0 reaches a much later block because the
+      //   restarted validators need that extra runway to replay backlog, restore steady-state work,
+      //   and observe finalized height near the live tip again
+      // - once that observation window is complete, cohort B is started again purely for cleanup
+      //   so suite shutdown does not wait on peers that are still timing out old overlay work
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_accepted_seqno = FIRST_PARENT.seqno();
+      for (const auto& record : snapshot.accepted_blocks) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_accepted_seqno = std::max(highest_accepted_seqno, record.block_id.seqno());
+        }
+      }
+      td::uint32 target_seqno = highest_accepted_seqno + COHORT_HANDOFF_BLOCK_COUNT;
+      td::uint32 recovery_target_seqno = target_seqno + COHORT_HANDOFF_RECOVERY_BLOCK_DELTA;
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.cohort_handoff_phase1_target_seqno = target_seqno;
+        test_expectations.cohort_handoff_recovery_target_seqno = recovery_target_seqno;
+      }
+
+      co_await clear_traces();
+      for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+        co_await stop_instance(node_idx, 0);
+      }
+      co_await wait_for_accepted_block_seqno_on(0, 0, target_seqno, 25.0);
+
+      for (size_t node_idx : cohort_handoff_first_offline_nodes()) {
+        start_instance(node_idx, 0);
+      }
+      for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+        co_await stop_instance(node_idx, 0);
+      }
+
+      co_await wait_for_accepted_block_seqno_on(0, 0, recovery_target_seqno, 25.0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      for (size_t node_idx : cohort_handoff_second_offline_nodes()) {
+        start_instance(node_idx, 0);
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
       co_return td::Unit{};
     }
     if (TEST_CASE == TestCase::StandstillWithByzantineWithholdingStillRecovers) {
