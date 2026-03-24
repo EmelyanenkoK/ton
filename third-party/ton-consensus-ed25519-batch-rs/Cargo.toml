@@ -1,0 +1,14 @@
+[package]
+name = "ton-consensus-ed25519-batch-rs"
+version = "0.1.0"
+edition = "2021"
+license = "LGPL-2.0-or-later"
+publish = false
+
+[lib]
+name = "ton_consensus_ed25519_batch"
+crate-type = ["staticlib"]
+
+[dependencies]
+ed25519-zebra = "=4.2.0"
+rand = "=0.8.5"

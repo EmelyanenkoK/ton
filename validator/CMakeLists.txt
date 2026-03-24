@@ -262,8 +262,7 @@ target_link_libraries(full-node PRIVATE tdactor adnl rldp rldp2 tl_api dht tdfec
 if (TON_USE_ZEBRA_CONSENSUS_BATCH)
   set(TON_RUST_TOOLCHAIN "1.91.1-x86_64-unknown-linux-gnu" CACHE STRING
       "Rust toolchain used for consensus batch verification")
-  set(TON_RUST_WORKSPACE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../rust_implementation/ton-rust-node/src)
-  set(TON_CONSENSUS_ED25519_BATCH_CRATE_DIR ${TON_RUST_WORKSPACE_DIR}/node/consensus-ed25519-batch)
+  set(TON_CONSENSUS_ED25519_BATCH_CRATE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../third-party/ton-consensus-ed25519-batch-rs)
   set(TON_CONSENSUS_ED25519_BATCH_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/rust-consensus-ed25519-batch-target)
   set(TON_CONSENSUS_ED25519_BATCH_LIBRARY
       ${TON_CONSENSUS_ED25519_BATCH_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}ton_consensus_ed25519_batch${CMAKE_STATIC_LIBRARY_SUFFIX})
@@ -272,13 +271,11 @@ if (TON_USE_ZEBRA_CONSENSUS_BATCH)
     OUTPUT ${TON_CONSENSUS_ED25519_BATCH_LIBRARY}
     COMMAND ${CMAKE_COMMAND} -E env
             CARGO_TARGET_DIR=${TON_CONSENSUS_ED25519_BATCH_TARGET_DIR}
-            cargo +${TON_RUST_TOOLCHAIN} build --manifest-path ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/Cargo.toml --release
-    WORKING_DIRECTORY ${TON_RUST_WORKSPACE_DIR}
+            cargo +${TON_RUST_TOOLCHAIN} build --manifest-path ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/Cargo.toml --release --locked
+    WORKING_DIRECTORY ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}
     DEPENDS
-      ${TON_RUST_WORKSPACE_DIR}/Cargo.lock
-      ${TON_RUST_WORKSPACE_DIR}/Cargo.toml
-      ${TON_RUST_WORKSPACE_DIR}/rust-toolchain.toml
       ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/Cargo.toml
+      ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/Cargo.lock
       ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/src/lib.rs
     COMMENT "Build Rust consensus ed25519 batch verifier"
     VERBATIM

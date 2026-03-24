@@ -58,11 +58,11 @@ Date: 2026-03-24
 
 ### Rust side
 
-- Add a new small crate inside the existing Rust workspace, for example:
-  - `rust_implementation/ton-rust-node/src/node/consensus-ed25519-batch`
+- Add a standalone Rust crate under `third-party`, for example:
+  - `third-party/ton-consensus-ed25519-batch-rs`
 - Recommended crate type for the integration target: `staticlib`.
   - This keeps the feature internal to the node binary and avoids deploying a separate shared library.
-  - Use the existing Rust `extern "C"` style from the in-tree `emulator` crate as the FFI pattern reference.
+  - Keep it independent from `rust_implementation`, because that tree is not part of the main validator build.
 - Proposed exported API:
 
 ```c
