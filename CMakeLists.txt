@@ -92,6 +92,7 @@ option(TON_PRINT_BACKTRACE_ON_CRASH "Attempt to print a backtrace when a fatal s
 option(TON_INSERT_GDB_HOOKS "Insert GDB hooks" OFF)
 
 option(TON_USE_LLD "Use LLD for linking" OFF)
+option(TON_USE_ZEBRA_CONSENSUS_BATCH "Use Rust ed25519-zebra for Simplex certificate batch verification" OFF)
 
 if (TON_USE_LLD)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fuse-ld=lld")

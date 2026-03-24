@@ -6,6 +6,7 @@
 
 #include "td/utils/overloaded.h"
 #include "validator/consensus/bus.h"
+#include "validator/consensus/ed25519_batch_verifier.h"
 
 #include "certificate.h"
 
@@ -19,6 +20,69 @@ td::Result<td::Ref<Certificate<T>>> Certificate<T>::from_tl(tl::voteSignatureSet
   std::vector<VoteSignature> signatures;
   ValidatorWeight voted_weight = 0;
 
+#if TON_USE_ZEBRA_CONSENSUS_BATCH
+  struct PendingVoteSignature {
+    const PeerValidator* validator;
+    td::Bits256 public_key;
+    td::BufferSlice signature;
+  };
+
+  std::vector<PendingVoteSignature> pending_signatures;
+  pending_signatures.reserve(set.votes_.size());
+
+  for (auto& signature : set.votes_) {
+    auto who = static_cast<td::uint32>(signature->who_);
+    if (who >= bus.validator_set.size()) {
+      return td::Status::Error(PSTRING() << "Invalid validator index " << who << " in certificate");
+    }
+    if (voted[who]) {
+      return td::Status::Error(PSTRING() << "Duplicate validator index " << who << " in certificate");
+    }
+    voted[who] = true;
+
+    const auto& validator = PeerValidatorId{who}.get_using(bus);
+    if (!validator.key.is_ed25519()) {
+      return td::Status::Error(PSTRING() << "Non-Ed25519 validator key in Simplex certificate for " << validator);
+    }
+
+    pending_signatures.push_back(PendingVoteSignature{
+        .validator = &validator,
+        .public_key = validator.key.ed25519_value().raw(),
+        .signature = std::move(signature->signature_),
+    });
+    voted_weight += validator.weight;
+  }
+
+  std::vector<Ed25519BatchVerifierItem> batch_items;
+  batch_items.reserve(pending_signatures.size());
+  for (const auto& pending : pending_signatures) {
+    batch_items.push_back(Ed25519BatchVerifierItem{
+        .public_key = pending.public_key,
+        .signature = pending.signature.as_slice(),
+    });
+  }
+
+  auto signed_data = create_serialize_tl_object<consensus::tl::dataToSign>(bus.session_id, vote_to_sign.clone());
+  auto validity = verify_ed25519_batch(signed_data.as_slice(), batch_items);
+  if (validity.is_error()) {
+    for (auto& pending : pending_signatures) {
+      if (!pending.validator->check_signature(bus.session_id, vote_to_sign, pending.signature.as_slice())) {
+        return td::Status::Error(PSTRING() << "Invalid vote signature for " << *pending.validator);
+      }
+    }
+  } else {
+    auto bitmap = validity.move_as_ok();
+    for (size_t i = 0; i < bitmap.size(); ++i) {
+      if (bitmap[i] == 0) {
+        return td::Status::Error(PSTRING() << "Invalid vote signature for " << *pending_signatures[i].validator);
+      }
+    }
+  }
+
+  for (auto& pending : pending_signatures) {
+    signatures.emplace_back(VoteSignature{pending.validator->idx, std::move(pending.signature)});
+  }
+#else
   for (auto& signature : set.votes_) {
     auto who = static_cast<td::uint32>(signature->who_);
     if (who >= bus.validator_set.size()) {
@@ -36,6 +100,7 @@ td::Result<td::Ref<Certificate<T>>> Certificate<T>::from_tl(tl::voteSignatureSet
     signatures.emplace_back(VoteSignature{validator.idx, std::move(signature->signature_)});
     voted_weight += validator.weight;
   }
+#endif
 
   if (voted_weight < (bus.total_weight * 2) / 3 + 1) {
     return td::Status::Error("Not enough signatures in certificate");

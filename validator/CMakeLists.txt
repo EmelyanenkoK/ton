@@ -117,6 +117,7 @@ set(VALIDATOR_SOURCE
   consensus/simplex/state-resolver.cpp
   consensus/simplex/stats.cpp
   consensus/simplex/votes.cpp
+  consensus/ed25519_batch_verifier.cpp
   consensus/block-accepter.cpp
   consensus/block-producer.cpp
   consensus/block-validator.cpp
@@ -128,6 +129,7 @@ set(VALIDATOR_SOURCE
   consensus/stats.cpp
   consensus/types.cpp
   consensus/utils.cpp
+  consensus/ed25519_batch_verifier.h
 
   ${VALIDATOR_HEADERS}
 )
@@ -256,3 +258,40 @@ target_link_libraries(validator-disk PRIVATE validator-db)
 target_link_libraries(validator-hardfork PRIVATE validator-db)
 
 target_link_libraries(full-node PRIVATE tdactor adnl rldp rldp2 tl_api dht tdfec overlay catchain validatorsession ton_db)
+
+if (TON_USE_ZEBRA_CONSENSUS_BATCH)
+  set(TON_RUST_TOOLCHAIN "1.91.1-x86_64-unknown-linux-gnu" CACHE STRING
+      "Rust toolchain used for consensus batch verification")
+  set(TON_RUST_WORKSPACE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../rust_implementation/ton-rust-node/src)
+  set(TON_CONSENSUS_ED25519_BATCH_CRATE_DIR ${TON_RUST_WORKSPACE_DIR}/node/consensus-ed25519-batch)
+  set(TON_CONSENSUS_ED25519_BATCH_TARGET_DIR ${CMAKE_CURRENT_BINARY_DIR}/rust-consensus-ed25519-batch-target)
+  set(TON_CONSENSUS_ED25519_BATCH_LIBRARY
+      ${TON_CONSENSUS_ED25519_BATCH_TARGET_DIR}/release/${CMAKE_STATIC_LIBRARY_PREFIX}ton_consensus_ed25519_batch${CMAKE_STATIC_LIBRARY_SUFFIX})
+
+  add_custom_command(
+    OUTPUT ${TON_CONSENSUS_ED25519_BATCH_LIBRARY}
+    COMMAND ${CMAKE_COMMAND} -E env
+            CARGO_TARGET_DIR=${TON_CONSENSUS_ED25519_BATCH_TARGET_DIR}
+            cargo +${TON_RUST_TOOLCHAIN} build --manifest-path ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/Cargo.toml --release
+    WORKING_DIRECTORY ${TON_RUST_WORKSPACE_DIR}
+    DEPENDS
+      ${TON_RUST_WORKSPACE_DIR}/Cargo.lock
+      ${TON_RUST_WORKSPACE_DIR}/Cargo.toml
+      ${TON_RUST_WORKSPACE_DIR}/rust-toolchain.toml
+      ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/Cargo.toml
+      ${TON_CONSENSUS_ED25519_BATCH_CRATE_DIR}/src/lib.rs
+    COMMENT "Build Rust consensus ed25519 batch verifier"
+    VERBATIM
+  )
+
+  add_custom_target(ton_consensus_ed25519_batch_rust DEPENDS ${TON_CONSENSUS_ED25519_BATCH_LIBRARY})
+  add_library(ton_consensus_ed25519_batch STATIC IMPORTED GLOBAL)
+  set_target_properties(ton_consensus_ed25519_batch PROPERTIES
+    IMPORTED_LOCATION ${TON_CONSENSUS_ED25519_BATCH_LIBRARY}
+    INTERFACE_LINK_LIBRARIES "${CMAKE_THREAD_LIBS_INIT};${CMAKE_DL_LIBS};m;util;rt"
+  )
+  add_dependencies(ton_consensus_ed25519_batch ton_consensus_ed25519_batch_rust)
+
+  target_link_libraries(validator PUBLIC ton_consensus_ed25519_batch)
+  target_compile_definitions(validator PRIVATE TON_USE_ZEBRA_CONSENSUS_BATCH=1)
+endif()
