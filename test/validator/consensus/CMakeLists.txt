@@ -26,6 +26,8 @@ target_link_libraries(test-consensus-adversarial PRIVATE
     validator
 )
 
+add_subdirectory(integration)
+
 foreach(TEST_NAME
     test-block-validator
     test-block-producer
