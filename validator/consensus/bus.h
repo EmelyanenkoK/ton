@@ -140,6 +140,14 @@ struct NoncriticalParamsUpdated {
   std::string contents_to_string() const;
 };
 
+struct PrecheckCandidateBroadcast {
+  using ReturnType = td::Unit;
+
+  td::uint32 slot;
+
+  std::string contents_to_string() const;
+};
+
 class Db {
  public:
   virtual ~Db() = default;
@@ -156,7 +164,7 @@ class Bus : public td::actor::Bus {
   using Events = td::TypeList<Start, StopRequested, FinalizeBlock, OurLeaderWindowStarted, CandidateGenerated,
                               CandidateReceived, ValidationRequest, IncomingProtocolMessage, OutgoingProtocolMessage,
                               IncomingOverlayRequest, OutgoingOverlayRequest, BlockFinalizedInMasterchain,
-                              MisbehaviorReport, TraceEvent, NoncriticalParamsUpdated>;
+                              MisbehaviorReport, TraceEvent, NoncriticalParamsUpdated, PrecheckCandidateBroadcast>;
 
   Bus() = default;
   ~Bus() override {
