@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
+#include <cmath>
 #include <random>
 
 #include "td/actor/Mocks.h"
@@ -130,6 +131,25 @@ class PoolTest : public td::Test {
     observer().clear_events();
   }
 
+  template <class Predicate>
+  td::actor::Task<td::Unit> advance_until(Predicate predicate, size_t max_steps = 16) {
+    for (size_t i = 0; i < max_steps; ++i) {
+      if (predicate()) {
+        co_return td::Unit{};
+      }
+      auto next_timeout = ts_.next_timeout_in();
+      EXPECT(std::isfinite(next_timeout));
+      if (!std::isfinite(next_timeout)) {
+        break;
+      }
+      ts_.advance_time(next_timeout);
+      co_await ts_.wait_sync_work();
+    }
+
+    EXPECT(predicate());
+    co_return td::Unit{};
+  }
+
   virtual void configure_bus(PoolBus&) {
   }
 
@@ -193,6 +213,29 @@ bool contains_outgoing_vote(const ObservedEvents& events, const simplex::Vote& e
     }
   }
   return false;
+}
+
+std::optional<size_t> outgoing_payload_position(const ObservedEvents& events, td::Slice payload) {
+  auto outgoing = events_of<OutgoingProtocolMessage>(events);
+  for (size_t i = 0; i < outgoing.size(); ++i) {
+    if (outgoing[i]->message.data.as_slice() == payload) {
+      return i;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<size_t> outgoing_vote_position(const ObservedEvents& events, const simplex::Vote& expected_vote,
+                                             PeerValidatorId src, const consensus::Bus& bus) {
+  auto expected_serialized = serialize_tl_object(expected_vote.to_tl(), true);
+  auto outgoing = events_of<OutgoingProtocolMessage>(events);
+  for (size_t i = 0; i < outgoing.size(); ++i) {
+    auto decoded = decode_simplex_signed_vote(outgoing[i]->message, src, bus);
+    if (decoded.is_ok() && serialize_tl_object(decoded.ok().vote.to_tl(), true) == expected_serialized) {
+      return i;
+    }
+  }
+  return std::nullopt;
 }
 
 struct ResolvesWaitForParentFromBootstrapProofs : PoolTest {
@@ -369,7 +412,11 @@ struct StandstillTriggersAtConfiguredTimeout : PoolTest {
     ts_.advance_time(0.1);
     co_await ts_.wait_sync_work();
 
-    EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
+    auto replay_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(replay_delay));
+    EXPECT(replay_delay < 0.1);
+
+    co_await advance_until([&] { return contains_outgoing_payload(events(), final_payload_.as_slice()); });
 
     co_return {};
   }
@@ -413,9 +460,29 @@ struct StandstillBroadcastContainsExpectedVotesAndCertificates : PoolTest {
     ts_.advance_time(ts_.next_timeout_in());
     co_await ts_.wait_sync_work();
 
+    auto replay_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(replay_delay));
+    EXPECT(replay_delay < 0.1);
+
+    co_await advance_until([&] {
+      return contains_outgoing_payload(events(), final_payload_.as_slice()) &&
+             contains_outgoing_payload(events(), skip_payload_.as_slice()) &&
+             contains_outgoing_vote(events(), expected_local_vote, PeerValidatorId{0}, *bus_);
+    });
+
     EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
     EXPECT(contains_outgoing_payload(events(), skip_payload_.as_slice()));
     EXPECT(contains_outgoing_vote(events(), expected_local_vote, PeerValidatorId{0}, *bus_));
+
+    auto final_pos = outgoing_payload_position(events(), final_payload_.as_slice());
+    auto skip_pos = outgoing_payload_position(events(), skip_payload_.as_slice());
+    auto local_vote_pos = outgoing_vote_position(events(), expected_local_vote, PeerValidatorId{0}, *bus_);
+    ASSERT_TRUE(final_pos.has_value());
+    ASSERT_TRUE(skip_pos.has_value());
+    ASSERT_TRUE(local_vote_pos.has_value());
+    EXPECT_EQ(*final_pos, static_cast<size_t>(0));
+    EXPECT(*final_pos < *skip_pos);
+    EXPECT(*skip_pos < *local_vote_pos);
 
     co_return {};
   }
@@ -821,7 +888,12 @@ struct NoncriticalParamsUpdateChangesStandstillTimeout : PoolTest {
 
     ts_.advance_time(initial_timeout);
     co_await ts_.wait_sync_work();
-    EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
+
+    auto first_replay_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(first_replay_delay));
+    EXPECT(first_replay_delay < 0.1);
+
+    co_await advance_until([&] { return contains_outgoing_payload(events(), final_payload_.as_slice()); });
     clear_events();
 
     // After the first standstill fires, Pool reschedules using the updated params.
@@ -832,7 +904,11 @@ struct NoncriticalParamsUpdateChangesStandstillTimeout : PoolTest {
     ts_.advance_time(rescheduled_timeout);
     co_await ts_.wait_sync_work();
 
-    EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
+    auto second_replay_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(second_replay_delay));
+    EXPECT(second_replay_delay < 0.1);
+
+    co_await advance_until([&] { return contains_outgoing_payload(events(), final_payload_.as_slice()); });
 
     co_return {};
   }

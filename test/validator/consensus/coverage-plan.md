@@ -260,60 +260,55 @@ Scenarios:
 
 ## Current test execution status
 
-Build/run attempt on this branch:
+Relevant consensus-side tests now build and pass on this branch:
 
-- Passed:
-  - `test/validator/test-mc-config`
-  - `test/validator/test-validate-query`
-  - `test/validator/consensus/test-block-validator`
-  - `test/validator/consensus/test-block-producer`
-  - `test/validator/consensus/test-simplex-parser`
-- Blocked by test-suite maintenance, not by changed consensus behavior:
-  - `test/validator/consensus/test-candidate-resolver`
-  - `test/validator/consensus/test-pool`
-  - `test/validator/consensus/test-simplex-db`
-  - `test/validator/consensus/test-simplex-consensus`
-  - `test/validator/consensus/test-consensus-adversarial`
-  - `test/validator/consensus/integration/test-adversarial` and all registered `adversarial-*` CTest cases
-  - all of the targets above fail to build because their `TestDbImpl` test doubles do not implement the newly required `consensus::Db::close()` pure virtual
-- Blocked by test target linkage:
-  - `test/validator/consensus/test-consensus`
-  - current link fails with undefined `validator::create_block(...)` after `validator/libvalidator.a` started using that symbol from `block-accepter.cpp` and `chain-state.cpp`; the test target now needs corrected direct/transitive linkage
+- `test/validator/test-mc-config`
+- `test/validator/test-validate-query`
+- `test/validator/consensus/test-block-validator`
+- `test/validator/consensus/test-block-producer`
+- `test/validator/consensus/test-candidate-resolver`
+- `test/validator/consensus/test-pool`
+- `test/validator/consensus/test-simplex-db`
+- `test/validator/consensus/test-simplex-consensus`
+- `test/validator/consensus/test-simplex-parser`
+- `test/validator/consensus/integration/test-adversarial` via all registered `adversarial-*` CTest cases
+
+Additional verification:
+
+- `test/validator/consensus/test-consensus` builds and smoke-runs successfully with `-d 1`
+- `test/validator/consensus/test-consensus-adversarial` builds and smoke-runs successfully with `--test-case smoke -d 1`
 
 Result for this plan:
 
-- After fixing the harness/build issues, `test/validator/consensus/test-pool` now exposes real expectation drift caused by the new standstill rebroadcast behavior.
-- The failing cases are about timing semantics, not about broken production logic.
+- The earlier harness/build issues are fixed.
+- The earlier `test-pool` failures were valid expectation drift caused by the new async standstill rebroadcast path and are now covered by updated assertions.
 
-## Update existing tests
+## Updated existing tests
 
-Existing tests that should be updated because the branch changed behavior in a valid way:
+Existing tests that were updated because the branch changed behavior in a valid way:
 
 - `test/validator/consensus/test-pool.cpp`
   - `Pool_StandstillTriggersAtConfiguredTimeout`
   - `Pool_StandstillBroadcastContainsExpectedVotesAndCertificates`
   - `Pool_NoncriticalParamsUpdateChangesStandstillTimeout`
 
-Why these now fail:
+Why they needed updating:
 
 - `validator/consensus/simplex/pool.cpp` no longer emits standstill rebroadcasts synchronously from the timeout handler.
 - The timeout handler now only starts `standstill_resolution_task()`, which sends messages through a paced background loop and may sleep before the first rebroadcast.
-- The old tests assert for outgoing payloads in the same scheduler tick in which standstill is detected, so they race the new asynchronous sender and fail even though the rebroadcast happens immediately after.
+- The old tests asserted for outgoing payloads in the same scheduler tick in which standstill was detected, so they raced the new asynchronous sender.
 
-What to change in the tests:
+What the updated tests now verify:
 
-1. Replace same-tick assertions with eventual assertions.
-   - After advancing time to the standstill timeout, advance once more by the next pending timeout or poll until the expected outgoing message appears.
-2. Update content tests to tolerate paced multi-tick delivery.
-   - Do not require final certificate, later certificates, and local votes to all appear in one scheduler drain.
-   - Collect events across subsequent ticks until the expected standstill replay set is observed.
-3. Add assertions for the new behavior while updating these tests.
+1. Same-tick standstill assertions were replaced with eventual assertions across scheduler timeouts.
+2. Standstill content checks now tolerate paced multi-tick delivery instead of assuming one scheduler drain.
+3. Replay ordering is now asserted explicitly.
    - Last final certificate is broadcast first.
-   - Replay may span multiple scheduler ticks because of `standstill_max_egress_bytes_per_s`.
-4. Keep the timeout assertions, but separate them from delivery assertions.
-   - The timeout test should still prove that standstill is detected at the configured time.
-   - The delivery assertion should then verify that rebroadcast starts asynchronously after detection.
-5. For `NoncriticalParamsUpdateChangesStandstillTimeout`, preserve the existing reschedule check but wait for the first replay message before checking post-rebroadcast state.
+   - Later certificates are replayed before later local votes in this scenario.
+4. Timeout assertions remain separate from delivery assertions.
+   - The tests still prove that standstill is detected at the configured time.
+   - They then verify that rebroadcast starts asynchronously after detection.
+5. The noncritical-param update test now waits for the first replay to complete before checking the next rescheduled alarm.
 
 ## Recommended implementation order
 
