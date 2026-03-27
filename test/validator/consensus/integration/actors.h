@@ -83,6 +83,7 @@ class TestDbImpl : public consensus::Db {
   std::optional<td::BufferSlice> get(td::Slice key) const override;
   std::vector<std::pair<td::BufferSlice, td::BufferSlice>> get_by_prefix(td::uint32 prefix) const override;
   td::actor::Task<> set(td::BufferSlice key, td::BufferSlice value) override;
+  td::actor::Task<> close() override;
 
  private:
   std::map<td::BufferSlice, td::BufferSlice> snapshot_;

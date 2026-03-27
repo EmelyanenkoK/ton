@@ -251,6 +251,10 @@ td::actor::Task<> TestDbImpl::set(td::BufferSlice key, td::BufferSlice value) {
   co_return {};
 }
 
+td::actor::Task<> TestDbImpl::close() {
+  co_return {};
+}
+
 // --- TestManagerFacade ---
 
 TestManagerFacade::TestManagerFacade(size_t node_idx, td::Ref<block::ValidatorSet> validator_set,

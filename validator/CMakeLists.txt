@@ -249,10 +249,10 @@ target_include_directories(full-node PUBLIC
   ${OPENSSL_INCLUDE_DIR}
   )
 
-target_link_libraries(validator PRIVATE validator-db)
+target_link_libraries(validator PRIVATE validator-db ton_validator)
 
-target_link_libraries(validator-disk PRIVATE validator-db)
+target_link_libraries(validator-disk PRIVATE validator-db ton_validator)
 
-target_link_libraries(validator-hardfork PRIVATE validator-db)
+target_link_libraries(validator-hardfork PRIVATE validator-db ton_validator)
 
 target_link_libraries(full-node PRIVATE tdactor adnl rldp rldp2 tl_api dht tdfec overlay catchain validatorsession ton_db)

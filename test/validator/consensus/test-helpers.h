@@ -299,6 +299,10 @@ class TestDbImpl : public consensus::Db {
     co_return {};
   }
 
+  td::actor::Task<> close() override {
+    co_return {};
+  }
+
  private:
   std::map<td::BufferSlice, td::BufferSlice> map_;
 };
