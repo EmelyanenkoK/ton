@@ -115,6 +115,8 @@ enum class TestCase {
   GoodCandidateWithWrongSlotParentHashDoesNotResolve,
   OfflineCohortNetworkHandoffStillFinalizes,
   OfflineCohortRestartHandoffStillFinalizes,
+  OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes,
+  OfflineCohortRestartHandoffForcedSkipWindowStillFinalizes,
 };
 
 td::Result<TestCase> parse_test_case(td::Slice s) {
@@ -262,6 +264,12 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   if (s == "offline-cohort-restart-handoff-still-finalizes") {
     return TestCase::OfflineCohortRestartHandoffStillFinalizes;
   }
+  if (s == "offline-cohort-network-handoff-forced-skip-window-still-finalizes") {
+    return TestCase::OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes;
+  }
+  if (s == "offline-cohort-restart-handoff-forced-skip-window-still-finalizes") {
+    return TestCase::OfflineCohortRestartHandoffForcedSkipWindowStillFinalizes;
+  }
   return td::Status::Error(PSTRING() << "unknown test case " << s);
 }
 
@@ -299,6 +307,7 @@ std::chrono::milliseconds FIRST_BLOCK_TIMEOUT{1'000};
 double FIRST_BLOCK_TIMEOUT_MULTIPLIER = 1.05;
 std::chrono::milliseconds FIRST_BLOCK_MAX_TIMEOUT{100'000};
 std::vector<ValidatorWeight> NODE_WEIGHTS_OVERRIDE;
+bool NEVER_NOTARIZE = false;
 
 std::pair<double, double> GREMLIN_PERIOD = {-1.0, -1.0};
 std::pair<double, double> GREMLIN_DOWNTIME = {1.0, 1.0};
@@ -378,6 +387,11 @@ ValidatorWeight configured_quorum_weight() {
 
 constexpr td::uint32 COHORT_HANDOFF_BLOCK_COUNT = 100;
 constexpr td::uint32 COHORT_HANDOFF_RECOVERY_BLOCK_DELTA = 50;
+constexpr td::uint32 COHORT_HANDOFF_FORCED_SKIP_PHASE1_BLOCK_DELTA = 30;
+constexpr td::uint32 COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT = 100;
+constexpr td::uint32 COHORT_HANDOFF_FORCED_SKIP_RECOVERY_SLOT_DELTA = 30;
+constexpr double COHORT_HANDOFF_FORCED_SKIP_TIMEOUT_S = 45.0;
+constexpr double COHORT_HANDOFF_FORCED_SKIP_RECOVERY_TIMEOUT_S = 45.0;
 
 std::vector<size_t> cohort_handoff_first_offline_nodes() {
   return {1, 2, 3};
@@ -387,9 +401,33 @@ std::vector<size_t> cohort_handoff_second_offline_nodes() {
   return {4, 5, 6};
 }
 
+std::vector<size_t> cohort_handoff_forced_skip_always_online_nodes() {
+  return {0, 1, 2, 3};
+}
+
+std::vector<size_t> cohort_handoff_forced_skip_first_offline_nodes() {
+  return {4, 5, 6};
+}
+
+std::vector<size_t> cohort_handoff_forced_skip_second_offline_nodes() {
+  return {7, 8, 9};
+}
+
 bool is_notar_or_final_vote(const simplex::Vote& vote) {
   return std::holds_alternative<simplex::NotarizeVote>(vote.vote) ||
          std::holds_alternative<simplex::FinalizeVote>(vote.vote);
+}
+
+bool is_skip_vote(const simplex::Vote& vote) {
+  return std::holds_alternative<simplex::SkipVote>(vote.vote);
+}
+
+td::uint32 vote_slot(const simplex::Vote& vote) {
+  return std::visit(
+      td::overloaded([](const simplex::NotarizeVote& notar) { return notar.id.slot; },
+                     [](const simplex::SkipVote& skip) { return skip.slot; },
+                     [](const simplex::FinalizeVote& final) { return final.id.slot; }),
+      vote.vote);
 }
 
 struct TestExpectations {
@@ -426,6 +464,9 @@ struct TestExpectations {
   std::optional<td::uint32> synthetic_mc_finalization_freeze_seqno;
   std::optional<td::uint32> cohort_handoff_phase1_target_seqno;
   std::optional<td::uint32> cohort_handoff_recovery_target_seqno;
+  std::optional<td::uint32> cohort_handoff_forced_skip_start_slot;
+  size_t cohort_handoff_forced_skip_slot_count = 0;
+  std::optional<td::uint32> cohort_handoff_forced_skip_recovery_slot;
 };
 
 std::mutex test_expectations_mutex;
@@ -2437,6 +2478,480 @@ td::Status verify_offline_cohort_restart_handoff_still_finalizes(const TraceSnap
   return td::Status::OK();
 }
 
+td::uint32 highest_accepted_seqno_on(const TraceSnapshot& snapshot, size_t node_idx, size_t instance_idx) {
+  td::uint32 highest_accepted_seqno = FIRST_PARENT.seqno();
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == node_idx && record.instance_idx == instance_idx) {
+      highest_accepted_seqno = std::max(highest_accepted_seqno, record.block_id.seqno());
+    }
+  }
+  return highest_accepted_seqno;
+}
+
+td::uint32 highest_observed_slot(const TraceSnapshot& snapshot) {
+  td::uint32 highest_slot = 0;
+  for (const auto& record : snapshot.protocol_votes) {
+    highest_slot = std::max(highest_slot, vote_slot(record.vote));
+  }
+  for (const auto& record : snapshot.protocol_certificates) {
+    highest_slot = std::max(highest_slot, vote_slot(record.vote));
+  }
+  for (const auto& record : snapshot.candidate_deliveries) {
+    highest_slot = std::max(highest_slot, record.candidate_id.slot);
+  }
+  for (const auto& record : snapshot.leader_windows_observed) {
+    highest_slot = std::max(highest_slot, record.start_slot);
+  }
+  for (const auto& record : snapshot.leader_windows_started) {
+    highest_slot = std::max(highest_slot, record.end_slot);
+  }
+  for (const auto& record : snapshot.notarizations_observed) {
+    highest_slot = std::max(highest_slot, record.id.slot);
+  }
+  for (const auto& record : snapshot.finalizations_observed) {
+    highest_slot = std::max(highest_slot, record.id.slot);
+  }
+  for (const auto& record : snapshot.candidates_generated) {
+    highest_slot = std::max(highest_slot, record.candidate_id.slot);
+  }
+  for (const auto& record : snapshot.candidates_resolved) {
+    highest_slot = std::max(highest_slot, record.id.slot);
+  }
+  return highest_slot;
+}
+
+std::set<td::uint32> skip_certificate_slots_in_range(const TraceSnapshot& snapshot, td::uint32 start_slot,
+                                                     td::uint32 end_slot) {
+  std::set<td::uint32> skipped_slots;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (auto* skip = std::get_if<simplex::SkipVote>(&record.vote.vote);
+        skip != nullptr && skip->slot >= start_slot && skip->slot < end_slot) {
+      skipped_slots.insert(skip->slot);
+    }
+  }
+  return skipped_slots;
+}
+
+td::Status verify_cohort_handoff_phase1_progress(const TraceSnapshot& snapshot, double phase1_start_ts,
+                                                 double phase1_end_ts, td::uint32 target_seqno,
+                                                 const char* offline_description) {
+  bool saw_phase1_progress = false;
+  for (const auto& record : snapshot.accepted_blocks) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > phase1_start_ts + 1e-9 &&
+        record.ts < phase1_end_ts - 1e-9 && record.block_id.seqno() >= target_seqno) {
+      saw_phase1_progress = true;
+      break;
+    }
+  }
+  if (!saw_phase1_progress) {
+    return td::Status::Error(PSTRING() << "always-online validator #0.0 never accepted block seqno >= "
+                                       << target_seqno << " while " << offline_description);
+  }
+  return td::Status::OK();
+}
+
+td::Status verify_cohort_handoff_forced_skip_window_behavior(const TraceSnapshot& snapshot, double phase2_start_ts,
+                                                             double phase2_end_ts, td::uint32 forced_skip_start_slot,
+                                                             size_t forced_skip_slot_count,
+                                                             td::uint32 recovery_target_slot,
+                                                             const char* rejoined_description) {
+  td::uint32 forced_skip_end_slot = forced_skip_start_slot + static_cast<td::uint32>(forced_skip_slot_count);
+  auto skipped_slots = skip_certificate_slots_in_range(snapshot, forced_skip_start_slot, forced_skip_end_slot);
+  if (skipped_slots.size() != forced_skip_slot_count) {
+    for (td::uint32 slot = forced_skip_start_slot; slot < forced_skip_end_slot; ++slot) {
+      if (!skipped_slots.contains(slot)) {
+        return td::Status::Error(PSTRING() << "forced never-notarize window missed Skip certificate for slot " << slot
+                                           << "; observed skip slots=" << skipped_slots);
+      }
+    }
+    return td::Status::Error(PSTRING() << "forced never-notarize window expected " << forced_skip_slot_count
+                                       << " skipped slots but observed " << skipped_slots.size());
+  }
+
+  for (const auto& record : snapshot.protocol_certificates) {
+    td::uint32 slot = vote_slot(record.vote);
+    if (slot < forced_skip_start_slot || slot >= forced_skip_end_slot) {
+      continue;
+    }
+    if (is_notar_or_final_vote(record.vote)) {
+      return td::Status::Error(PSTRING() << "forced never-notarize window still produced "
+                                         << vote_trace_key(record.vote) << " certificate at slot " << slot);
+    }
+  }
+  for (const auto& record : snapshot.notarizations_observed) {
+    if (record.id.slot >= forced_skip_start_slot && record.id.slot < forced_skip_end_slot) {
+      return td::Status::Error(PSTRING() << "validator #" << record.node_idx << "." << record.instance_idx
+                                         << " still observed notarization in forced skip slot " << record.id.slot);
+    }
+  }
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.id.slot >= forced_skip_start_slot && record.id.slot < forced_skip_end_slot) {
+      return td::Status::Error(PSTRING() << "validator #" << record.node_idx << "." << record.instance_idx
+                                         << " still observed finalization in forced skip slot " << record.id.slot);
+    }
+  }
+
+  for (size_t node_idx : cohort_handoff_forced_skip_always_online_nodes()) {
+    bool saw_skip_vote = false;
+    bool saw_post_window_notar_or_final_vote = false;
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx != node_idx || record.src_instance_idx != 0 || record.ts <= phase2_start_ts + 1e-9 ||
+          record.ts + 1e-9 >= phase2_end_ts) {
+        continue;
+      }
+      td::uint32 slot = vote_slot(record.vote);
+      if (slot >= forced_skip_start_slot && slot < forced_skip_end_slot) {
+        if (is_notar_or_final_vote(record.vote)) {
+          return td::Status::Error(PSTRING() << "always-online validator #" << node_idx
+                                             << ".0 still emitted Notar/Final during forced skip slot " << slot);
+        }
+        if (is_skip_vote(record.vote)) {
+          saw_skip_vote = true;
+        }
+      }
+      if (slot >= recovery_target_slot && is_notar_or_final_vote(record.vote)) {
+        saw_post_window_notar_or_final_vote = true;
+      }
+    }
+    if (!saw_skip_vote) {
+      return td::Status::Error(PSTRING() << "always-online validator #" << node_idx
+                                         << ".0 emitted no Skip vote during the forced never-notarize window");
+    }
+    if (!saw_post_window_notar_or_final_vote) {
+      return td::Status::Error(PSTRING() << "always-online validator #" << node_idx
+                                         << ".0 never resumed Notar/Final voting after forced skip recovery slot "
+                                         << recovery_target_slot);
+    }
+  }
+
+  bool saw_recovered_finalization_on_anchor = false;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+        record.id.slot >= recovery_target_slot) {
+      saw_recovered_finalization_on_anchor = true;
+      break;
+    }
+  }
+  if (!saw_recovered_finalization_on_anchor) {
+    return td::Status::Error(PSTRING() << "always-online validator #0.0 never observed finalization at or past slot "
+                                       << recovery_target_slot << " after the forced skip window");
+  }
+
+  for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+    bool saw_post_window_vote = false;
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+          record.ts + 1e-9 < phase2_end_ts && vote_slot(record.vote) >= recovery_target_slot &&
+          is_notar_or_final_vote(record.vote)) {
+        saw_post_window_vote = true;
+        break;
+      }
+    }
+    if (!saw_post_window_vote) {
+      return td::Status::Error(PSTRING() << rejoined_description << " validator #" << node_idx
+                                         << ".0 emitted no post-window Notar/Final vote");
+    }
+
+    bool saw_post_window_finalization = false;
+    for (const auto& record : snapshot.finalizations_observed) {
+      if (record.node_idx == node_idx && record.instance_idx == 0 && record.ts > phase2_start_ts + 1e-9 &&
+          record.id.slot >= recovery_target_slot) {
+        saw_post_window_finalization = true;
+        break;
+      }
+    }
+    if (!saw_post_window_finalization) {
+      return td::Status::Error(PSTRING() << rejoined_description << " validator #" << node_idx
+                                         << ".0 never observed post-window finalization at slot "
+                                         << recovery_target_slot);
+    }
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_offline_cohort_network_handoff_forced_skip_window_still_finalizes(const TraceSnapshot& snapshot) {
+  // Covers a 10-validator online-cohort handoff under pure network isolation:
+  // - validators {0,1,2,3} stay online throughout
+  // - cohort A = {4,5,6} is network-disabled first, but validator #0 must still accept 30 more blocks
+  // - then A is re-enabled and cohort B = {7,8,9} is disabled immediately, with no grace period
+  // - from the first post-switch slot that is not already in flight, validators {0,1,2,3} suppress
+  //   Notar/Final traffic for 100 slots so the network must progress only via Skip certificates
+  // - once that forced skip window ends, finalization must recover and the rejoined A validators
+  //   must resume steady-state Notar/Final work and later observe a distant finalized slot again
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> target_seqno;
+  std::optional<td::uint32> forced_skip_start_slot;
+  std::optional<td::uint32> recovery_target_slot;
+  size_t forced_skip_slot_count = 0;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    target_seqno = test_expectations.cohort_handoff_phase1_target_seqno;
+    forced_skip_start_slot = test_expectations.cohort_handoff_forced_skip_start_slot;
+    forced_skip_slot_count = test_expectations.cohort_handoff_forced_skip_slot_count;
+    recovery_target_slot = test_expectations.cohort_handoff_forced_skip_recovery_slot;
+  }
+  if (!target_seqno.has_value()) {
+    return td::Status::Error("scenario did not register the phase-1 forced-skip handoff target seqno");
+  }
+  if (!forced_skip_start_slot.has_value() || forced_skip_slot_count == 0) {
+    return td::Status::Error("scenario did not register the forced never-notarize skip window");
+  }
+  if (!recovery_target_slot.has_value()) {
+    return td::Status::Error("scenario did not register the post-window recovery slot");
+  }
+
+  std::map<size_t, double> disable_ts_by_first_cohort;
+  std::map<size_t, double> reenable_ts_by_first_cohort;
+  std::map<size_t, double> disable_ts_by_second_cohort;
+  std::map<size_t, double> reenable_ts_by_second_cohort;
+
+  for (const auto& record : snapshot.network_toggles) {
+    for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (record.disabled && !disable_ts_by_first_cohort.contains(node_idx)) {
+        disable_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+      if (!record.disabled && disable_ts_by_first_cohort.contains(node_idx) &&
+          !reenable_ts_by_first_cohort.contains(node_idx)) {
+        reenable_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+    }
+    for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (record.disabled && !disable_ts_by_second_cohort.contains(node_idx)) {
+        disable_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+      if (!record.disabled && disable_ts_by_second_cohort.contains(node_idx) &&
+          !reenable_ts_by_second_cohort.contains(node_idx)) {
+        reenable_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+    }
+  }
+
+  double phase1_start_ts = 0.0;
+  double phase1_end_ts = std::numeric_limits<double>::infinity();
+  double latest_reenable_ts = 0.0;
+  for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+    auto disable_it = disable_ts_by_first_cohort.find(node_idx);
+    auto reenable_it = reenable_ts_by_first_cohort.find(node_idx);
+    if (disable_it == disable_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not disable first forced-skip cohort node #" << node_idx);
+    }
+    if (reenable_it == reenable_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not re-enable first forced-skip cohort node #" << node_idx);
+    }
+    if (reenable_it->second <= disable_it->second) {
+      return td::Status::Error(PSTRING() << "forced-skip cohort-A node #" << node_idx
+                                         << " has invalid disable/re-enable ordering");
+    }
+    phase1_start_ts = std::max(phase1_start_ts, disable_it->second);
+    phase1_end_ts = std::min(phase1_end_ts, reenable_it->second);
+    latest_reenable_ts = std::max(latest_reenable_ts, reenable_it->second);
+  }
+  if (!std::isfinite(phase1_end_ts) || phase1_end_ts <= phase1_start_ts) {
+    return td::Status::Error("scenario did not create a valid interval where the whole first forced-skip cohort was offline");
+  }
+
+  double earliest_second_disable_ts = std::numeric_limits<double>::infinity();
+  double phase2_start_ts = 0.0;
+  double phase2_end_ts = std::numeric_limits<double>::infinity();
+  for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+    auto disable_it = disable_ts_by_second_cohort.find(node_idx);
+    if (disable_it == disable_ts_by_second_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not disable second forced-skip cohort node #" << node_idx);
+    }
+    earliest_second_disable_ts = std::min(earliest_second_disable_ts, disable_it->second);
+    phase2_start_ts = std::max(phase2_start_ts, disable_it->second);
+    if (auto reenable_it = reenable_ts_by_second_cohort.find(node_idx);
+        reenable_it != reenable_ts_by_second_cohort.end()) {
+      phase2_end_ts = std::min(phase2_end_ts, reenable_it->second);
+    }
+  }
+  if (earliest_second_disable_ts + 1e-9 < latest_reenable_ts) {
+    return td::Status::Error("scenario disabled the second forced-skip cohort before the first cohort fully rejoined");
+  }
+  if (phase2_end_ts <= phase2_start_ts + 1e-9) {
+    return td::Status::Error("scenario did not leave any pure forced-skip handoff interval before restoring cohort B");
+  }
+
+  TRY_STATUS(verify_cohort_handoff_phase1_progress(snapshot, phase1_start_ts, phase1_end_ts, *target_seqno,
+                                                   "cohort A = {4,5,6} was offline"));
+  TRY_STATUS(verify_cohort_handoff_forced_skip_window_behavior(
+      snapshot, phase2_start_ts, phase2_end_ts, *forced_skip_start_slot, forced_skip_slot_count, *recovery_target_slot,
+      "rejoined cohort-A"));
+  return td::Status::OK();
+}
+
+td::Status verify_offline_cohort_restart_handoff_forced_skip_window_still_finalizes(const TraceSnapshot& snapshot) {
+  // Covers the same 10-validator handoff, but with real stop/start instead of pure network isolation:
+  // - validators {0,1,2,3} stay online throughout
+  // - cohort A = {4,5,6} is fully stopped first, and validator #0 must still accept 30 more blocks
+  // - then A is started again and cohort B = {7,8,9} is stopped immediately, with no sync grace period
+  // - from the first post-switch slot that is not already in flight, validators {0,1,2,3} suppress
+  //   Notar/Final traffic for 100 slots, so only Skip certificates may form during that window
+  // - once the forced skip window ends, finalization must recover, restarted A validators must
+  //   resume Notar/Final work, and stopped B validators must stay completely quiescent until cleanup
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> target_seqno;
+  std::optional<td::uint32> forced_skip_start_slot;
+  std::optional<td::uint32> recovery_target_slot;
+  size_t forced_skip_slot_count = 0;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    target_seqno = test_expectations.cohort_handoff_phase1_target_seqno;
+    forced_skip_start_slot = test_expectations.cohort_handoff_forced_skip_start_slot;
+    forced_skip_slot_count = test_expectations.cohort_handoff_forced_skip_slot_count;
+    recovery_target_slot = test_expectations.cohort_handoff_forced_skip_recovery_slot;
+  }
+  if (!target_seqno.has_value()) {
+    return td::Status::Error("scenario did not register the phase-1 forced-skip restart target seqno");
+  }
+  if (!forced_skip_start_slot.has_value() || forced_skip_slot_count == 0) {
+    return td::Status::Error("scenario did not register the forced never-notarize restart window");
+  }
+  if (!recovery_target_slot.has_value()) {
+    return td::Status::Error("scenario did not register the post-window restart recovery slot");
+  }
+
+  std::map<size_t, double> stop_ts_by_first_cohort;
+  std::map<size_t, double> start_ts_by_first_cohort;
+  std::map<size_t, double> stop_ts_by_second_cohort;
+  std::map<size_t, double> restart_ts_by_second_cohort;
+
+  for (const auto& record : snapshot.lifecycle) {
+    for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (!record.started && !stop_ts_by_first_cohort.contains(node_idx)) {
+        stop_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+      if (record.started && stop_ts_by_first_cohort.contains(node_idx) &&
+          !start_ts_by_first_cohort.contains(node_idx)) {
+        start_ts_by_first_cohort.emplace(node_idx, record.ts);
+      }
+    }
+    for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+      if (record.node_idx != node_idx || record.instance_idx != 0) {
+        continue;
+      }
+      if (!record.started && !stop_ts_by_second_cohort.contains(node_idx)) {
+        stop_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+      if (record.started && stop_ts_by_second_cohort.contains(node_idx) &&
+          !restart_ts_by_second_cohort.contains(node_idx)) {
+        restart_ts_by_second_cohort.emplace(node_idx, record.ts);
+      }
+    }
+  }
+
+  double phase1_start_ts = 0.0;
+  double phase1_end_ts = std::numeric_limits<double>::infinity();
+  double latest_restart_ts = 0.0;
+  for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+    auto stop_it = stop_ts_by_first_cohort.find(node_idx);
+    auto start_it = start_ts_by_first_cohort.find(node_idx);
+    if (stop_it == stop_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not stop first forced-skip restart cohort node #"
+                                         << node_idx);
+    }
+    if (start_it == start_ts_by_first_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not restart first forced-skip restart cohort node #"
+                                         << node_idx);
+    }
+    if (start_it->second <= stop_it->second) {
+      return td::Status::Error(PSTRING() << "forced-skip restart cohort-A node #" << node_idx
+                                         << " has invalid stop/start ordering");
+    }
+    phase1_start_ts = std::max(phase1_start_ts, stop_it->second);
+    phase1_end_ts = std::min(phase1_end_ts, start_it->second);
+    latest_restart_ts = std::max(latest_restart_ts, start_it->second);
+  }
+  if (!std::isfinite(phase1_end_ts) || phase1_end_ts <= phase1_start_ts) {
+    return td::Status::Error(
+        "scenario did not create a valid interval where the whole first forced-skip restart cohort was stopped");
+  }
+
+  double earliest_second_stop_ts = std::numeric_limits<double>::infinity();
+  double phase2_start_ts = 0.0;
+  double phase2_end_ts = std::numeric_limits<double>::infinity();
+  for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+    auto stop_it = stop_ts_by_second_cohort.find(node_idx);
+    if (stop_it == stop_ts_by_second_cohort.end()) {
+      return td::Status::Error(PSTRING() << "scenario did not stop second forced-skip restart cohort node #"
+                                         << node_idx);
+    }
+    earliest_second_stop_ts = std::min(earliest_second_stop_ts, stop_it->second);
+    phase2_start_ts = std::max(phase2_start_ts, stop_it->second);
+    if (auto restart_it = restart_ts_by_second_cohort.find(node_idx); restart_it != restart_ts_by_second_cohort.end()) {
+      phase2_end_ts = std::min(phase2_end_ts, restart_it->second);
+    }
+  }
+  if (earliest_second_stop_ts + 1e-9 < latest_restart_ts) {
+    return td::Status::Error("scenario stopped the second forced-skip cohort before the first cohort fully restarted");
+  }
+  if (phase2_end_ts <= phase2_start_ts + 1e-9) {
+    return td::Status::Error(
+        "scenario did not leave any pure forced-skip restart interval before restoring cohort B");
+  }
+
+  TRY_STATUS(verify_cohort_handoff_phase1_progress(snapshot, phase1_start_ts, phase1_end_ts, *target_seqno,
+                                                   "cohort A = {4,5,6} was stopped"));
+  TRY_STATUS(verify_cohort_handoff_forced_skip_window_behavior(
+      snapshot, phase2_start_ts, phase2_end_ts, *forced_skip_start_slot, forced_skip_slot_count, *recovery_target_slot,
+      "restarted cohort-A"));
+
+  for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+    double stop_ts = stop_ts_by_second_cohort[node_idx];
+    double restart_ts = restart_ts_by_second_cohort.contains(node_idx) ? restart_ts_by_second_cohort[node_idx]
+                                                                       : std::numeric_limits<double>::infinity();
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped forced-skip cohort-B validator #" << node_idx
+                                           << ".0 still emitted a vote after stop");
+      }
+    }
+    for (const auto& record : snapshot.protocol_certificates) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped forced-skip cohort-B validator #" << node_idx
+                                           << ".0 still emitted a certificate after stop");
+      }
+    }
+    for (const auto& record : snapshot.candidate_deliveries) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped forced-skip cohort-B validator #" << node_idx
+                                           << ".0 still delivered a candidate after stop");
+      }
+    }
+    for (const auto& record : snapshot.overlay_requests) {
+      if (record.src_node_idx == node_idx && record.src_instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped forced-skip cohort-B validator #" << node_idx
+                                           << ".0 still sent an overlay request after stop");
+      }
+    }
+    for (const auto& record : snapshot.accepted_blocks) {
+      if (record.node_idx == node_idx && record.instance_idx == 0 && record.ts > stop_ts + 1e-9 &&
+          record.ts + 1e-9 < restart_ts) {
+        return td::Status::Error(PSTRING() << "stopped forced-skip cohort-B validator #" << node_idx
+                                           << ".0 still accepted a block after stop");
+      }
+    }
+  }
+
+  return td::Status::OK();
+}
+
 td::Status verify_standstill_with_byzantine_withholding_still_recovers(const TraceSnapshot& snapshot) {
   // Covers C5/C9/C11 from the adversarial plan:
   // one Byzantine validator withholds throughout, one honest validator disappears long enough to
@@ -3933,6 +4448,10 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_offline_cohort_network_handoff_still_finalizes(snapshot);
     case TestCase::OfflineCohortRestartHandoffStillFinalizes:
       return verify_offline_cohort_restart_handoff_still_finalizes(snapshot);
+    case TestCase::OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes:
+      return verify_offline_cohort_network_handoff_forced_skip_window_still_finalizes(snapshot);
+    case TestCase::OfflineCohortRestartHandoffForcedSkipWindowStillFinalizes:
+      return verify_offline_cohort_restart_handoff_forced_skip_window_still_finalizes(snapshot);
   }
   UNREACHABLE();
 }
@@ -5283,6 +5802,30 @@ class TestConsensus : public td::actor::Actor {
     co_return td::Unit{};
   }
 
+  td::actor::Task<> set_never_notarize_for_test(std::vector<size_t> src_node_indices, td::uint32 start_slot,
+                                                td::uint32 end_slot) {
+    std::scoped_lock lock(test_message_filters_mutex);
+    std::vector<size_t> dst_node_indices;
+    dst_node_indices.reserve(N_NODES);
+    for (size_t node_idx = 0; node_idx < N_NODES; ++node_idx) {
+      dst_node_indices.push_back(node_idx);
+    }
+    for (size_t src_node_idx : src_node_indices) {
+      for (auto kind : {TestMessageFilters::ProtocolKind::NotarVote, TestMessageFilters::ProtocolKind::NotarCert,
+                        TestMessageFilters::ProtocolKind::FinalVote, TestMessageFilters::ProtocolKind::FinalCert}) {
+        test_message_filters.protocol_drop_rules.push_back(TestMessageFilters::ProtocolDropRule{
+            .src_node_idx = src_node_idx,
+            .src_instance_idx = 0,
+            .dst_node_indices = {dst_node_indices.begin(), dst_node_indices.end()},
+            .start_slot = start_slot,
+            .end_slot = end_slot,
+            .kind = kind,
+        });
+      }
+    }
+    co_return td::Unit{};
+  }
+
   td::actor::Task<> set_drop_candidates_for_test(size_t dst_node_idx, td::uint32 start_slot, td::uint32 end_slot) {
     std::scoped_lock lock(test_message_filters_mutex);
     test_message_filters.candidate_drop_rules.push_back(TestMessageFilters::CandidateDropRule{
@@ -5418,6 +5961,18 @@ class TestConsensus : public td::actor::Actor {
   td::actor::Task<> set_delayed_finalization_release_ts_for_test(double ts) {
     std::scoped_lock lock(test_expectations_mutex);
     test_expectations.delayed_finalization_release_ts = ts;
+    co_return td::Unit{};
+  }
+
+  td::actor::Task<> set_cohort_handoff_forced_skip_expectations_for_test(td::uint32 target_seqno,
+                                                                         td::uint32 forced_skip_start_slot,
+                                                                         size_t forced_skip_slot_count,
+                                                                         td::uint32 recovery_target_slot) {
+    std::scoped_lock lock(test_expectations_mutex);
+    test_expectations.cohort_handoff_phase1_target_seqno = target_seqno;
+    test_expectations.cohort_handoff_forced_skip_start_slot = forced_skip_start_slot;
+    test_expectations.cohort_handoff_forced_skip_slot_count = forced_skip_slot_count;
+    test_expectations.cohort_handoff_forced_skip_recovery_slot = recovery_target_slot;
     co_return td::Unit{};
   }
 
@@ -5777,6 +6332,33 @@ class TestConsensus : public td::actor::Actor {
         FIRST_BLOCK_MAX_TIMEOUT = std::chrono::milliseconds{200};
       }
       NODE_WEIGHTS_OVERRIDE = {15, 11, 11, 11, 11, 11, 11, 11, 11};
+    }
+    if (TEST_CASE == TestCase::OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes ||
+        TEST_CASE == TestCase::OfflineCohortRestartHandoffForcedSkipWindowStillFinalizes) {
+      if (N_NODES == 8) {
+        N_NODES = 10;
+      }
+      if (TARGET_RATE_MS == 1000) {
+        TARGET_RATE_MS = 50;
+      }
+      if (SLOTS_PER_LEADER_WINDOW == 4) {
+        SLOTS_PER_LEADER_WINDOW = 1;
+      }
+      if (DURATION == 60.0) {
+        DURATION = 8.0;
+      }
+      if (NET_PING == std::pair<double, double>{0.05, 0.1}) {
+        NET_PING = {0.005, 0.01};
+      }
+      if (FIRST_BLOCK_TIMEOUT == std::chrono::milliseconds{1000}) {
+        FIRST_BLOCK_TIMEOUT = std::chrono::milliseconds{100};
+      }
+      if (FIRST_BLOCK_TIMEOUT_MULTIPLIER == 1.05) {
+        FIRST_BLOCK_TIMEOUT_MULTIPLIER = 1.2;
+      }
+      if (FIRST_BLOCK_MAX_TIMEOUT == std::chrono::milliseconds{100'000}) {
+        FIRST_BLOCK_MAX_TIMEOUT = std::chrono::milliseconds{200};
+      }
     }
     if (TEST_CASE == TestCase::StandstillWithByzantineWithholdingStillRecovers) {
       if (N_NODES == 8) {
@@ -6178,6 +6760,30 @@ class TestConsensus : public td::actor::Actor {
                                           << " on validator #" << node_idx << "." << instance_idx);
   }
 
+  td::actor::Task<> wait_for_skip_certificates_in_range(td::uint32 start_slot, size_t slot_count, double timeout_s) {
+    td::Timestamp deadline = td::Timestamp::in(timeout_s);
+    td::uint32 end_slot = start_slot + static_cast<td::uint32>(slot_count);
+    while (!deadline.is_in_past()) {
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      auto skipped_slots = skip_certificate_slots_in_range(snapshot, start_slot, end_slot);
+      if (skipped_slots.size() == slot_count) {
+        bool complete = true;
+        for (td::uint32 slot = start_slot; slot < end_slot; ++slot) {
+          if (!skipped_slots.contains(slot)) {
+            complete = false;
+            break;
+          }
+        }
+        if (complete) {
+          co_return td::Unit{};
+        }
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+    }
+    co_return td::Status::Error(PSTRING() << "timeout waiting for Skip certificates on slot range ["
+                                          << start_slot << ", " << end_slot << ")");
+  }
+
   td::actor::Task<> wait_for_candidate_resolved_on(size_t node_idx, size_t instance_idx, CandidateId id,
                                                    double timeout_s) {
     td::Timestamp deadline = td::Timestamp::in(timeout_s);
@@ -6225,7 +6831,9 @@ class TestConsensus : public td::actor::Actor {
            TEST_CASE == TestCase::StandstillFloodStillRecovers ||
            TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery ||
            TEST_CASE == TestCase::OfflineCohortNetworkHandoffStillFinalizes ||
-           TEST_CASE == TestCase::OfflineCohortRestartHandoffStillFinalizes;
+           TEST_CASE == TestCase::OfflineCohortRestartHandoffStillFinalizes ||
+           TEST_CASE == TestCase::OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes ||
+           TEST_CASE == TestCase::OfflineCohortRestartHandoffForcedSkipWindowStillFinalizes;
   }
 
   td::actor::Task<> run_test_case_scenario() {
@@ -6949,6 +7557,114 @@ class TestConsensus : public td::actor::Actor {
       co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
       co_return td::Unit{};
     }
+    if (TEST_CASE == TestCase::OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes) {
+      // Covers the harder 10-validator cohort handoff under pure network isolation:
+      // - validators {0,1,2,3} stay online for the whole run
+      // - cohort A = {4,5,6} is network-disabled first, but validator #0 must still accept 30 more blocks
+      // - then A is re-enabled and cohort B = {7,8,9} is disabled immediately, with no grace period
+      // - from the first post-switch slot that is not already in flight, validators {0,1,2,3}
+      //   run in a test-only never-notarize mode for 100 slots, so the network must clear purely by Skip
+      // - once that window finishes, never-notarize is removed and the network must return to finalization
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 target_seqno =
+          highest_accepted_seqno_on(snapshot, 0, 0) + COHORT_HANDOFF_FORCED_SKIP_PHASE1_BLOCK_DELTA;
+
+      co_await clear_traces();
+      for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, true);
+      }
+      co_await wait_for_accepted_block_seqno_on(0, 0, target_seqno, 25.0);
+
+      for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, false);
+      }
+      for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, true);
+      }
+
+      snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 forced_skip_start_slot = highest_observed_slot(snapshot) + 1;
+      td::uint32 recovery_target_slot =
+          forced_skip_start_slot + COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT + COHORT_HANDOFF_FORCED_SKIP_RECOVERY_SLOT_DELTA;
+      co_await set_cohort_handoff_forced_skip_expectations_for_test(
+          target_seqno, forced_skip_start_slot, COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT, recovery_target_slot);
+
+      co_await set_never_notarize_for_test(cohort_handoff_forced_skip_always_online_nodes(), forced_skip_start_slot,
+                                           forced_skip_start_slot + COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT);
+      co_await wait_for_skip_certificates_in_range(forced_skip_start_slot, COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT,
+                                                   COHORT_HANDOFF_FORCED_SKIP_TIMEOUT_S);
+      co_await clear_test_message_filters();
+
+      std::vector<td::actor::Task<>> recovery_tasks;
+      recovery_tasks.push_back(
+          wait_for_finalization_past_slot_on(0, 0, recovery_target_slot - 1, COHORT_HANDOFF_FORCED_SKIP_RECOVERY_TIMEOUT_S));
+      for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+        recovery_tasks.push_back(wait_for_finalization_past_slot_on(
+            node_idx, 0, recovery_target_slot - 1, COHORT_HANDOFF_FORCED_SKIP_RECOVERY_TIMEOUT_S));
+      }
+      co_await td::actor::all(std::move(recovery_tasks));
+
+      for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+        co_await set_instance_network_disabled_for_test(node_idx, 0, false);
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::OfflineCohortRestartHandoffForcedSkipWindowStillFinalizes) {
+      // Covers the same harder 10-validator handoff, but with real stop/start instead of pure link cuts:
+      // - validators {0,1,2,3} stay online for the whole run
+      // - cohort A = {4,5,6} is fully stopped first, but validator #0 must still accept 30 more blocks
+      // - then A is restarted and cohort B = {7,8,9} is stopped immediately, with no sync grace period
+      // - from the first post-switch slot that is not already in flight, validators {0,1,2,3}
+      //   run in a test-only never-notarize mode for 100 slots, forcing a pure Skip window
+      // - once that window finishes, never-notarize is removed and finalization must recover again
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 target_seqno =
+          highest_accepted_seqno_on(snapshot, 0, 0) + COHORT_HANDOFF_FORCED_SKIP_PHASE1_BLOCK_DELTA;
+
+      co_await clear_traces();
+      for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+        co_await stop_instance(node_idx, 0);
+      }
+      co_await wait_for_accepted_block_seqno_on(0, 0, target_seqno, 25.0);
+
+      for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+        start_instance(node_idx, 0);
+      }
+      for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+        co_await stop_instance(node_idx, 0);
+      }
+
+      snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 forced_skip_start_slot = highest_observed_slot(snapshot) + 1;
+      td::uint32 recovery_target_slot =
+          forced_skip_start_slot + COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT + COHORT_HANDOFF_FORCED_SKIP_RECOVERY_SLOT_DELTA;
+      co_await set_cohort_handoff_forced_skip_expectations_for_test(
+          target_seqno, forced_skip_start_slot, COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT, recovery_target_slot);
+
+      co_await set_never_notarize_for_test(cohort_handoff_forced_skip_always_online_nodes(), forced_skip_start_slot,
+                                           forced_skip_start_slot + COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT);
+      co_await wait_for_skip_certificates_in_range(forced_skip_start_slot, COHORT_HANDOFF_FORCED_SKIP_SLOT_COUNT,
+                                                   COHORT_HANDOFF_FORCED_SKIP_TIMEOUT_S);
+      co_await clear_test_message_filters();
+
+      std::vector<td::actor::Task<>> recovery_tasks;
+      recovery_tasks.push_back(
+          wait_for_finalization_past_slot_on(0, 0, recovery_target_slot - 1, COHORT_HANDOFF_FORCED_SKIP_RECOVERY_TIMEOUT_S));
+      for (size_t node_idx : cohort_handoff_forced_skip_first_offline_nodes()) {
+        recovery_tasks.push_back(wait_for_finalization_past_slot_on(
+            node_idx, 0, recovery_target_slot - 1, COHORT_HANDOFF_FORCED_SKIP_RECOVERY_TIMEOUT_S));
+      }
+      co_await td::actor::all(std::move(recovery_tasks));
+
+      for (size_t node_idx : cohort_handoff_forced_skip_second_offline_nodes()) {
+        start_instance(node_idx, 0);
+      }
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
+      co_return td::Unit{};
+    }
     if (TEST_CASE == TestCase::StandstillWithByzantineWithholdingStillRecovers) {
       // Covers the adversarial plan's standstill recovery case:
       // node #1 withholds for the whole run, node #2 disappears long enough to break quorum, and
@@ -7397,6 +8113,14 @@ class TestConsensus : public td::actor::Actor {
         start_instance(idx, i);
       }
     }
+    if (NEVER_NOTARIZE) {
+      std::vector<size_t> node_indices;
+      node_indices.reserve(N_NODES);
+      for (size_t node_idx = 0; node_idx < N_NODES; ++node_idx) {
+        node_indices.push_back(node_idx);
+      }
+      co_await set_never_notarize_for_test(node_indices, 0, std::numeric_limits<td::uint32>::max());
+    }
 
     if (GREMLIN_PERIOD.first >= 0.0) {
       run_gremlin().start().detach();
@@ -7820,6 +8544,8 @@ int main(int argc, char* argv[]) {
                          }
                          return td::Status::OK();
                        });
+  p.add_option('\0', "never-notarize", "drop Notar/Final traffic for every validator from slot 0",
+               [&]() { NEVER_NOTARIZE = true; });
   p.add_checked_option('\0', "test-case", "named consensus assertion to run (default: smoke)", [&](td::Slice arg) {
     TRY_RESULT_ASSIGN(TEST_CASE, parse_test_case(arg));
     return td::Status::OK();
