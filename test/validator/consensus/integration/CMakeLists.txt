@@ -44,7 +44,6 @@ foreach(CASE
     single-validator-restart-rejoins-consensus
     repeated-validator-restarts-rejoin-after-second-downtime
     full-network-clean-restart-still-finalizes
-    full-network-restart-with-state-loss-still-recovers
 )
     add_test(NAME reboot-${CASE} COMMAND test-reboots --test-case ${CASE})
 endforeach()

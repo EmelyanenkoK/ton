@@ -25,6 +25,7 @@ TestOverlay::NodeSlot& TestOverlay::get_node(size_t idx) {
 void TestOverlay::register_node(size_t idx, td::actor::ActorId<TestOverlayNode> node) {
   auto& slot = get_node(idx);
   CHECK(slot.actor.empty());
+  slot.generation++;
   slot.actor = std::move(node);
 }
 
@@ -55,21 +56,23 @@ td::actor::Task<> TestOverlay::before_receive(size_t src_idx, size_t dst_idx, bo
 }
 
 td::actor::Task<> TestOverlay::send_message(PeerValidator src, size_t dst_idx, td::BufferSlice message) {
+  td::uint64 expected_generation = get_node(dst_idx).generation;
   co_await before_receive(src.idx.value(), dst_idx, false);
   auto& node = get_node(dst_idx);
-  if (!node.actor.empty() && !node.disabled) {
+  if (!node.actor.empty() && !node.disabled && node.generation == expected_generation) {
     td::actor::send_closure(node.actor, &TestOverlayNode::receive_message, src, std::move(message));
   }
   co_return td::Unit{};
 }
 
 td::actor::Task<> TestOverlay::send_candidate(PeerValidator src, size_t dst_idx, CandidateRef candidate) {
+  td::uint64 expected_generation = get_node(dst_idx).generation;
   co_await before_receive(src.idx.value(), dst_idx, true);
   if (should_drop_candidate_delivery(filters_, src.idx.value(), dst_idx, candidate)) {
     co_return td::Unit{};
   }
   auto& node = get_node(dst_idx);
-  if (!node.actor.empty() && !node.disabled) {
+  if (!node.actor.empty() && !node.disabled && node.generation == expected_generation) {
     if (!trace_sink_.empty()) {
       td::actor::send_closure(trace_sink_, &TraceSink::record_candidate_delivery, src.idx.value(),
                               CandidateDelivered{
@@ -88,13 +91,19 @@ td::actor::Task<> TestOverlay::send_candidate(PeerValidator src, size_t dst_idx,
 
 td::actor::Task<td::BufferSlice> TestOverlay::send_query(PeerValidator src, size_t dst_idx, td::BufferSlice message) {
   td::BufferSlice request_copy = message.clone();
+  td::uint64 dst_generation = get_node(dst_idx).generation;
+  td::uint64 src_generation = get_node(src.idx.value()).generation;
   co_await before_receive(src.idx.value(), dst_idx, true);
   auto& node = get_node(dst_idx);
-  if (node.actor.empty() || node.disabled) {
+  if (node.actor.empty() || node.disabled || node.generation != dst_generation) {
     co_return td::Status::Error("instance is stopped/disabled");
   }
   auto response = co_await td::actor::ask(node.actor, &TestOverlayNode::receive_query, src, std::move(message));
   co_await before_receive(dst_idx, src.idx.value(), true);
+  auto& src_node = get_node(src.idx.value());
+  if (src_node.actor.empty() || src_node.disabled || src_node.generation != src_generation) {
+    co_return td::Status::Error("requester restarted before response delivery");
+  }
   if (auto tampered = maybe_make_malformed_candidate_response(filters_, src.idx.value(), dst_idx,
                                                               request_copy.as_slice(), response.as_slice());
       tampered.has_value()) {

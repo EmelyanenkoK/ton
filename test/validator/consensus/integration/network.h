@@ -45,6 +45,7 @@ class TestOverlay : public td::actor::Actor {
   struct NodeSlot {
     td::actor::ActorId<TestOverlayNode> actor;
     bool disabled = false;
+    td::uint64 generation = 0;
   };
   std::vector<NodeSlot> nodes_;
   td::actor::ActorId<TraceSink> trace_sink_;

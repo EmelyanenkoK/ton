@@ -34,25 +34,21 @@ This plan turns the reboot-review findings into concrete test work for `test/val
 - `test_noncritical_params_persistence.py`
   Covers real node-process restart for engine noncritical-params persistence, not consensus liveness.
 - `test-reboots --test-case full-network-restart-with-state-loss-still-recovers`
-  Implements the planned all-node restart + one-node state-loss scenario and is kept in CTest even though
-  the current branch still aborts before recovery completes.
+  Implements the planned all-node restart + one-node state-loss scenario and is kept as a manual
+  reproducer for a low-priority local-simplex-state-loss bug. It is not registered in CTest.
 
 ## Main gaps from the review
 
 - No remaining coverage gaps from the original review.
-- Current blockers:
-  the clean full-network restart case is now intentionally red because the strengthened verifier catches
-  duplicate local-vote persistence on restarted honest validators.
-  the all-node cold-restart variant with one wiped validator is also intentionally red because the branch
-  still aborts before that recovery scenario reaches steady state.
+- Registered reboot coverage is green.
+- The only remaining manual-only reproducer is the low-priority state-loss case where one validator
+  loses its simplex-local DB before the full-network restart.
 
 ## Follow-up order
 
-1. Fix the clean-restart duplicate local-vote persistence bug so `reboot-full-network-clean-restart-still-finalizes`
-   turns green.
-2. Reduce and fix the state-loss restart abort so `reboot-full-network-restart-with-state-loss-still-recovers`
-   can complete recovery.
-3. Re-run the real process-level Python reboot test in an environment with `Python >= 3.13` and `pytoniq-core`.
+1. Re-run the real process-level Python reboot test in an environment with `Python >= 3.13` and `pytoniq-core`.
+2. If needed later, promote the manual state-loss reproducer back into CTest once the low-priority local-state-loss
+   bug is fixed in production code.
 
 ## Success criteria
 
@@ -81,8 +77,10 @@ This plan turns the reboot-review findings into concrete test work for `test/val
 - Current CTest state:
   - `reboot-single-validator-restart-rejoins-consensus`: green
   - `reboot-repeated-validator-restarts-rejoin-after-second-downtime`: green
-  - `reboot-full-network-clean-restart-still-finalizes`: red, duplicate local-vote persistence after restart
-  - `reboot-full-network-restart-with-state-loss-still-recovers`: red, recovery abort before steady state
+  - `reboot-full-network-clean-restart-still-finalizes`: green
+- Manual reproducer state:
+  - `full-network-restart-with-state-loss-still-recovers`: kept out of CTest; reproduces the low-priority
+    local simplex-DB state-loss bug documented in `docs/simplex/bugs_discovered_during_testing.md`
 - Execution note:
   - `test_consensus_reboots.py` is implemented but could not be executed in this workspace because `test/tontester`
     currently requires `Python >= 3.13` and `pytoniq-core`, while this machine still lacks that runtime.

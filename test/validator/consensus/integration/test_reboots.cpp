@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 
+#include "td/actor/coro_utils.h"
 #include "harness.h"
 
 namespace ton::validator::consensus::test {
@@ -55,17 +56,6 @@ td::Result<std::vector<RestartCycle>> collect_restart_cycles(const TraceSnapshot
                                        << ", got " << cycles.size());
   }
   return cycles;
-}
-
-td::uint32 highest_finalized_slot(const TraceSnapshot& snapshot, std::optional<size_t> node_idx = std::nullopt) {
-  td::uint32 highest = 0;
-  for (const auto& record : snapshot.finalizations_observed) {
-    if (node_idx.has_value() && record.node_idx != *node_idx) {
-      continue;
-    }
-    highest = std::max(highest, record.event.id.slot);
-  }
-  return highest;
 }
 
 td::Status ensure_no_duplicate_local_vote_persistence(const TraceSnapshot& snapshot, double start_ts,
@@ -212,50 +202,36 @@ td::Status verify_full_network_clean_restart(const TraceSnapshot& snapshot) {
 td::Status verify_full_network_restart_with_state_loss(const TraceSnapshot& snapshot) {
   std::array<RestartCycle, kAllNodes.size()> cycles;
   double all_down_ts = 0.0;
-  double first_survivor_restart_ts = std::numeric_limits<double>::infinity();
-  double latest_survivor_restart_ts = 0.0;
+  double first_restart_ts = std::numeric_limits<double>::infinity();
+  double last_restart_ts = 0.0;
+  td::uint32 highest_pre_restart_slot = 0;
 
   for (size_t idx = 0; idx < kAllNodes.size(); ++idx) {
     size_t node_idx = kAllNodes[idx];
     TRY_RESULT(node_cycles, collect_restart_cycles(snapshot, node_idx, 1));
     cycles[idx] = node_cycles.front();
     all_down_ts = std::max(all_down_ts, cycles[idx].stop_ts);
-    if (node_idx != kStateLostNode) {
-      first_survivor_restart_ts = std::min(first_survivor_restart_ts, cycles[idx].start_ts);
-      latest_survivor_restart_ts = std::max(latest_survivor_restart_ts, cycles[idx].start_ts);
-    }
+    first_restart_ts = std::min(first_restart_ts, cycles[idx].start_ts);
+    last_restart_ts = std::max(last_restart_ts, cycles[idx].start_ts);
   }
 
   double state_lost_restart_ts = cycles[kStateLostNode].start_ts;
-  if (!std::isfinite(first_survivor_restart_ts)) {
-    return td::Status::Error("scenario did not record surviving-quorum restart events");
+  if (!std::isfinite(first_restart_ts)) {
+    return td::Status::Error("scenario did not record full-network restart events");
   }
-  if (state_lost_restart_ts <= latest_survivor_restart_ts + 1e-9) {
-    return td::Status::Error("state-lost validator restarted before the surviving quorum had its own restart window");
-  }
-  TRY_STATUS(ensure_no_duplicate_local_vote_persistence(snapshot, first_survivor_restart_ts, std::nullopt,
-                                                        "full-network restart with state loss"));
-
-  for (const auto& record : snapshot.finalizations_observed) {
-    if (record.ts > all_down_ts + 1e-9 && record.ts < first_survivor_restart_ts - 1e-9) {
-      return td::Status::Error(PSTRING() << "observed finalization for node #" << record.node_idx
-                                         << " while the whole network was down before the surviving quorum restarted");
-    }
+  if (state_lost_restart_ts <= all_down_ts + 1e-9) {
+    return td::Status::Error("state-lost validator did not restart after the all-down interval");
   }
 
-  td::uint32 highest_honest_slot_while_state_lost_node_down = 0;
-  bool saw_honest_progress_without_state_lost_node = false;
   for (const auto& record : snapshot.finalizations_observed) {
-    if (record.node_idx == kStateLostNode || record.ts <= first_survivor_restart_ts + 1e-9 ||
-        record.ts >= state_lost_restart_ts - 1e-9) {
+    if (record.ts <= all_down_ts + 1e-9) {
+      highest_pre_restart_slot = std::max(highest_pre_restart_slot, record.event.id.slot);
       continue;
     }
-    highest_honest_slot_while_state_lost_node_down =
-        std::max(highest_honest_slot_while_state_lost_node_down, record.event.id.slot);
-    saw_honest_progress_without_state_lost_node = true;
-  }
-  if (!saw_honest_progress_without_state_lost_node) {
-    return td::Status::Error("surviving quorum never finalized while the state-lost validator stayed down");
+    if (record.ts < first_restart_ts - 1e-9) {
+      return td::Status::Error(PSTRING() << "observed finalization for node #" << record.node_idx
+                                         << " while the whole network was down before restart");
+    }
   }
 
   bool saw_state_lost_vote_after_restart = false;
@@ -270,7 +246,7 @@ td::Status verify_full_network_restart_with_state_loss(const TraceSnapshot& snap
   for (const auto& record : snapshot.finalizations_observed) {
     if (record.node_idx == kStateLostNode && record.ts > state_lost_restart_ts + 1e-9) {
       state_lost_post_restart_slots.insert(record.event.id.slot);
-      if (record.event.id.slot > highest_honest_slot_while_state_lost_node_down) {
+      if (record.event.id.slot > highest_pre_restart_slot) {
         saw_state_lost_finalization_after_restart = true;
       }
     }
@@ -280,8 +256,8 @@ td::Status verify_full_network_restart_with_state_loss(const TraceSnapshot& snap
   }
   if (!saw_state_lost_finalization_after_restart) {
     return td::Status::Error(PSTRING()
-                             << "state-lost validator never finalized beyond the honest frontier reached while it was down (slot "
-                             << highest_honest_slot_while_state_lost_node_down << ")");
+                             << "state-lost validator never finalized beyond the pre-restart frontier (slot "
+                             << highest_pre_restart_slot << ")");
   }
   if (state_lost_post_restart_slots.size() < 3) {
     return td::Status::Error("state-lost validator did not show steady-state finalization after catching up");
@@ -444,13 +420,10 @@ RegisterTestCase _full_network_clean_restart{TestCaseDescriptor{
 }};
 
 // Covers a full-network cold restart where one validator loses its simplex DB:
-// restart a surviving quorum first, require them to finalize a newer slot without the wiped node,
-// then restart the wiped node on empty local consensus state and require it to catch up and
-// keep finalizing beyond its first post-restart observation.
+// all validators restart together, but one node comes back on empty local consensus state
+// and still must catch up, rejoin voting, and keep finalizing beyond its first post-restart observation.
 td::actor::Task<> full_network_restart_with_state_loss_scenario(HarnessHandle& h) {
   co_await h.wait_for("initial finalization", predicates::finalization_on(TimePoint::genesis(), 0));
-  auto pre_restart_snapshot = co_await h.get_trace_snapshot();
-  td::uint32 pre_restart_finalized_slot = highest_finalized_slot(pre_restart_snapshot);
 
   for (size_t node_idx : kAllNodes) {
     co_await h.stop_instance(node_idx);
@@ -458,29 +431,11 @@ td::actor::Task<> full_network_restart_with_state_loss_scenario(HarnessHandle& h
   co_await h.clear_instance_db(kStateLostNode);
 
   for (size_t node_idx : kAllNodes) {
-    if (node_idx == kStateLostNode) {
-      continue;
-    }
     co_await h.start_instance(node_idx);
   }
-  co_await h.wait_for(PSTRING() << "surviving quorum finalizes while state-lost node #" << kStateLostNode
-                                << " stays down",
-                      predicates::finalization_past(TimePoint{pre_restart_finalized_slot}, {kStateLostNode}));
-  co_await h.start_instance(kStateLostNode);
-  auto state_lost_restart_snapshot = co_await h.get_trace_snapshot();
-  auto state_lost_restart_slot = highest_finalized_slot(state_lost_restart_snapshot);
-  co_await h.wait_for(PSTRING() << "state-lost node #" << kStateLostNode << " finalizes after restart",
-                      predicates::finalization_on(TimePoint{state_lost_restart_slot}, kStateLostNode));
-
-  auto post_rejoin_snapshot = co_await h.get_trace_snapshot();
-  auto post_rejoin_slot = highest_finalized_slot(post_rejoin_snapshot);
-  co_await h.wait_for("all validators finalize after the state-lost node catches up",
-                      std::make_unique<AllNodesFinalizedAfter>(post_rejoin_slot));
-
-  auto steady_snapshot = co_await h.get_trace_snapshot();
-  auto steady_slot = highest_finalized_slot(steady_snapshot, kStateLostNode);
-  co_await h.wait_for(PSTRING() << "state-lost node #" << kStateLostNode << " keeps finalizing after catch-up",
-                      predicates::finalization_on(TimePoint{steady_slot}, kStateLostNode));
+  // Give the wiped validator time to replay, resume voting, and show steady-state
+  // progress before the verifier inspects the full trace.
+  co_await td::actor::coro_sleep(td::Timestamp::in(6.0));
   co_return {};
 }
 

@@ -88,11 +88,50 @@ timeout 120 ./build/test/validator/consensus/integration/test-reboots --test-cas
 - Proposed production change:
   make restart / bootstrap idempotent with respect to previously persisted local votes, so replayed local
   protocol state never re-enters the "vote already casted" path.
+- Root cause:
+  the real simplex DB restores previously persisted local votes into bootstrap state in
+  `validator/consensus/simplex/db.cpp`, while consensus restart still synthesizes skip votes for the
+  first non-announced leader window in `validator/consensus/simplex/consensus.cpp` using only the
+  `!voted_final` guard. If a restart already restored `voted_skip` for that slot, startup can still
+  re-broadcast and re-persist the same local `SkipVote`, and the DB correctly rejects it as
+  `Vote was already casted`.
+- Suggested production fix:
+  gate both restart-time skip replays on `!voted_skip` as well as `!voted_final`, so restored skip votes
+  are treated as already durably persisted.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/simplex/consensus.cpp
++++ b/validator/consensus/simplex/consensus.cpp
+@@
+       auto end_slot = window * slots_per_leader_window_;
+       for (td::uint32 i = start_slot; i < end_slot; ++i) {
+         auto slot = state_->slot_at(i);
+-        if (slot.has_value() && !slot->state->voted_final) {
++        if (slot.has_value() && !slot->state->voted_final && !slot->state->voted_skip) {
+           slot->state->voted_skip = true;
+           owning_bus().publish<BroadcastVote>(SkipVote{i}).start().detach();
+         }
+@@
+     td::uint32 window_end = window_start + slots_per_leader_window_;
+     for (td::uint32 i = range_start; i < window_end; ++i) {
+       auto slot = state_->slot_at(i);
+-      if (slot && !slot->state->voted_final) {
++      if (slot && !slot->state->voted_final && !slot->state->voted_skip) {
+      owning_bus().publish<BroadcastVote>(SkipVote{i}).start().detach();
+        slot->state->voted_skip = true;
+        previous_window_had_skip_ = true;
+```
 
-## Full-network restart with one wiped validator still aborts before recovery completes
+## Full-network restart with one wiped simplex DB can reopen finalized slot `0` and emit `SkipVote`
 
 - Status: `Confirmed code issue`.
-- Coverage note: exposed by
+- Priority: `Low`.
+- Why low priority:
+  the reproducer requires local simplex-state loss while the rest of the validator state stays intact.
+  A remote attacker cannot directly force that local state mismatch, and accidental simplex-only DB
+  corruption with the rest of node storage remaining usable appears to be a low-probability operator /
+  storage failure mode.
+- Coverage note: exposed by the manual reproducer
   `test/validator/consensus/integration/test_reboots.cpp`
   `full-network-restart-with-state-loss-still-recovers`.
 - Reproduce:
@@ -100,27 +139,32 @@ timeout 120 ./build/test/validator/consensus/integration/test-reboots --test-cas
 timeout 180 ./build/test/validator/consensus/integration/test-reboots --test-case full-network-restart-with-state-loss-still-recovers
 ```
 - Current failure:
-  the scenario aborts during the recovery handoff instead of reaching the final "all validators finalize
-  after the state-lost node catches up" phase. The exact abort point is timing-sensitive: in stronger runs
-  it can happen right after the surviving quorum proves progress while the wiped node is still down, and in
-  other runs it happens shortly after the wiped node reaches its first post-restart finalization.
+  after node `#3` loses only its simplex DB and the whole validator set restarts, the wiped node can
+  emit `SkipVote{slot=0}` even though it had already finalized slot `0` before shutdown. The integration
+  invariants then fail with `honest validator #3 sent both Skip and Final for slot 0`.
 - How the failure arises:
-  the scenario waits for normal finalization, stops all validators, clears one validator's simplex DB,
-  restarts the surviving quorum first, requires them to finalize a newer slot, and then tries to let the
-  wiped validator catch up. The branch still aborts before that recovery flow reaches steady state.
+  the restart path still gives the wiped validator a normal chain tip through `Start(...)`, but its
+  simplex-local bootstrap state is empty. `validator/consensus/simplex/pool.cpp` therefore starts from
+  `first_nonannounced_window_ == 0`, reopens `LeaderWindowObserved{start_slot=0, base=genesis}`, and
+  `validator/consensus/simplex/consensus.cpp` later times that reopened slot out and broadcasts
+  `SkipVote{slot=0}`. That conflicts with the same node's pre-restart `FinalizeVote` / finalization for
+  slot `0`.
 - Why this is not just a bad test:
-  the scenario is now stricter than the earlier broken reproducer: it records the pre-restart finalized
-  frontier and waits for genuinely newer finalization instead of accepting replay of old trace history.
-  The old narrow wording about one specific pre-restart `Vote was already casted` symptom was stale and
-  has been removed; the corrected test still exposes a real state-loss reboot failure.
+  the red path no longer depends on the earlier stale waiter bug. The current reproducer restarts the
+  wiped node on a real post-restart chain tip and the conflicting `SkipVote{slot=0}` is visible directly
+  in the node trace.
 - Bigger-picture impact:
-  full validator-set restart with one node losing only local simplex state is still not a reliable recovery
-  path. Even after the healthy quorum proves it can make forward progress, the branch fails to bring the
-  wiped validator back to stable participation.
-- Root-cause note:
-  this issue is confirmed by the end-to-end reproducer above, but I have not yet reduced it to a single
-  precise source line in `validator/consensus/simplex`. The stable fact today is the end-to-end failure to
-  complete recovery, not one narrow timing-specific symptom.
+  this is not a generic reboot issue. It is a partial-local-state-loss bug: a validator that restarts
+  with simplex-local state missing can reopen already finalized history and violate honest vote discipline
+  in its own recovery path.
+- Root cause:
+  simplex bootstrap currently trusts only the simplex DB for `first_nonannounced_window`, bootstrap votes,
+  and bootstrap certificates in `validator/consensus/simplex/db.cpp`. If that DB is empty, `Pool` has no
+  persisted simplex frontier and starts announcing from slot `0` again, even though the validator's chain
+  state was restored at a later finalized tip.
+- Suggested production direction:
+  derive an initial simplex frontier from the restored chain tip / finalization state when simplex-local DB
+  state is empty or behind, so restart cannot reopen finalized slots below the already restored tip.
 
 ## `ConsensusImpl` leaves a rejected candidate stuck as the slot's pending block
 
