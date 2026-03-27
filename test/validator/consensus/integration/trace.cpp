@@ -29,6 +29,7 @@ DEFINE_RECORD(record_network_toggle, network_toggles, NetworkToggle)
 DEFINE_RECORD(record_lifecycle, lifecycle, Lifecycle)
 DEFINE_RECORD(record_candidate_resolved, candidates_resolved, CandidateResolved)
 DEFINE_RECORD(record_malformed_response, malformed_candidate_responses, MalformedCandidateResponse)
+DEFINE_RECORD(record_duplicate_local_vote_persistence, duplicate_local_vote_persistence, DuplicateLocalVotePersistence)
 
 #undef DEFINE_RECORD
 

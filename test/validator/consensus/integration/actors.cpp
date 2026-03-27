@@ -59,10 +59,16 @@ void TestSimplexDb::handle(BusHandle, std::shared_ptr<const StopRequested>) {
 }
 
 template <>
-td::actor::Task<> TestSimplexDb::process(BusHandle, std::shared_ptr<simplex::BroadcastVote> event) {
+td::actor::Task<> TestSimplexDb::process(BusHandle bus, std::shared_ptr<simplex::BroadcastVote> event) {
   auto vote = event->vote.to_tl();
   auto hash = sha256_bits256(serialize_tl_object(vote, true));
   if (saved_votes_.contains(hash)) {
+    auto& test_bus = dynamic_cast<const TestSimplexBus&>(*bus);
+    if (!test_bus.trace_sink.empty()) {
+      td::actor::send_closure(test_bus.trace_sink, &TraceSink::record_duplicate_local_vote_persistence,
+                              bus->local_id.idx.value(),
+                              DuplicateLocalVotePersistence{.vote = event->vote});
+    }
     co_return td::Status::Error(cancelled, "Vote was already casted");
   }
   saved_votes_.insert(hash);

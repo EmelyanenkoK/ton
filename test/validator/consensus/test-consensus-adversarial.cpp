@@ -82,6 +82,7 @@ enum class TestCase {
   LeaderWindowSchedule,
   NoMisbehaviorReports,
   SilentLeaderWindowSkipsButNextHonestWindowFinalizes,
+  LeaderRestartMidWindowStillRejoinsAfterHonestFinalization,
   SilentValidatorDoesNotStopProgress,
   BadCandidateResolutionResponderDoesNotStopCatchup,
   ConsecutiveSilentLeadersThenProgress,
@@ -112,6 +113,7 @@ enum class TestCase {
   AdjacentWindowForkRollsBackAfterLateAlternateFinalization,
   RestartAfterEightNonMcFinalizedBlocksReacceptsPendingCandidates,
   StandstillWithoutCertificateRebroadcastRequiresRecovery,
+  StandstillRebroadcastReplayerRestartsStillRecovers,
   GoodCandidateWithWrongSlotParentHashDoesNotResolve,
   OfflineCohortNetworkHandoffStillFinalizes,
   OfflineCohortRestartHandoffStillFinalizes,
@@ -164,6 +166,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "silent-leader-window-skips-but-next-honest-window-finalizes") {
     return TestCase::SilentLeaderWindowSkipsButNextHonestWindowFinalizes;
+  }
+  if (s == "leader-restart-mid-window-still-rejoins-after-honest-finalization") {
+    return TestCase::LeaderRestartMidWindowStillRejoinsAfterHonestFinalization;
   }
   if (s == "silent-validator-does-not-stop-progress") {
     return TestCase::SilentValidatorDoesNotStopProgress;
@@ -254,6 +259,9 @@ td::Result<TestCase> parse_test_case(td::Slice s) {
   }
   if (s == "standstill-without-certificate-rebroadcast-requires-recovery") {
     return TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery;
+  }
+  if (s == "standstill-rebroadcast-replayer-restarts-still-recovers") {
+    return TestCase::StandstillRebroadcastReplayerRestartsStillRecovers;
   }
   if (s == "good-candidate-with-wrong-slot-parent-hash-does-not-resolve") {
     return TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve;
@@ -462,6 +470,8 @@ struct TestExpectations {
   std::optional<CandidateId> wrong_parent_hash_candidate_id;
   std::optional<td::uint32> restart_reaccept_stop_slot;
   std::optional<td::uint32> synthetic_mc_finalization_freeze_seqno;
+  std::optional<td::uint32> leader_restart_attacked_slot;
+  std::optional<td::uint32> leader_restart_recovery_target_slot;
   std::optional<td::uint32> cohort_handoff_phase1_target_seqno;
   std::optional<td::uint32> cohort_handoff_recovery_target_seqno;
   std::optional<td::uint32> cohort_handoff_forced_skip_start_slot;
@@ -648,6 +658,7 @@ td::Status verify_no_double_notar(const TraceSnapshot& snapshot) {
 std::set<size_t> adversarial_nodes() {
   switch (TEST_CASE) {
     case TestCase::SilentLeaderWindowSkipsButNextHonestWindowFinalizes:
+    case TestCase::LeaderRestartMidWindowStillRejoinsAfterHonestFinalization:
       return {0};
     case TestCase::SilentValidatorDoesNotStopProgress:
       return {3};
@@ -1631,6 +1642,131 @@ td::Status verify_silent_leader_window_skips_but_next_honest_window_finalizes(co
   if (!saw_later_finalization) {
     return td::Status::Error(PSTRING() << "honest validators never finalized past silent leader slot " << *attacked_slot
                                        << "; highest finalized slot=" << highest_finalized_slot);
+  }
+
+  return td::Status::OK();
+}
+
+td::Status verify_leader_restart_mid_window_still_rejoins_after_honest_finalization(const TraceSnapshot& snapshot) {
+  // Covers a clean reboot of the current leader while its own slot is already in flight:
+  // the leader must have started working on its slot before the stop, honest peers must keep
+  // finalizing while it is down, and the restarted node must later rejoin voting/finalization.
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> attacked_slot;
+  std::optional<td::uint32> recovery_target_slot;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    attacked_slot = test_expectations.leader_restart_attacked_slot;
+    recovery_target_slot = test_expectations.leader_restart_recovery_target_slot;
+  }
+  if (!attacked_slot.has_value() || !recovery_target_slot.has_value()) {
+    return td::Status::Error("scenario did not register leader-restart expectations");
+  }
+
+  std::optional<double> stop_ts;
+  std::optional<double> restart_ts;
+  for (const auto& record : snapshot.lifecycle) {
+    if (record.node_idx != 0 || record.instance_idx != 0) {
+      continue;
+    }
+    if (!record.started && !stop_ts.has_value()) {
+      stop_ts = record.ts;
+      continue;
+    }
+    if (record.started && stop_ts.has_value() && record.ts > *stop_ts + 1e-9) {
+      restart_ts = record.ts;
+      break;
+    }
+  }
+  if (!stop_ts.has_value() || !restart_ts.has_value()) {
+    return td::Status::Error("scenario did not record a complete stop/start cycle for validator #0.0");
+  }
+
+  bool saw_leader_window_before_stop = false;
+  for (const auto& record : snapshot.leader_windows_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.start_slot == *attacked_slot &&
+        record.ts < *stop_ts - 1e-9) {
+      saw_leader_window_before_stop = true;
+      break;
+    }
+  }
+  if (!saw_leader_window_before_stop) {
+    return td::Status::Error(PSTRING() << "validator #0.0 never observed leader window " << *attacked_slot
+                                       << " before its restart stop");
+  }
+
+  bool saw_inflight_candidate_before_stop = false;
+  for (const auto& record : snapshot.candidates_generated) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.candidate_id.slot == *attacked_slot &&
+        record.ts < *stop_ts - 1e-9) {
+      saw_inflight_candidate_before_stop = true;
+      break;
+    }
+  }
+  if (!saw_inflight_candidate_before_stop) {
+    for (const auto& record : snapshot.candidate_deliveries) {
+      if (record.src_node_idx == 0 && record.src_instance_idx == 0 && record.candidate_id.slot == *attacked_slot &&
+          record.ts < *stop_ts - 1e-9) {
+        saw_inflight_candidate_before_stop = true;
+        break;
+      }
+    }
+  }
+  if (!saw_inflight_candidate_before_stop) {
+    return td::Status::Error(PSTRING() << "validator #0.0 never put leader slot " << *attacked_slot
+                                       << " in flight before it was restarted");
+  }
+
+  // A stop can still flush a prebuilt candidate through the fake network, so only forbid
+  // fresh local work after the stop, not delayed delivery of already queued traffic.
+  for (const auto& record : snapshot.candidates_generated) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.candidate_id.slot == *attacked_slot &&
+        record.ts > *stop_ts + 1e-9 && record.ts < *restart_ts - 1e-9) {
+      return td::Status::Error(PSTRING() << "validator #0.0 generated a fresh candidate for slot "
+                                         << *attacked_slot << " while it was down");
+    }
+  }
+
+  bool saw_honest_progress_while_down = false;
+  td::uint32 highest_honest_finalized_slot = 0;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 || record.ts <= *stop_ts + 1e-9 || record.ts >= *restart_ts - 1e-9) {
+      continue;
+    }
+    highest_honest_finalized_slot = std::max(highest_honest_finalized_slot, record.id.slot);
+    if (record.id.slot > *attacked_slot) {
+      saw_honest_progress_while_down = true;
+    }
+  }
+  if (!saw_honest_progress_while_down) {
+    return td::Status::Error(PSTRING() << "honest validators never finalized beyond attacked leader slot "
+                                       << *attacked_slot << " while validator #0.0 was down; highest honest slot="
+                                       << highest_honest_finalized_slot);
+  }
+
+  bool saw_node0_vote_after_restart = false;
+  for (const auto& record : snapshot.protocol_votes) {
+    if (record.src_node_idx == 0 && record.src_instance_idx == 0 && record.ts > *restart_ts + 1e-9) {
+      saw_node0_vote_after_restart = true;
+      break;
+    }
+  }
+  if (!saw_node0_vote_after_restart) {
+    return td::Status::Error("validator #0.0 never rejoined protocol voting after restart");
+  }
+
+  bool saw_node0_finalization_after_restart = false;
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.ts > *restart_ts + 1e-9 &&
+        record.id.slot >= *recovery_target_slot) {
+      saw_node0_finalization_after_restart = true;
+      break;
+    }
+  }
+  if (!saw_node0_finalization_after_restart) {
+    return td::Status::Error(PSTRING() << "validator #0.0 never finalized again past recovery slot "
+                                       << *recovery_target_slot << " after restart");
   }
 
   return td::Status::OK();
@@ -4223,6 +4359,49 @@ td::Status verify_restart_after_eight_non_mc_finalized_blocks_reaccepts_pending_
   return td::Status::OK();
 }
 
+td::Result<double> verify_standstill_certificate_recovery_base(const TraceSnapshot& snapshot, td::uint32 attacked_slot,
+                                                               double release_ts) {
+  bool saw_cert_to_node0_before_release = false;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (record.dst_node_idx == 0 && record.vote.referenced_slot() == attacked_slot && record.ts < release_ts - 1e-9) {
+      saw_cert_to_node0_before_release = true;
+      break;
+    }
+  }
+  if (saw_cert_to_node0_before_release) {
+    return td::Status::Error(PSTRING() << "validator #0 received ordinary certificate traffic for slot "
+                                       << attacked_slot << " before the standstill-recovery filter was lifted");
+  }
+
+  bool saw_post_release_cert_to_node0 = false;
+  for (const auto& record : snapshot.protocol_certificates) {
+    if (record.dst_node_idx == 0 && record.vote.referenced_slot() >= attacked_slot && record.ts > release_ts + 1e-9) {
+      saw_post_release_cert_to_node0 = true;
+      break;
+    }
+  }
+  if (!saw_post_release_cert_to_node0) {
+    return td::Status::Error(PSTRING() << "validator #0 never received any standstill-era certificate for slot >= "
+                                       << attacked_slot << " after filters were lifted");
+  }
+
+  double first_node0_finalization_ts = std::numeric_limits<double>::infinity();
+  for (const auto& record : snapshot.finalizations_observed) {
+    if (record.node_idx == 0 && record.instance_idx == 0 && record.id.slot >= attacked_slot) {
+      first_node0_finalization_ts = std::min(first_node0_finalization_ts, record.ts);
+    }
+  }
+  if (!std::isfinite(first_node0_finalization_ts)) {
+    return td::Status::Error(PSTRING() << "validator #0 never caught up to slot " << attacked_slot
+                                       << " after standstill recovery");
+  }
+  if (first_node0_finalization_ts <= release_ts + 1e-9) {
+    return td::Status::Error("validator #0 caught up before standstill recovery traffic was allowed through");
+  }
+
+  return first_node0_finalization_ts;
+}
+
 td::Status verify_standstill_without_certificate_rebroadcast_requires_recovery(const TraceSnapshot& snapshot) {
   // Covers Kernel-28's explicit "no cert rebroadcast => standstill recovery required" regression:
   // if one validator misses normal certificate traffic for a slot, it should only catch up after
@@ -4240,42 +4419,108 @@ td::Status verify_standstill_without_certificate_rebroadcast_requires_recovery(c
     return td::Status::Error("scenario did not register standstill certificate-recovery expectations");
   }
 
-  bool saw_cert_to_node0_before_release = false;
-  for (const auto& record : snapshot.protocol_certificates) {
-    if (record.dst_node_idx == 0 && record.vote.referenced_slot() == *attacked_slot && record.ts < *release_ts - 1e-9) {
-      saw_cert_to_node0_before_release = true;
+  TRY_RESULT(first_node0_finalization_ts,
+             verify_standstill_certificate_recovery_base(snapshot, *attacked_slot, *release_ts));
+  static_cast<void>(first_node0_finalization_ts);
+  return td::Status::OK();
+}
+
+td::Status verify_standstill_rebroadcast_replayer_restarts_still_recovers(const TraceSnapshot& snapshot) {
+  // Covers rebooting the surviving standstill replayer after replay has already started:
+  // node #1 must have begun rebroadcasting cached state before its stop, resume replay after
+  // restart, and node #0 must only catch up once that restarted replay path is back online.
+  TRY_STATUS(verify_adversarial_invariants(snapshot));
+
+  std::optional<td::uint32> attacked_slot;
+  std::optional<double> release_ts;
+  {
+    std::scoped_lock lock(test_expectations_mutex);
+    attacked_slot = test_expectations.standstill_recovery_slot;
+    release_ts = test_expectations.standstill_recovery_release_ts;
+  }
+  if (!attacked_slot.has_value() || !release_ts.has_value()) {
+    return td::Status::Error("scenario did not register standstill replayer-restart expectations");
+  }
+
+  TRY_RESULT(first_node0_finalization_ts,
+             verify_standstill_certificate_recovery_base(snapshot, *attacked_slot, *release_ts));
+
+  std::optional<double> node2_stop_ts;
+  std::optional<double> node3_stop_ts;
+  std::optional<double> node1_stop_ts;
+  std::optional<double> node1_restart_ts;
+  for (const auto& record : snapshot.lifecycle) {
+    if (record.instance_idx != 0) {
+      continue;
+    }
+    if (record.node_idx == 2 && !record.started && !node2_stop_ts.has_value()) {
+      node2_stop_ts = record.ts;
+    } else if (record.node_idx == 3 && !record.started && !node3_stop_ts.has_value()) {
+      node3_stop_ts = record.ts;
+    } else if (record.node_idx == 1 && !record.started && !node1_stop_ts.has_value()) {
+      node1_stop_ts = record.ts;
+    } else if (record.node_idx == 1 && record.started && node1_stop_ts.has_value() &&
+               record.ts > *node1_stop_ts + 1e-9) {
+      node1_restart_ts = record.ts;
       break;
     }
   }
-  if (saw_cert_to_node0_before_release) {
-    return td::Status::Error(PSTRING() << "validator #0 received ordinary certificate traffic for slot "
-                                       << *attacked_slot << " before the standstill-recovery filter was lifted");
+  if (!node2_stop_ts.has_value() || !node3_stop_ts.has_value()) {
+    return td::Status::Error("scenario did not record quorum-breaking stops for validators #2.0 and #3.0");
+  }
+  if (!node1_stop_ts.has_value() || !node1_restart_ts.has_value()) {
+    return td::Status::Error("scenario did not record a complete stop/start cycle for standstill replayer #1.0");
+  }
+  if (*node1_restart_ts <= *node1_stop_ts + 1e-9) {
+    return td::Status::Error("standstill replayer #1.0 has invalid stop/start ordering");
   }
 
-  bool saw_post_release_cert_to_node0 = false;
+  double quorum_loss_ts = std::max(*node2_stop_ts, *node3_stop_ts);
+  double standstill_replay_deadline =
+      quorum_loss_ts + static_cast<double>(STANDSTILL_TIMEOUT.count()) / 1000.0 * 0.75;
+
+  auto saw_replay_from_node1 = [&](double min_ts, double max_ts) {
+    for (const auto& record : snapshot.protocol_votes) {
+      if (record.src_node_idx == 1 && record.src_instance_idx == 0 && vote_slot(record.vote) >= *attacked_slot &&
+          record.ts > min_ts + 1e-9 && record.ts < max_ts - 1e-9) {
+        return true;
+      }
+    }
+    for (const auto& record : snapshot.protocol_certificates) {
+      if (record.src_node_idx == 1 && record.src_instance_idx == 0 && vote_slot(record.vote) >= *attacked_slot &&
+          record.ts > min_ts + 1e-9 && record.ts < max_ts - 1e-9) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+  if (!saw_replay_from_node1(standstill_replay_deadline, *node1_stop_ts)) {
+    return td::Status::Error(PSTRING() << "validator #1.0 never entered active standstill replay for slot >= "
+                                       << *attacked_slot << " before its reboot");
+  }
+
+  double post_restart_min_ts = std::max(*node1_restart_ts, *release_ts);
+  if (!saw_replay_from_node1(post_restart_min_ts, std::numeric_limits<double>::infinity())) {
+    return td::Status::Error(PSTRING() << "validator #1.0 never resumed standstill replay for slot >= "
+                                       << *attacked_slot << " after restart");
+  }
+
+  if (first_node0_finalization_ts <= *node1_restart_ts + 1e-9) {
+    return td::Status::Error("validator #0 caught up before the standstill replayer had restarted");
+  }
+
+  bool saw_cert_from_node1_to_node0_after_restart = false;
   for (const auto& record : snapshot.protocol_certificates) {
-    if (record.dst_node_idx == 0 && record.vote.referenced_slot() >= *attacked_slot && record.ts > *release_ts + 1e-9) {
-      saw_post_release_cert_to_node0 = true;
+    if (record.src_node_idx == 1 && record.src_instance_idx == 0 && record.dst_node_idx == 0 &&
+        vote_slot(record.vote) >= *attacked_slot && record.ts > *node1_restart_ts + 1e-9) {
+      saw_cert_from_node1_to_node0_after_restart = true;
       break;
     }
   }
-  if (!saw_post_release_cert_to_node0) {
-    return td::Status::Error(PSTRING() << "validator #0 never received any standstill-era certificate for slot >= "
-                                       << *attacked_slot << " after filters were lifted");
-  }
-
-  double first_node0_finalization_ts = std::numeric_limits<double>::infinity();
-  for (const auto& record : snapshot.finalizations_observed) {
-    if (record.node_idx == 0 && record.instance_idx == 0 && record.id.slot >= *attacked_slot) {
-      first_node0_finalization_ts = std::min(first_node0_finalization_ts, record.ts);
-    }
-  }
-  if (!std::isfinite(first_node0_finalization_ts)) {
-    return td::Status::Error(PSTRING() << "validator #0 never caught up to slot " << *attacked_slot
-                                       << " after standstill recovery");
-  }
-  if (first_node0_finalization_ts <= *release_ts + 1e-9) {
-    return td::Status::Error("validator #0 caught up before standstill recovery traffic was allowed through");
+  if (!saw_cert_from_node1_to_node0_after_restart) {
+    return td::Status::Error(PSTRING() << "validator #1.0 never replayed any standstill-era certificate to validator #0 "
+                                       << "after restart");
   }
 
   return td::Status::OK();
@@ -4382,6 +4627,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_no_misbehavior_reports(snapshot);
     case TestCase::SilentLeaderWindowSkipsButNextHonestWindowFinalizes:
       return verify_silent_leader_window_skips_but_next_honest_window_finalizes(snapshot);
+    case TestCase::LeaderRestartMidWindowStillRejoinsAfterHonestFinalization:
+      return verify_leader_restart_mid_window_still_rejoins_after_honest_finalization(snapshot);
     case TestCase::SilentValidatorDoesNotStopProgress:
       return verify_silent_validator_does_not_stop_progress(snapshot);
     case TestCase::BadCandidateResolutionResponderDoesNotStopCatchup:
@@ -4442,6 +4689,8 @@ td::Status verify_test_case(const TraceSnapshot& snapshot) {
       return verify_restart_after_eight_non_mc_finalized_blocks_reaccepts_pending_candidates(snapshot);
     case TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery:
       return verify_standstill_without_certificate_rebroadcast_requires_recovery(snapshot);
+    case TestCase::StandstillRebroadcastReplayerRestartsStillRecovers:
+      return verify_standstill_rebroadcast_replayer_restarts_still_recovers(snapshot);
     case TestCase::GoodCandidateWithWrongSlotParentHashDoesNotResolve:
       return verify_good_candidate_with_wrong_slot_parent_hash_does_not_resolve(snapshot);
     case TestCase::OfflineCohortNetworkHandoffStillFinalizes:
@@ -6165,6 +6414,7 @@ class TestConsensus : public td::actor::Actor {
   void apply_test_case_defaults() {
     NODE_WEIGHTS_OVERRIDE.clear();
     if (TEST_CASE == TestCase::SilentLeaderWindowSkipsButNextHonestWindowFinalizes ||
+        TEST_CASE == TestCase::LeaderRestartMidWindowStillRejoinsAfterHonestFinalization ||
         TEST_CASE == TestCase::SilentValidatorDoesNotStopProgress) {
       if (N_NODES == 8) {
         N_NODES = 4;
@@ -6176,7 +6426,7 @@ class TestConsensus : public td::actor::Actor {
         SLOTS_PER_LEADER_WINDOW = 1;
       }
       if (DURATION == 60.0) {
-        DURATION = 3.0;
+        DURATION = TEST_CASE == TestCase::LeaderRestartMidWindowStillRejoinsAfterHonestFinalization ? 5.0 : 3.0;
       }
     }
     if (TEST_CASE == TestCase::BadCandidateResolutionResponderDoesNotStopCatchup ||
@@ -6602,7 +6852,8 @@ class TestConsensus : public td::actor::Actor {
         DURATION = 6.0;
       }
     }
-    if (TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery) {
+    if (TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery ||
+        TEST_CASE == TestCase::StandstillRebroadcastReplayerRestartsStillRecovers) {
       if (N_NODES == 8) {
         N_NODES = 4;
       }
@@ -6830,6 +7081,7 @@ class TestConsensus : public td::actor::Actor {
            TEST_CASE == TestCase::MultiSlotEquivocationWindowPreservesSafety ||
            TEST_CASE == TestCase::StandstillFloodStillRecovers ||
            TEST_CASE == TestCase::StandstillWithoutCertificateRebroadcastRequiresRecovery ||
+           TEST_CASE == TestCase::StandstillRebroadcastReplayerRestartsStillRecovers ||
            TEST_CASE == TestCase::OfflineCohortNetworkHandoffStillFinalizes ||
            TEST_CASE == TestCase::OfflineCohortRestartHandoffStillFinalizes ||
            TEST_CASE == TestCase::OfflineCohortNetworkHandoffForcedSkipWindowStillFinalizes ||
@@ -6843,6 +7095,68 @@ class TestConsensus : public td::actor::Actor {
       co_await wait_for_finalization_on(0, 0, 5.0);
       co_await clear_traces();
       co_await stop_instance(0, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::LeaderRestartMidWindowStillRejoinsAfterHonestFinalization) {
+      // Covers a clean reboot of the current leader after it has already started working on its slot:
+      // validator #0 must put its own slot in flight, stop mid-window, honest peers must keep
+      // finalizing while it is down, and the restarted validator must later vote/finalize again.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+        }
+      }
+      td::uint32 attacked_slot = highest_finalized_slot + 1;
+      while (attacked_slot % N_NODES != 0) {
+        ++attacked_slot;
+      }
+      td::uint32 recovery_target_slot = attacked_slot + static_cast<td::uint32>(N_NODES) + 1;
+
+      co_await clear_traces();
+      co_await wait_for_leader_window_observed_on(0, 0, attacked_slot, 5.0);
+
+      td::Timestamp deadline = td::Timestamp::in(2.0);
+      bool saw_inflight_candidate = false;
+      while (!deadline.is_in_past()) {
+        snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+        for (const auto& record : snapshot.candidates_generated) {
+          if (record.node_idx == 0 && record.instance_idx == 0 && record.candidate_id.slot == attacked_slot) {
+            saw_inflight_candidate = true;
+            break;
+          }
+        }
+        if (!saw_inflight_candidate) {
+          for (const auto& record : snapshot.candidate_deliveries) {
+            if (record.src_node_idx == 0 && record.src_instance_idx == 0 && record.candidate_id.slot == attacked_slot) {
+              saw_inflight_candidate = true;
+              break;
+            }
+          }
+        }
+        if (saw_inflight_candidate) {
+          break;
+        }
+        co_await td::actor::coro_sleep(td::Timestamp::in(0.02));
+      }
+      if (!saw_inflight_candidate) {
+        co_return td::Status::Error(PSTRING() << "validator #0.0 never put leader slot " << attacked_slot
+                                              << " in flight before reboot");
+      }
+
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.leader_restart_attacked_slot = attacked_slot;
+        test_expectations.leader_restart_recovery_target_slot = recovery_target_slot;
+      }
+
+      co_await stop_instance(0, 0);
+      co_await wait_for_finalization_past_slot_on(1, 0, attacked_slot, 5.0);
+      start_instance(0, 0);
+      co_await wait_for_finalization_past_slot_on(0, 0, recovery_target_slot - 1, 5.0);
       co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
       co_return td::Unit{};
     }
@@ -7271,6 +7585,80 @@ class TestConsensus : public td::actor::Actor {
       co_await stop_instance(2, 0);
       co_await stop_instance(3, 0);
       co_await td::actor::coro_sleep(td::Timestamp::in(0.8));
+      {
+        std::scoped_lock lock(test_expectations_mutex);
+        test_expectations.standstill_recovery_slot = attacked_slot;
+        test_expectations.standstill_recovery_release_ts = td::Time::now_unadjusted();
+      }
+      co_await clear_test_message_filters();
+      co_await td::actor::coro_sleep(td::Timestamp::in(DURATION));
+      co_return td::Unit{};
+    }
+    if (TEST_CASE == TestCase::StandstillRebroadcastReplayerRestartsStillRecovers) {
+      // Covers rebooting the surviving standstill replayer after replay has started:
+      // node #0 misses ordinary cert traffic for one slot, nodes #2/#3 are stopped to force a
+      // standstill, node #1 begins replaying cached state, then #1 is rebooted and must resume
+      // replay so node #0 can only catch up after the restart.
+      co_await wait_for_finalization_on(0, 0, 5.0);
+      auto snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+      td::uint32 highest_finalized_slot = 0;
+      for (const auto& record : snapshot.finalizations_observed) {
+        if (record.node_idx == 0 && record.instance_idx == 0) {
+          highest_finalized_slot = std::max(highest_finalized_slot, record.id.slot);
+        }
+      }
+      td::uint32 attacked_slot = highest_finalized_slot + static_cast<td::uint32>(N_NODES);
+      while (attacked_slot % N_NODES != 1) {
+        ++attacked_slot;
+      }
+      td::uint32 blocked_until_slot = attacked_slot + 8;
+      for (auto kind : {TestMessageFilters::ProtocolKind::NotarVote, TestMessageFilters::ProtocolKind::FinalVote,
+                        TestMessageFilters::ProtocolKind::NotarCert, TestMessageFilters::ProtocolKind::FinalCert}) {
+        for (size_t src_node_idx = 1; src_node_idx < N_NODES; ++src_node_idx) {
+          co_await set_selective_protocol_drop_for_test(src_node_idx, 0, {0}, attacked_slot, blocked_until_slot, kind);
+        }
+      }
+      co_await clear_traces();
+      co_await wait_for_finalization_past_slot_on(1, 0, attacked_slot, 5.0);
+      co_await stop_instance(2, 0);
+      co_await stop_instance(3, 0);
+      double quorum_loss_ts = td::Time::now_unadjusted();
+
+      td::Timestamp replay_deadline = td::Timestamp::in(2.0);
+      bool saw_node1_replay = false;
+      while (!replay_deadline.is_in_past()) {
+        snapshot = co_await td::actor::ask(trace_sink_, &TestTraceSink::snapshot);
+        double replay_threshold =
+            quorum_loss_ts + static_cast<double>(STANDSTILL_TIMEOUT.count()) / 1000.0 * 0.75;
+        for (const auto& record : snapshot.protocol_votes) {
+          if (record.src_node_idx == 1 && record.src_instance_idx == 0 && vote_slot(record.vote) >= attacked_slot &&
+              record.ts > replay_threshold + 1e-9) {
+            saw_node1_replay = true;
+            break;
+          }
+        }
+        if (!saw_node1_replay) {
+          for (const auto& record : snapshot.protocol_certificates) {
+            if (record.src_node_idx == 1 && record.src_instance_idx == 0 && vote_slot(record.vote) >= attacked_slot &&
+                record.ts > replay_threshold + 1e-9) {
+              saw_node1_replay = true;
+              break;
+            }
+          }
+        }
+        if (saw_node1_replay) {
+          break;
+        }
+        co_await td::actor::coro_sleep(td::Timestamp::in(0.05));
+      }
+      if (!saw_node1_replay) {
+        co_return td::Status::Error(PSTRING() << "validator #1.0 never entered standstill replay for slot >= "
+                                              << attacked_slot << " before reboot");
+      }
+
+      co_await stop_instance(1, 0);
+      co_await td::actor::coro_sleep(td::Timestamp::in(0.2));
+      start_instance(1, 0);
       {
         std::scoped_lock lock(test_expectations_mutex);
         test_expectations.standstill_recovery_slot = attacked_slot;

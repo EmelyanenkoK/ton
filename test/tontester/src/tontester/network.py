@@ -651,12 +651,15 @@ class FullNode(Network.Node):
     async def stop(self):
         if self._client:
             await self._client.aclose()
+            self._client = None
         if self._engine_console:
             self._engine_console.close()
+            self._engine_console = None
         if self._blockchain_explorer:
             _ = self._blockchain_explorer.cancel()
             try:
                 await self._blockchain_explorer
             except asyncio.CancelledError:
                 pass
+            self._blockchain_explorer = None
         await super().stop()

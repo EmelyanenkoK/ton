@@ -57,6 +57,71 @@
    }
 ```
 
+## Full-network clean restart replays already-persisted local votes
+
+- Status: `Confirmed code issue`.
+- Coverage note: exposed by
+  `test/validator/consensus/integration/test_reboots.cpp`
+  `full-network-clean-restart-still-finalizes`.
+- Reproduce:
+```sh
+timeout 120 ./build/test/validator/consensus/integration/test-reboots --test-case full-network-clean-restart-still-finalizes
+```
+- Current failure:
+  the reboot verifier fails with
+  `full-network clean restart: node #... retried persisting local vote SkipVote{slot=2} after restart`.
+- How the failure arises:
+  the scenario stops every validator on intact state, restarts the whole set, and then waits for the
+  network to resume steady-state finalization. During that restart, the trace now records restarted
+  validators trying to persist local votes that are already present in their simplex DB bootstrap state.
+  The clean restart run stays live long enough to finish, but the explicit reboot verifier turns that
+  duplicate-persistence behavior into a deterministic red result.
+- Why this is not just a bad test:
+  the duplicate guard is not unique to the integration double. The real simplex DB applies the same
+  "our vote already exists" check, so a restart path that re-emits previously persisted local votes is a
+  real replay-idempotence regression, not a harness artifact.
+- Bigger-picture impact:
+  a validator that reboots cleanly on intact local state can re-enter consensus by trying to save old
+  local votes again. Current evidence says this likely surfaces in production first as detached-task error
+  logs and fragile recovery behavior, not as an immediate validator-process crash. Even so, it makes reboot
+  recovery timing-sensitive and risks turning otherwise safe operator restarts into liveness failures.
+- Proposed production change:
+  make restart / bootstrap idempotent with respect to previously persisted local votes, so replayed local
+  protocol state never re-enters the "vote already casted" path.
+
+## Full-network restart with one wiped validator still aborts before recovery completes
+
+- Status: `Confirmed code issue`.
+- Coverage note: exposed by
+  `test/validator/consensus/integration/test_reboots.cpp`
+  `full-network-restart-with-state-loss-still-recovers`.
+- Reproduce:
+```sh
+timeout 180 ./build/test/validator/consensus/integration/test-reboots --test-case full-network-restart-with-state-loss-still-recovers
+```
+- Current failure:
+  the scenario aborts during the recovery handoff instead of reaching the final "all validators finalize
+  after the state-lost node catches up" phase. The exact abort point is timing-sensitive: in stronger runs
+  it can happen right after the surviving quorum proves progress while the wiped node is still down, and in
+  other runs it happens shortly after the wiped node reaches its first post-restart finalization.
+- How the failure arises:
+  the scenario waits for normal finalization, stops all validators, clears one validator's simplex DB,
+  restarts the surviving quorum first, requires them to finalize a newer slot, and then tries to let the
+  wiped validator catch up. The branch still aborts before that recovery flow reaches steady state.
+- Why this is not just a bad test:
+  the scenario is now stricter than the earlier broken reproducer: it records the pre-restart finalized
+  frontier and waits for genuinely newer finalization instead of accepting replay of old trace history.
+  The old narrow wording about one specific pre-restart `Vote was already casted` symptom was stale and
+  has been removed; the corrected test still exposes a real state-loss reboot failure.
+- Bigger-picture impact:
+  full validator-set restart with one node losing only local simplex state is still not a reliable recovery
+  path. Even after the healthy quorum proves it can make forward progress, the branch fails to bring the
+  wiped validator back to stable participation.
+- Root-cause note:
+  this issue is confirmed by the end-to-end reproducer above, but I have not yet reduced it to a single
+  precise source line in `validator/consensus/simplex`. The stable fact today is the end-to-end failure to
+  complete recovery, not one narrow timing-specific symptom.
+
 ## `ConsensusImpl` leaves a rejected candidate stuck as the slot's pending block
 
 - Status: `Confirmed code issue`.

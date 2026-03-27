@@ -22,8 +22,9 @@ class HarnessHandle {
   // Node lifecycle. Returns a TimePoint capturing the protocol frontier at the
   // moment the action completes.
   td::actor::Task<TimePoint> stop_instance(size_t node_idx);
-  TimePoint start_instance(size_t node_idx);
+  td::actor::Task<TimePoint> start_instance(size_t node_idx);
   td::actor::Task<> clear_instance_db(size_t node_idx);
+  td::actor::Task<> clear_traces();
 
   // Wait until a predicate over the trace is satisfied.
   td::actor::Task<> wait_for(std::string description, std::unique_ptr<TracePredicate> predicate);

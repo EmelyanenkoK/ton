@@ -75,6 +75,10 @@ struct MalformedCandidateResponse {
   CandidateId id;
 };
 
+struct DuplicateLocalVotePersistence {
+  simplex::Vote vote;
+};
+
 struct TraceSnapshot {
   // Bus events wrapped with metadata
   std::vector<Traced<simplex::LeaderWindowObserved>> leader_windows_observed;
@@ -96,6 +100,7 @@ struct TraceSnapshot {
   std::vector<Traced<Lifecycle>> lifecycle;
   std::vector<Traced<CandidateResolved>> candidates_resolved;
   std::vector<Traced<MalformedCandidateResponse>> malformed_candidate_responses;
+  std::vector<Traced<DuplicateLocalVotePersistence>> duplicate_local_vote_persistence;
 };
 
 // An incremental predicate over the trace. Evaluated on the TraceSink's thread
@@ -133,6 +138,7 @@ class TraceSink : public td::actor::Actor {
   void record_lifecycle(size_t node_idx, Lifecycle e);
   void record_candidate_resolved(size_t node_idx, CandidateResolved e);
   void record_malformed_response(size_t node_idx, MalformedCandidateResponse e);
+  void record_duplicate_local_vote_persistence(size_t node_idx, DuplicateLocalVotePersistence e);
 
   // Register a waiter that will be checked on each new event.
   void wait_for(std::string description, std::unique_ptr<TracePredicate> predicate, td::Promise<td::Unit> promise);

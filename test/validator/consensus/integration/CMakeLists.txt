@@ -24,6 +24,11 @@ add_executable(test-adversarial
 )
 target_link_libraries(test-adversarial PRIVATE adversarial-test-harness)
 
+add_executable(test-reboots
+    test_reboots.cpp
+)
+target_link_libraries(test-reboots PRIVATE adversarial-test-harness)
+
 # Register each test case as a CTest entry.
 foreach(CASE
     smoke
@@ -33,4 +38,13 @@ foreach(CASE
     empty-candidates-with-silent-validator-still-finalize
 )
     add_test(NAME adversarial-${CASE} COMMAND test-adversarial --test-case ${CASE})
+endforeach()
+
+foreach(CASE
+    single-validator-restart-rejoins-consensus
+    repeated-validator-restarts-rejoin-after-second-downtime
+    full-network-clean-restart-still-finalizes
+    full-network-restart-with-state-loss-still-recovers
+)
+    add_test(NAME reboot-${CASE} COMMAND test-reboots --test-case ${CASE})
 endforeach()

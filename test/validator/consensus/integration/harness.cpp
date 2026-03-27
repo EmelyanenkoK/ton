@@ -105,6 +105,22 @@ class TestConsensus : public td::actor::Actor {
     co_return co_await td::actor::ask(trace_sink_, &TraceSink::snapshot);
   }
 
+  td::actor::Task<TimePoint> start_node_and_capture_timepoint(size_t node_idx) {
+    start_node(node_idx);
+    co_return current_timepoint();
+  }
+
+  td::actor::Task<> clear_traces() {
+    co_return co_await td::actor::ask(trace_sink_, &TraceSink::clear);
+  }
+
+  td::actor::Task<> clear_instance_db(size_t node_idx) {
+    auto& db_inner = nodes_[node_idx].db_inner;
+    std::scoped_lock lock(db_inner->mutex);
+    db_inner->map.clear();
+    co_return {};
+  }
+
   TestMessageFilters& message_filters() {
     return filters_;
   }
@@ -169,8 +185,16 @@ class TestConsensus : public td::actor::Actor {
     td::actor::send_closure(trace_sink_, &TraceSink::record_lifecycle, idx, Lifecycle{.started = true});
     node.bus.publish<BlockFinalizedInMasterchain>(synthetic_mc_finalized_block_);
     BlockIdExt fp = first_parent(desc_.config.shard);
-    node.bus.publish<Start>(
-        td::make_ref<ChainState>(ChainState::ZerostateTip{fp, gen_shard_state(0)}, MIN_MC_BLOCK_ID));
+    if (last_accepted_block_ == fp) {
+      node.bus.publish<Start>(
+          td::make_ref<ChainState>(ChainState::ZerostateTip{fp, gen_shard_state(0)}, MIN_MC_BLOCK_ID));
+    } else {
+      auto it = accepted_blocks_.find(last_accepted_block_.seqno());
+      CHECK(it != accepted_blocks_.end());
+      CHECK(it->second->block_id() == last_accepted_block_);
+      node.bus.publish<Start>(td::make_ref<ChainState>(
+          ChainState::NormalTip{it->second, gen_shard_state(last_accepted_block_.seqno())}, MIN_MC_BLOCK_ID));
+    }
     LOG(ERROR) << "Starting node #" << idx;
   }
 
@@ -354,9 +378,16 @@ td::actor::Task<TimePoint> HarnessHandle::stop_instance(size_t node_idx) {
   co_return td::actor::ActorId<TestConsensus>(test_).get_actor_unsafe().current_timepoint();
 }
 
-TimePoint HarnessHandle::start_instance(size_t node_idx) {
-  td::actor::send_closure(test_, &TestConsensus::start_node, node_idx);
-  return td::actor::ActorId<TestConsensus>(test_).get_actor_unsafe().current_timepoint();
+td::actor::Task<TimePoint> HarnessHandle::start_instance(size_t node_idx) {
+  co_return co_await td::actor::ask(test_, &TestConsensus::start_node_and_capture_timepoint, node_idx);
+}
+
+td::actor::Task<> HarnessHandle::clear_instance_db(size_t node_idx) {
+  co_return co_await td::actor::ask(test_, &TestConsensus::clear_instance_db, node_idx);
+}
+
+td::actor::Task<> HarnessHandle::clear_traces() {
+  co_return co_await td::actor::ask(test_, &TestConsensus::clear_traces);
 }
 
 td::actor::Task<TraceSnapshot> HarnessHandle::get_trace_snapshot() {
