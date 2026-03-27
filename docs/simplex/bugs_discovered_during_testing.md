@@ -4,9 +4,11 @@
 - Coverage note: this merges the earlier "End-to-end consensus still notarizes a wrong-leader candidate after `CandidateReceived`" and "`ConsensusImpl` still notarizes a candidate that names the wrong slot leader" sections.
 - Documentation / expectation: tracker `Kernel-23` / `Kernel-28` expects an otherwise well-formed candidate with the wrong leader for its slot to stop before local `Notar`.
 - Reproduce:
-```sh
-timeout 45s ./build/test/validator/consensus/test-consensus --test-case wrong-leader-candidate-never-notarizes --verbosity 0
-```
+  there is no longer a dedicated runnable reproducer on this branch: the old
+  `test-consensus --test-case wrong-leader-candidate-never-notarizes` selector was removed from
+  `test/validator/consensus/test-consensus.cpp`. The issue is still directly visible in
+  `validator/consensus/simplex/consensus.cpp`: `handle(CandidateReceived)` at lines 174-192 stores
+  `pending_block` and starts `try_notarize()` without checking the slot's expected leader.
 - Current failure:
   `validator #0.0 sent Notar for wrong-leader candidate ...`
 - Why this is not just a bad test:
@@ -65,9 +67,11 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case wrong-le
   residual votes or slot state, so a later replacement candidate for the same slot can still
   progress normally through notarization.
 - Reproduce:
-```sh
-timeout 45s ./build/test/validator/consensus/test-consensus --test-case validation-reject-does-not-leave-residual-votes --verbosity 0
-```
+  there is no longer a dedicated runnable reproducer on this branch: the old
+  `test-consensus --test-case validation-reject-does-not-leave-residual-votes` selector was
+  removed from `test/validator/consensus/test-consensus.cpp`. The issue is still directly visible
+  in `validator/consensus/simplex/consensus.cpp`: after `CandidateReject`, lines 227-231 return
+  without clearing `slot.state->pending_block`.
 - Current failure:
   `replacement candidate ... never notarized after the first candidate was rejected`
 - How the failure arises:
@@ -102,13 +106,160 @@ timeout 45s ./build/test/validator/consensus/test-consensus --test-case validati
 --- a/validator/consensus/simplex/consensus.cpp
 +++ b/validator/consensus/simplex/consensus.cpp
 @@
-   if (validation_result.has<CandidateReject>()) {
-     LOG(WARNING) << "Candidate " << candidate->id
-                  << " is rejected: " << validation_result.get<CandidateReject>().reason;
+  if (validation_result.has<CandidateReject>()) {
+    LOG(WARNING) << "Candidate " << candidate->id
+                 << " is rejected: " << validation_result.get<CandidateReject>().reason;
 +    if (slot.state->pending_block == candidate) {
 +      slot.state->pending_block.reset();
 +    }
      // FIXME: Report misbehavior
      co_return {};
    }
+```
+
+## `SimplexPool::WaitForParent` rejects the latest already-finalized candidate for its slot
+
+- Status: `Confirmed code issue`.
+- Coverage note: exposed by `test/validator/consensus/test-pool.cpp`
+  `Pool_WaitForParentAcceptsLatestFinalizedCandidateAtSameSlot`.
+- Reproduce:
+```sh
+timeout 45s ./build/test/validator/consensus/test-pool --filter Pool_WaitForParentAcceptsLatestFinalizedCandidateAtSameSlot --verbosity 0
+```
+- Current failure:
+  `Expectation failed: result.is_ok()!`
+  and the pool logs the response error `Candidate's slot is already finalized`.
+- How the failure arises:
+  `validator/consensus/simplex/pool.cpp` `maybe_resolve_request()` rejects every request whose
+  `candidate.id.slot < first_nonfinalized_slot_` before it checks whether the requested candidate
+  is exactly `last_finalized_block_`. The branch already has a same-candidate fast path for an
+  already-notarized slot, but the stronger "already finalized to this same block" case still falls
+  into the generic error branch.
+- Why this is not just a bad test:
+  for callers of `WaitForParent`, a finalization certificate for the exact same candidate is
+  stronger evidence than a notarization certificate. Returning a hard error for the already-final
+  candidate makes "the parent condition is satisfied" depend on whether the slot stopped at notar or
+  advanced to finalization, which is not a sensible API contract.
+- Bigger-picture impact:
+  any actor that asks the pool whether a candidate's parent chain is satisfied can misclassify a
+  fully finalized candidate as a conflict and abort the normal pipeline or replay / recovery logic.
+  That is a real correctness regression at the pool boundary, not just an overly strict test.
+- Proposed production change:
+  special-case the exact `last_finalized_block_` match before the generic finalized-slot rejection.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/simplex/pool.cpp
++++ b/validator/consensus/simplex/pool.cpp
+@@
+   td::uint32 next_slot_after_parent = parent.has_value() ? parent->slot + 1 : 0;
+ 
+   if (id.slot < first_nonfinalized_slot_) {
++    if (last_finalized_block_ == id) {
++      return resolve_with(std::nullopt);
++    }
+     return resolve_with(td::Status::Error("Candidate's slot is already finalized"));
+   }
+```
+
+## `SimplexPool` standstill replay still emits stale messages after a newer finalization
+
+- Status: `Confirmed code issue`.
+- Coverage note: exposed by `test/validator/consensus/test-pool.cpp`
+  `Pool_StandstillReplayRestartsFromNewFinalization`.
+- Reproduce:
+```sh
+timeout 45s ./build/test/validator/consensus/test-pool --filter Pool_StandstillReplayRestartsFromNewFinalization
+```
+- Current failure:
+  `Expectation failed: count_events<OutgoingProtocolMessage>(events()) is not equal to static_cast<size_t>(0) (1 != 0)`
+  followed by
+  `Expectation failed: outgoing_payload_position(events(), new_final_payload_.as_slice()) is not equal to static_cast<size_t>(0)`
+- How the failure arises:
+  `validator/consensus/simplex/pool.cpp` snapshots `last_final_cert_` into
+  `last_final_cert_copy` and stops the outer replay loop once the frontier changes, but it does not
+  re-check that condition inside the per-slot message loop. If a newer finalization arrives while
+  the replay coroutine is sleeping in `send(...)` or iterating the current slot's message vector,
+  the old sweep can still emit stale payloads from the previous frontier before it notices the
+  change. The failing test catches exactly that: an old `SkipVote{slot=1}` certificate leaks onto
+  the wire ahead of the new finalization frontier.
+- Why this is not just a bad test:
+  the branch changed standstill recovery specifically to restart from the newest finalization. Once
+  the frontier advances, continuing to broadcast older replay payload from the superseded sweep is
+  contrary to that design and wastes the very bandwidth this path was added to control.
+- Bigger-picture impact:
+  during recovery after stalls, validators can spend scarce standstill-recovery egress on obsolete
+  proofs and may advertise an older replay item ahead of the new frontier certificate. That slows
+  convergence and makes recovery ordering nondeterministic exactly when the pool is supposed to be
+  helping lagging peers catch up.
+- Proposed production change:
+  make the replay cancellation frontier-aware at message granularity, not just at slot granularity.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/simplex/pool.cpp
++++ b/validator/consensus/simplex/pool.cpp
+@@
+         std::vector<ProtocolMessage> messages;
+         state->certs.serialize_to(messages);
+         state->votes[bus.local_id.idx.value()].serialize_to(messages, state->certs);
+ 
+         for (auto &message : messages) {
++          if (last_final_cert_ != last_final_cert_copy) {
++            break;
++          }
+           co_await send(std::move(message));
+         }
+```
+
+## Standstill egress-rate updates do not cleanly take effect on the next replay cycle
+
+- Status: `Confirmed code issue`.
+- Coverage note: exposed by `test/validator/consensus/test-pool.cpp`
+  `Pool_NoncriticalParamsUpdateChangesStandstillEgressForNextCycle`.
+- Reproduce:
+```sh
+timeout 45s ./build/test/validator/consensus/test-pool --filter Pool_NoncriticalParamsUpdateChangesStandstillEgressForNextCycle
+```
+- Current failure:
+  `Expectation failed: second_replay_delay < first_replay_delay / 100.0!`
+- How the failure arises:
+  `validator/consensus/simplex/pool.cpp` updates `params_` on `NoncriticalParamsUpdated`, but
+  `alarm()` keeps signaling and rescheduling standstill recovery even while a prior replay is still
+  active. Those queued notifications let an old standstill cycle roll directly into another replay,
+  so the "next cycle" after an egress-rate update is often not a clean fresh cycle started under
+  the new pacing parameters. The failing test sees exactly that: the second replay delay still looks
+  like old carried-over work instead of collapsing once `standstill_max_egress_bytes_per_s` is
+  raised by many orders of magnitude.
+- Why this is not just a bad test:
+  runtime noncritical params are explicitly meant to apply without restart, and adjacent pool tests
+  already prove that live updates affect ban duration and standstill timeout. The egress-rate knob
+  is part of the same runtime surface, so stale queued standstill work should not mask the next
+  cycle's pacing.
+- Bigger-picture impact:
+  operators can raise standstill recovery bandwidth during an incident and still observe old slow
+  pacing for extra cycles, which undermines the purpose of the live override and makes recovery
+  timing unpredictable.
+- Proposed production change:
+  coalesce standstill notifications while recovery is already pending / active, or explicitly
+  restart the standstill replay loop when standstill pacing params change.
+- Smallest intended patch shape:
+```diff
+--- a/validator/consensus/simplex/pool.cpp
++++ b/validator/consensus/simplex/pool.cpp
+@@
+-  void alarm() override {
++  void alarm() override {
+     ...
+-    standstill_resolution_notification_.set_value({});
++    if (!standstill_resolution_pending_) {
++      standstill_resolution_pending_ = true;
++      standstill_resolution_notification_.set_value({});
++    }
+     reschedule_standstill_resolution();
+   }
+@@
+     while (true) {
+       co_await std::move(standstill_resolution_awaiter_);
++      standstill_resolution_pending_ = false;
+       std::tie(standstill_resolution_awaiter_, standstill_resolution_notification_) =
+           td::actor::StartedTask<>::make_bridge();
 ```

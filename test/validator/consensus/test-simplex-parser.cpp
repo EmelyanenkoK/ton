@@ -155,6 +155,40 @@ TEST(SimplexParser, CandidateDeserializeRejectsWrongLeaderSource) {
   ASSERT_TRUE(result.is_error());
 }
 
+// Pass a valid candidate with a mismatched expected_slot to prove the new slot
+// authentication gate rejects it during deserialize.
+TEST(SimplexParser, CandidateDeserializeRejectsUnexpectedExpectedSlot) {
+  ValidatorSetup setup(TestOptions{.weight_distribution = {1, 1, 1, 1}});
+  ParserBus bus;
+  fill_simplex_bus(setup, bus, 0);
+
+  td::uint32 slot = 0;
+  auto leader = bus.collator_schedule->expected_collator_for(slot);
+  auto candidate = make_serializable_empty_candidate(setup, bus, slot, make_candidate_id(0, 1400), min_mc_block_id,
+                                                     leader);
+
+  auto result = Candidate::deserialize(candidate->serialize().as_slice(), bus, leader, slot + 1);
+  ASSERT_TRUE(result.is_error());
+}
+
+// Use the same deserialize path with the matching expected_slot to show valid
+// candidates still pass the slot check.
+TEST(SimplexParser, CandidateDeserializeAcceptsExpectedSlot) {
+  ValidatorSetup setup(TestOptions{.weight_distribution = {1, 1, 1, 1}});
+  ParserBus bus;
+  fill_simplex_bus(setup, bus, 0);
+
+  td::uint32 slot = 0;
+  auto leader = bus.collator_schedule->expected_collator_for(slot);
+  auto candidate = make_serializable_empty_candidate(setup, bus, slot, make_candidate_id(0, 1500), min_mc_block_id,
+                                                     leader);
+
+  auto result = Candidate::deserialize(candidate->serialize().as_slice(), bus, leader, slot);
+  ASSERT_TRUE(result.is_ok());
+  EXPECT_EQ(result.ok()->id, candidate->id);
+  EXPECT_EQ(result.ok()->leader, leader);
+}
+
 TEST(SimplexParser, CandidateDeserializeRejectsMalformedCandidateBody) {
   ValidatorSetup setup(TestOptions{.weight_distribution = {1, 1, 1, 1}});
   ParserBus bus;

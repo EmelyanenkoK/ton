@@ -8,11 +8,11 @@ The consensus-relevant production diff falls into these buckets:
 
 | Area | Files | Current coverage status |
 | --- | --- | --- |
-| Dynamic noncritical params inside consensus actors | `validator/consensus/block-producer.cpp`, `validator/consensus/simplex/consensus.cpp`, `validator/consensus/simplex/pool.cpp`, `validator/consensus/simplex/candidate-resolver.cpp` | Partial |
-| Broadcast extra + overlay precheck path | `validator/consensus/private-overlay.cpp`, `validator/consensus/types.cpp`, `validator/consensus/types.h`, `validator/consensus/bus.cpp`, `validator/consensus/bus.h` | Missing |
-| Pool-side hardening | `validator/consensus/simplex/pool.cpp`, `validator/consensus/simplex/certificate.cpp` | Partial |
-| Candidate resolver ingress hardening | `validator/consensus/simplex/candidate-resolver.cpp` | Missing |
-| Noncritical param override selection / runtime plumbing | `validator/validator-options.hpp`, `validator/validator.h`, `validator/consensus/bridge.cpp`, `validator-engine/validator-engine.cpp`, `validator-engine/validator-engine.hpp` | Partial |
+| Dynamic noncritical params inside consensus actors | `validator/consensus/block-producer.cpp`, `validator/consensus/simplex/consensus.cpp`, `validator/consensus/simplex/pool.cpp`, `validator/consensus/simplex/candidate-resolver.cpp` | Covered, with standstill edge bugs now exposed |
+| Broadcast extra + overlay precheck path | `validator/consensus/private-overlay.cpp`, `validator/consensus/types.cpp`, `validator/consensus/types.h`, `validator/consensus/bus.cpp`, `validator/consensus/bus.h` | Covered |
+| Pool-side hardening | `validator/consensus/simplex/pool.cpp`, `validator/consensus/simplex/certificate.cpp` | Covered, with 3 confirmed product bugs now documented |
+| Candidate resolver ingress hardening | `validator/consensus/simplex/candidate-resolver.cpp` | Covered |
+| Noncritical param override selection / runtime plumbing | `validator/validator-options.hpp`, `validator/validator.h`, `validator/consensus/bridge.cpp`, `validator-engine/validator-engine.cpp`, `validator-engine/validator-engine.hpp` | Mostly covered |
 | Config schema / parsing | `crypto/block/block.tlb`, `crypto/block/mc-config.cpp` | Covered |
 | Mechanical config field moves / refactors | `validator/consensus/simplex/bus.cpp`, `validator/consensus/simplex/bus.h`, `validator/consensus/simplex/db.cpp`, `validator/consensus/chain-state.cpp`, `validator/consensus/chain-state.h` | No extra test work needed beyond existing coverage |
 
@@ -34,10 +34,27 @@ Existing tests already cover a large part of the new branch:
   - standstill timeout behavior
   - standstill rebroadcast contents
   - certificate rebroadcast after init
+- `test/validator/consensus/test-private-overlay.cpp`
+  - outgoing `consensus_broadcastExtra(slot)` on candidate broadcasts
+  - malformed `extra`, slot mismatch, and wrong-collator precheck rejection
+  - valid precheck-to-delivery path into `CandidateReceived`
 - `test/validator/consensus/test-simplex-parser.cpp`
   - malformed vote parsing
   - wrong signer / corrupt signature for signed votes
   - duplicate signers / mixed statements / underweight certificate rejection
+  - candidate slot / expected-slot mismatch rejection
+- `test/validator/consensus/test-pool.cpp`
+  - pool-side `PrecheckCandidateBroadcast` rejection for duplicate / finalized / too-future slots
+  - bans for invalid vote and invalid certificate signatures
+  - same-candidate `WaitForParent` success when the slot is already notarized
+  - standstill pacing across scheduler ticks
+  - runtime update of bad-signature ban duration
+  - runtime standstill restart / next-cycle egress behavior, currently exposing product bugs
+- `test/validator/test-validator-options.cpp`
+  - inclusive seqno bounds
+  - descendant shard matching
+  - partial override merge behavior
+  - deterministic first-match precedence for overlapping overrides
 - `test/validator/test-mc-config.cpp`
   - `simplex_config_v2`
   - noncritical param dictionary parsing
@@ -45,8 +62,14 @@ Existing tests already cover a large part of the new branch:
   - set/get override control query
   - masterchain target rate override affects runtime behavior
   - shardchain remains unaffected by a masterchain-only override
+- `test/integration/test_noncritical_params_persistence.py`
+  - unauthorized control-query rejection
+  - override persistence across restart
+  - exact getter payload after restart
+  - shard-only override behavior
+  - malformed on-disk JSON fallback to base config
 
-The remaining work is therefore mostly around newly added hardening paths and runtime plumbing that are not exercised by the current validator consensus tests.
+The remaining work is now limited to product bugs exposed by the new tests plus one bridge-internal publish path that still lacks a clean harness.
 
 ## Missing coverage and test plan
 
@@ -271,6 +294,9 @@ Relevant consensus-side tests now build and pass on this branch:
 - `test/validator/consensus/test-simplex-db`
 - `test/validator/consensus/test-simplex-consensus`
 - `test/validator/consensus/test-simplex-parser`
+- `test/validator/consensus/test-private-overlay`
+- `test/validator/consensus/test-bridge`
+- `test/validator/test-validator-options`
 - `test/validator/consensus/integration/test-adversarial` via all registered `adversarial-*` CTest cases
 
 Additional verification:
@@ -282,6 +308,29 @@ Result for this plan:
 
 - The earlier harness/build issues are fixed.
 - The earlier `test-pool` failures were valid expectation drift caused by the new async standstill rebroadcast path and are now covered by updated assertions.
+- Newly added unit coverage for private-overlay, parser slot checks, candidate-resolver ingress limits, validator-options overrides, and bridge DB lifecycle all build and pass.
+- `test/integration/test_noncritical_params_persistence.py` is implemented and syntax-valid, but full execution is currently blocked in this workspace by the local Python environment (`test/tontester` requires Python 3.13+ and `pytoniq-core`; this machine currently has Python 3.12.3 without that package).
+
+## Newly exposed product bugs
+
+The new tests are intentionally not watered down to match current broken behavior. They now expose the following confirmed production issues:
+
+- `Pool_WaitForParentAcceptsLatestFinalizedCandidateAtSameSlot`
+  - currently fails because `WaitForParent` returns `Candidate's slot is already finalized` for the exact latest finalized block instead of succeeding idempotently.
+- `Pool_StandstillReplayRestartsFromNewFinalization`
+  - currently fails because a stale message from the superseded standstill sweep can still be broadcast after a newer finalization arrives.
+- `Pool_NoncriticalParamsUpdateChangesStandstillEgressForNextCycle`
+  - currently fails because queued standstill-recovery work prevents the next replay cycle from cleanly reflecting the updated egress pacing.
+
+All three are documented in `docs/simplex/bugs_discovered_during_testing.md`.
+
+## Remaining partial area
+
+One bridge-related behavior is still only partially covered:
+
+- `validator/consensus/bridge.cpp` publication of `NoncriticalParamsUpdated`
+  - current tests cover effective param resolution and DB destroy / recreate behavior.
+  - the exact actor-level "no-op update publishes nothing, effective update publishes exactly once" path is not reachable cleanly from the current public test harness without adding new bridge test hooks or production-visible plumbing.
 
 ## Updated existing tests
 
@@ -333,4 +382,7 @@ What the updated tests now verify:
 
 ## Bottom line
 
-The core consensus logic added in this branch is already in much better shape than `testnet`, but the branch still lacks tests for the new hardening paths around broadcast admission, peer abuse resistance, override selection, and persistence. The highest-value missing work is in `private-overlay`, `candidate-resolver`, and `pool`, because those are the new code paths that can now reject, rate-limit, or quarantine network inputs.
+The original high-value coverage gaps from `testnet...HEAD` are now implemented in tests. What remains is not "missing test work" so much as:
+
+- three real pool bugs that the new tests now catch and document, and
+- one bridge-internal event-publication path that still needs either extra harness exposure or a purpose-built bridge actor test.

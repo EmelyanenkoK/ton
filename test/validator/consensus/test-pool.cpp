@@ -238,6 +238,26 @@ std::optional<size_t> outgoing_vote_position(const ObservedEvents& events, const
   return std::nullopt;
 }
 
+td::BufferSlice corrupt_serialized_vote(td::BufferSlice payload) {
+  auto tl_vote = fetch_tl_object<simplex::tl::vote>(payload, true).move_as_ok();
+  CHECK(!tl_vote->signature_.empty());
+  auto signature = tl_vote->signature_.clone();
+  signature.as_slice()[0] ^= 0x01;
+  tl_vote->signature_ = std::move(signature);
+  return serialize_tl_object(std::move(tl_vote), true);
+}
+
+td::BufferSlice corrupt_serialized_certificate(td::BufferSlice payload) {
+  auto tl_cert = fetch_tl_object<simplex::tl::certificate>(payload, true).move_as_ok();
+  CHECK(tl_cert->signatures_ != nullptr);
+  CHECK(!tl_cert->signatures_->votes_.empty());
+  CHECK(!tl_cert->signatures_->votes_[0]->signature_.empty());
+  auto signature = tl_cert->signatures_->votes_[0]->signature_.clone();
+  signature.as_slice()[0] ^= 0x01;
+  tl_cert->signatures_->votes_[0]->signature_ = std::move(signature);
+  return serialize_tl_object(std::move(tl_cert), true);
+}
+
 struct ResolvesWaitForParentFromBootstrapProofs : PoolTest {
   CandidateId parent_id_ = make_candidate_id(1, 1001);
 
@@ -914,6 +934,533 @@ struct NoncriticalParamsUpdateChangesStandstillTimeout : PoolTest {
   }
 };
 REGISTER_TEST(Pool, NoncriticalParamsUpdateChangesStandstillTimeout);
+
+// =============================================================================
+// Pool hardening regressions
+// =============================================================================
+
+// Corrupt one peer's vote, then reuse valid votes before and after ban expiry
+// to prove temporary quarantine and duplicate fast-path handling.
+struct InvalidSignedVoteBansPeerUntilExpiryAndIgnoresKnownDuplicates : PoolTest {
+  TestOptions options() const override {
+    auto opts = PoolTest::options();
+    opts.max_leader_window_desync = 0;
+    return opts;
+  }
+
+  void configure_bus(PoolBus& bus) override {
+    bus.config.noncritical_params.bad_signature_ban_duration = std::chrono::milliseconds{1000};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto id = make_candidate_id(0, 9000);
+    auto vote = simplex::NotarizeVote{id};
+    auto expected_cert = make_simplex_certificate(ctx(), *bus_, vote, {0, 1, 2});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    auto bad_serialized_vote = corrupt_serialized_vote(make_signed_simplex_vote(ctx(), *bus_, 0, vote).serialize());
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{std::move(bad_serialized_vote)});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<MisbehaviorReport>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+
+    auto good_peer_1 = make_signed_simplex_vote(ctx(), *bus_, 1, vote);
+    auto good_peer_2 = make_signed_simplex_vote(ctx(), *bus_, 2, vote);
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{1},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{good_peer_1.validator, simplex::Vote{good_peer_1.vote},
+                                                       good_peer_1.signature.clone()}
+                            .serialize()});
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{2},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{good_peer_2.validator, simplex::Vote{good_peer_2.vote},
+                                                       good_peer_2.signature.clone()}
+                            .serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<simplex::NotarizationObserved>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<OutgoingProtocolMessage>(events()), static_cast<size_t>(0));
+
+    auto good_peer_0_before_expiry = make_signed_simplex_vote(ctx(), *bus_, 0, vote);
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{0},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{good_peer_0_before_expiry.validator,
+                                                       simplex::Vote{good_peer_0_before_expiry.vote},
+                                                       good_peer_0_before_expiry.signature.clone()}
+                            .serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+
+    ts_.advance_time(1.1);
+    co_await ts_.wait_sync_work();
+
+    auto good_peer_0 = make_signed_simplex_vote(ctx(), *bus_, 0, vote);
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{0},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{good_peer_0.validator, simplex::Vote{good_peer_0.vote},
+                                                       good_peer_0.signature.clone()}
+                            .serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(1));
+    EXPECT_EQ(count_events<simplex::NotarizationObserved>(events()), static_cast<size_t>(1));
+    EXPECT_EQ(count_events<MisbehaviorReport>(events()), static_cast<size_t>(0));
+    EXPECT(contains_outgoing_payload(events(), expected_cert->serialize().as_slice()));
+
+    clear_events();
+    auto duplicate_bad_vote = corrupt_serialized_vote(
+        simplex::Signed<simplex::Vote>{good_peer_0.validator, simplex::Vote{good_peer_0.vote},
+                                       good_peer_0.signature.clone()}
+            .serialize());
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{std::move(duplicate_bad_vote)});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<MisbehaviorReport>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<OutgoingProtocolMessage>(events()), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, InvalidSignedVoteBansPeerUntilExpiryAndIgnoresKnownDuplicates);
+
+// Corrupt a certificate from one peer, then retry the valid certificate across
+// the ban window to prove the same quarantine rules apply to certs.
+struct InvalidSignedCertificateBansPeerUntilExpiryAndIgnoresKnownDuplicates : PoolTest {
+  void configure_bus(PoolBus& bus) override {
+    bus.config.noncritical_params.bad_signature_ban_duration = std::chrono::milliseconds{1000};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto id = make_candidate_id(0, 9100);
+    auto vote = simplex::NotarizeVote{id};
+    auto expected_cert = make_simplex_certificate(ctx(), *bus_, vote, {0, 1, 2});
+    auto bad_serialized_cert = corrupt_serialized_certificate(expected_cert->serialize());
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{std::move(bad_serialized_cert)});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<MisbehaviorReport>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<OutgoingProtocolMessage>(events()), static_cast<size_t>(0));
+
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{expected_cert->serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+
+    ts_.advance_time(1.1);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{expected_cert->serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(1));
+    EXPECT_EQ(count_events<simplex::NotarizationObserved>(events()), static_cast<size_t>(1));
+    EXPECT_EQ(count_events<MisbehaviorReport>(events()), static_cast<size_t>(0));
+    EXPECT(contains_outgoing_payload(events(), expected_cert->serialize().as_slice()));
+
+    clear_events();
+    auto duplicate_bad_cert = corrupt_serialized_certificate(expected_cert->serialize());
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{0}, ProtocolMessage{std::move(duplicate_bad_cert)});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<MisbehaviorReport>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<OutgoingProtocolMessage>(events()), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, InvalidSignedCertificateBansPeerUntilExpiryAndIgnoresKnownDuplicates);
+
+// Query the pool precheck API directly to cover the valid, duplicate,
+// finalized-slot, and too-future broadcast admission branches.
+struct PrecheckCandidateBroadcastCoversDuplicateFinalizedTooFutureAndValid : PoolTest {
+  TestOptions options() const override {
+    auto opts = PoolTest::options();
+    opts.max_leader_window_desync = 0;
+    return opts;
+  }
+
+  void configure_bus(PoolBus& bus) override {
+    auto final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{make_candidate_id(0, 9200)}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(final.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto valid = co_await handle_.publish<PrecheckCandidateBroadcast>(1).wrap();
+    ASSERT_TRUE(valid.is_ok());
+
+    auto duplicate = co_await handle_.publish<PrecheckCandidateBroadcast>(1).wrap();
+    ASSERT_TRUE(duplicate.is_error());
+    EXPECT(duplicate.error().message().str().find("Duplicate broadcast") != std::string::npos);
+
+    auto finalized = co_await handle_.publish<PrecheckCandidateBroadcast>(0).wrap();
+    ASSERT_TRUE(finalized.is_error());
+    EXPECT(finalized.error().message().str().find("already finalized") != std::string::npos);
+
+    auto too_future = co_await handle_.publish<PrecheckCandidateBroadcast>(2).wrap();
+    ASSERT_TRUE(too_future.is_error());
+    EXPECT(too_future.error().message().str().find("too far in the future") != std::string::npos);
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, PrecheckCandidateBroadcastCoversDuplicateFinalizedTooFutureAndValid);
+
+// Seed the pool with a finalized parent, a skipped gap, and a conflicting notar
+// to prove WaitForParent accepts the good chain and reports conflicts.
+struct WaitForParentAcceptsFinalizedParentAndRejectsConflictingSlot : PoolTest {
+  CandidateId parent_id_ = make_candidate_id(1, 9301);
+  CandidateId conflicting_id_ = make_candidate_id(3, 9303);
+
+  void configure_bus(PoolBus& bus) override {
+    auto final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{parent_id_}, {0, 1, 2});
+    auto skip = make_simplex_certificate(ctx(), bus, simplex::SkipVote{2}, {0, 1, 2});
+    auto conflict = make_simplex_certificate(ctx(), bus, simplex::NotarizeVote{conflicting_id_}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(final.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(skip.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(conflict.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto candidate = make_wait_candidate(make_candidate_id(2, 9304), ParentId{parent_id_});
+    auto conflicting_candidate = make_wait_candidate(make_candidate_id(3, 9305), ParentId{parent_id_});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto result = co_await handle_.publish<simplex::WaitForParent>(candidate).wrap();
+    ASSERT_TRUE(result.is_ok());
+    EXPECT(!result.ok().has_value());
+
+    auto conflict = co_await handle_.publish<simplex::WaitForParent>(conflicting_candidate).wrap();
+    ASSERT_TRUE(conflict.is_ok());
+    ASSERT_TRUE(conflict.ok().has_value());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, WaitForParentAcceptsFinalizedParentAndRejectsConflictingSlot);
+
+// Trigger standstill with multiple replay items and advance the scheduler in
+// steps to prove recovery egress is paced instead of emitted in one burst.
+struct StandstillReplayIsPacedAcrossSchedulerTicks : PoolTest {
+  td::BufferSlice final_payload_;
+  td::BufferSlice skip_payload_;
+
+  void configure_bus(PoolBus& bus) override {
+    bus.config.noncritical_params.standstill_timeout = std::chrono::milliseconds{3000};
+    bus.config.noncritical_params.standstill_max_egress_bytes_per_s = 1000;
+    auto final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{make_candidate_id(0, 9400)}, {0, 1, 2});
+    auto skip = make_simplex_certificate(ctx(), bus, simplex::SkipVote{1}, {0, 1, 2});
+    final_payload_ = final->serialize();
+    skip_payload_ = skip->serialize();
+    bus.bootstrap_certificates.push_back(std::move(final.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(skip.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    auto delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(delay));
+
+    ts_.advance_time(delay);
+    co_await ts_.wait_sync_work();
+    co_await advance_until([&] { return contains_outgoing_payload(events(), final_payload_.as_slice()); });
+
+    EXPECT_EQ(outgoing_payload_position(events(), final_payload_.as_slice()), static_cast<size_t>(0));
+    EXPECT(count_events<OutgoingProtocolMessage>(events()) >= static_cast<size_t>(1));
+    EXPECT(contains_outgoing_payload(events(), final_payload_.as_slice()));
+
+    auto paced_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(paced_delay));
+    EXPECT(paced_delay > 0);
+
+    ts_.advance_time(paced_delay * 0.5);
+    co_await ts_.wait_sync_work();
+    EXPECT_EQ(count_events<OutgoingProtocolMessage>(events()), static_cast<size_t>(1));
+
+    ts_.advance_time(paced_delay);
+    co_await ts_.wait_sync_work();
+    EXPECT(count_events<OutgoingProtocolMessage>(events()) >= static_cast<size_t>(2));
+    EXPECT(contains_outgoing_payload(events(), skip_payload_.as_slice()));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, StandstillReplayIsPacedAcrossSchedulerTicks);
+
+// Create one ban under the old duration, update the runtime params, then ban a
+// second peer to prove only new bans use the new timeout.
+struct NoncriticalParamsUpdateChangesBanDurationForNewBans : PoolTest {
+  void configure_bus(PoolBus& bus) override {
+    bus.config.noncritical_params.bad_signature_ban_duration = std::chrono::milliseconds{1000};
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto id = make_candidate_id(0, 9150);
+    auto vote = simplex::NotarizeVote{id};
+    auto peer0_vote = make_signed_simplex_vote(ctx(), *bus_, 0, vote);
+    auto peer1_vote = make_signed_simplex_vote(ctx(), *bus_, 1, vote);
+    auto peer2_vote = make_signed_simplex_vote(ctx(), *bus_, 2, vote);
+    auto expected_cert = make_simplex_certificate(ctx(), *bus_, vote, {0, 1, 2});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{0}, ProtocolMessage{corrupt_serialized_vote(peer0_vote.serialize())});
+    co_await ts_.wait_sync_work();
+
+    auto new_params = bus_->config.noncritical_params;
+    new_params.bad_signature_ban_duration = std::chrono::milliseconds{5000};
+    handle_.publish<NoncriticalParamsUpdated>(new_params);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{1}, ProtocolMessage{corrupt_serialized_vote(peer1_vote.serialize())});
+    co_await ts_.wait_sync_work();
+
+    ts_.advance_time(1.1);
+    co_await ts_.wait_sync_work();
+
+    clear_events();
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{0},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{peer0_vote.validator, simplex::Vote{peer0_vote.vote},
+                                                       peer0_vote.signature.clone()}
+                            .serialize()});
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{1},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{peer1_vote.validator, simplex::Vote{peer1_vote.vote},
+                                                       peer1_vote.signature.clone()}
+                            .serialize()});
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{2},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{peer2_vote.validator, simplex::Vote{peer2_vote.vote},
+                                                       peer2_vote.signature.clone()}
+                            .serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(0));
+    EXPECT_EQ(count_events<simplex::NotarizationObserved>(events()), static_cast<size_t>(0));
+
+    ts_.advance_time(4.1);
+    co_await ts_.wait_sync_work();
+
+    handle_.publish<IncomingProtocolMessage>(
+        PeerValidatorId{1},
+        ProtocolMessage{simplex::Signed<simplex::Vote>{peer1_vote.validator, simplex::Vote{peer1_vote.vote},
+                                                       peer1_vote.signature.clone()}
+                            .serialize()});
+    co_await ts_.wait_sync_work();
+
+    EXPECT_EQ(count_events<simplex::SaveCertificate>(events()), static_cast<size_t>(1));
+    EXPECT_EQ(count_events<simplex::NotarizationObserved>(events()), static_cast<size_t>(1));
+    EXPECT(contains_outgoing_payload(events(), expected_cert->serialize().as_slice()));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, NoncriticalParamsUpdateChangesBanDurationForNewBans);
+
+// Bootstrap the slot with a matching notarization certificate and verify
+// WaitForParent succeeds immediately for the same candidate id.
+struct WaitForParentAcceptsAlreadyNotarizedCandidateAtSameSlot : PoolTest {
+  CandidateId parent_id_ = make_candidate_id(2, 9302);
+  CandidateId candidate_id_ = make_candidate_id(3, 9303);
+
+  void configure_bus(PoolBus& bus) override {
+    auto parent_final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{parent_id_}, {0, 1, 2});
+    auto candidate_notar =
+        make_simplex_certificate(ctx(), bus, simplex::NotarizeVote{candidate_id_}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(parent_final.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(candidate_notar.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto candidate = make_wait_candidate(candidate_id_, ParentId{parent_id_});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto result = co_await handle_.publish<simplex::WaitForParent>(candidate).wrap();
+    ASSERT_TRUE(result.is_ok());
+    EXPECT(!result.ok().has_value());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, WaitForParentAcceptsAlreadyNotarizedCandidateAtSameSlot);
+
+// Start a standstill replay, inject a newer finalization mid-sweep, and assert
+// the old replay stops before leaking stale payload ahead of the new frontier.
+struct StandstillReplayRestartsFromNewFinalization : PoolTest {
+  td::BufferSlice old_final_payload_;
+  td::BufferSlice new_final_payload_;
+
+  void configure_bus(PoolBus& bus) override {
+    bus.config.noncritical_params.standstill_timeout = std::chrono::milliseconds{3000};
+    bus.config.noncritical_params.standstill_max_egress_bytes_per_s = 1000;
+    auto final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{make_candidate_id(0, 9500)}, {0, 1, 2});
+    auto skip = make_simplex_certificate(ctx(), bus, simplex::SkipVote{1}, {0, 1, 2});
+    old_final_payload_ = final->serialize();
+    bus.bootstrap_certificates.push_back(std::move(final.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(skip.unique_write()).consume_and_upcast());
+    auto new_final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{make_candidate_id(3, 9503)},
+                                              {0, 1, 2});
+    new_final_payload_ = new_final->serialize();
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    auto first_alarm = ts_.next_timeout_in();
+    ts_.advance_time(first_alarm);
+    co_await ts_.wait_sync_work();
+    co_await advance_until([&] { return contains_outgoing_payload(events(), old_final_payload_.as_slice()); });
+    EXPECT_EQ(outgoing_payload_position(events(), old_final_payload_.as_slice()), static_cast<size_t>(0));
+
+    clear_events();
+
+    PoolBus seed_bus;
+    fill_simplex_bus(ctx(), seed_bus, 1);
+    auto new_final = make_simplex_certificate(ctx(), seed_bus, simplex::FinalizeVote{make_candidate_id(3, 9503)},
+                                              {0, 1, 2});
+    handle_.publish<IncomingProtocolMessage>(PeerValidatorId{1}, ProtocolMessage{new_final->serialize()});
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    auto carryover_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(carryover_delay));
+    ts_.advance_time(carryover_delay);
+    co_await ts_.wait_sync_work();
+    EXPECT_EQ(count_events<OutgoingProtocolMessage>(events()), static_cast<size_t>(0));
+
+    co_await advance_until([&] { return contains_outgoing_payload(events(), new_final_payload_.as_slice()); });
+    EXPECT_EQ(outgoing_payload_position(events(), new_final_payload_.as_slice()), static_cast<size_t>(0));
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, StandstillReplayRestartsFromNewFinalization);
+
+// Measure one standstill replay under slow egress, then raise the runtime
+// egress cap and assert the next replay cycle is scheduled much sooner.
+struct NoncriticalParamsUpdateChangesStandstillEgressForNextCycle : PoolTest {
+  td::BufferSlice final_payload_;
+
+  void configure_bus(PoolBus& bus) override {
+    bus.config.noncritical_params.standstill_timeout = std::chrono::milliseconds{3000};
+    bus.config.noncritical_params.standstill_max_egress_bytes_per_s = 100;
+    auto final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{make_candidate_id(0, 9600)}, {0, 1, 2});
+    final_payload_ = final->serialize();
+    bus.bootstrap_certificates.push_back(std::move(final.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+    clear_events();
+
+    auto first_alarm = ts_.next_timeout_in();
+    ts_.advance_time(first_alarm);
+    co_await ts_.wait_sync_work();
+
+    auto first_replay_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(first_replay_delay));
+    EXPECT(first_replay_delay > 0.1);
+
+    ts_.advance_time(first_replay_delay);
+    co_await ts_.wait_sync_work();
+    co_await advance_until([&] { return contains_outgoing_payload(events(), final_payload_.as_slice()); });
+
+    clear_events();
+    auto new_params = bus_->config.noncritical_params;
+    new_params.standstill_max_egress_bytes_per_s = 1'000'000'000;
+    handle_.publish<NoncriticalParamsUpdated>(new_params);
+    co_await ts_.wait_sync_work();
+
+    auto second_alarm = ts_.next_timeout_in();
+    ts_.advance_time(second_alarm);
+    co_await ts_.wait_sync_work();
+
+    auto second_replay_delay = ts_.next_timeout_in();
+    EXPECT(std::isfinite(second_replay_delay));
+    EXPECT(second_replay_delay < first_replay_delay / 100.0);
+
+    ts_.advance_time(second_replay_delay);
+    co_await ts_.wait_sync_work();
+    co_await advance_until([&] { return contains_outgoing_payload(events(), final_payload_.as_slice()); });
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, NoncriticalParamsUpdateChangesStandstillEgressForNextCycle);
+
+// Bootstrap the exact latest finalized candidate for the slot and verify
+// WaitForParent treats that finalization as satisfied, not as a hard conflict.
+struct WaitForParentAcceptsLatestFinalizedCandidateAtSameSlot : PoolTest {
+  CandidateId parent_id_ = make_candidate_id(2, 9312);
+  CandidateId candidate_id_ = make_candidate_id(3, 9313);
+
+  void configure_bus(PoolBus& bus) override {
+    auto parent_final = make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{parent_id_}, {0, 1, 2});
+    auto candidate_final =
+        make_simplex_certificate(ctx(), bus, simplex::FinalizeVote{candidate_id_}, {0, 1, 2});
+    bus.bootstrap_certificates.push_back(std::move(parent_final.unique_write()).consume_and_upcast());
+    bus.bootstrap_certificates.push_back(std::move(candidate_final.unique_write()).consume_and_upcast());
+  }
+
+  td::actor::Task<td::Unit> run_test() override {
+    auto state = make_normal_state(ctx().shard(), 1, min_mc_block_id);
+    auto candidate = make_wait_candidate(candidate_id_, ParentId{parent_id_});
+
+    handle_.publish<Start>(state);
+    co_await ts_.wait_sync_work();
+
+    auto result = co_await handle_.publish<simplex::WaitForParent>(candidate).wrap();
+    ASSERT_TRUE(result.is_ok());
+    EXPECT(!result.ok().has_value());
+
+    co_return {};
+  }
+};
+REGISTER_TEST(Pool, WaitForParentAcceptsLatestFinalizedCandidateAtSameSlot);
 
 }  // namespace
 }  // namespace ton::validator::consensus::test

@@ -31,8 +31,10 @@ add_subdirectory(integration)
 foreach(TEST_NAME
     test-block-validator
     test-block-producer
+    test-bridge
     test-candidate-resolver
     test-pool
+    test-private-overlay
     test-simplex-db
     test-simplex-consensus
     test-simplex-parser

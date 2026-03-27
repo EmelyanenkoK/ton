@@ -26,4 +26,18 @@ target_link_libraries(test-mc-config PRIVATE
 )
 ton_test(test-mc-config)
 
+add_executable(test-validator-options test-validator-options.cpp)
+target_link_libraries(test-validator-options PRIVATE
+    adnl
+    dht
+    overlay
+    tdactor
+    tdutils
+    tl_api
+    ton_validator
+    validator
+    td-test-main
+)
+ton_test(test-validator-options)
+
 add_subdirectory(consensus)

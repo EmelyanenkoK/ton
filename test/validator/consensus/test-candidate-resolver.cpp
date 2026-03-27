@@ -216,6 +216,92 @@ struct DoesNotLeakUnrequestedCandidateBody : CandidateResolverTest {
 };
 REGISTER_TEST(CandidateResolver, DoesNotLeakUnrequestedCandidateBody);
 
+// Send repeated incoming requestCandidate RPCs to prove per-peer limiting,
+// window expiry, cross-peer independence, and immediate config refresh.
+struct EnforcesIngressRateLimitAndRefreshesOnConfigChange : CandidateResolverTest {
+  td::actor::Task<td::Unit> run_test() override {
+    auto params = bus_->config.noncritical_params;
+    params.candidate_resolve_rate_limit = 1;
+    update_noncritical_params(params);
+    co_await ts_.wait_sync_work();
+
+    auto request_id = make_candidate_id(0, 1200);
+    auto send_request = [&](PeerValidatorId peer) {
+      return handle_.publish<IncomingOverlayRequest>(
+                     peer,
+                     ProtocolMessage{create_tl_object<ton_api::consensus_simplex_requestCandidate>(
+                         request_id.to_tl(), true, true)})
+          .wrap();
+    };
+
+    auto expect_empty_response = [&](const ProtocolMessage& response) {
+      auto response_tl =
+          fetch_tl_object<ton_api::consensus_simplex_candidateAndCert>(response.data, true).move_as_ok();
+      EXPECT(response_tl->candidate_.empty());
+      EXPECT(response_tl->notar_.empty());
+    };
+
+    auto first = co_await send_request(PeerValidatorId{1});
+    ASSERT_TRUE(first.is_ok());
+    expect_empty_response(first.ok());
+
+    auto second = co_await send_request(PeerValidatorId{1});
+    ASSERT_TRUE(second.is_error());
+    EXPECT_EQ(second.error().message().str(), "too many requests");
+
+    auto other_peer = co_await send_request(PeerValidatorId{2});
+    ASSERT_TRUE(other_peer.is_ok());
+    expect_empty_response(other_peer.ok());
+
+    ts_.advance_time(1.1);
+    co_await ts_.wait_sync_work();
+
+    auto after_window = co_await send_request(PeerValidatorId{1});
+    ASSERT_TRUE(after_window.is_ok());
+    expect_empty_response(after_window.ok());
+
+    params.candidate_resolve_rate_limit = 2;
+    update_noncritical_params(params);
+    co_await ts_.wait_sync_work();
+
+    auto post_update_1 = co_await send_request(PeerValidatorId{1});
+    ASSERT_TRUE(post_update_1.is_ok());
+    expect_empty_response(post_update_1.ok());
+
+    auto post_update_2 = co_await send_request(PeerValidatorId{1});
+    ASSERT_TRUE(post_update_2.is_ok());
+    expect_empty_response(post_update_2.ok());
+
+    auto post_update_3 = co_await send_request(PeerValidatorId{1});
+    ASSERT_TRUE(post_update_3.is_error());
+    EXPECT_EQ(post_update_3.error().message().str(), "too many requests");
+
+    co_return {};
+  }
+};
+REGISTER_TEST(CandidateResolver, EnforcesIngressRateLimitAndRefreshesOnConfigChange);
+
+// Set the ingress limit to zero and issue one request to lock in the reject-all
+// boundary behavior.
+struct RejectsAllIngressRequestsWhenRateLimitIsZero : CandidateResolverTest {
+  td::actor::Task<td::Unit> run_test() override {
+    auto params = bus_->config.noncritical_params;
+    params.candidate_resolve_rate_limit = 0;
+    update_noncritical_params(params);
+    co_await ts_.wait_sync_work();
+
+    auto request_id = make_candidate_id(0, 1201);
+    auto request = create_tl_object<ton_api::consensus_simplex_requestCandidate>(request_id.to_tl(), true, true);
+    auto result = co_await handle_.publish<IncomingOverlayRequest>(PeerValidatorId{1}, ProtocolMessage{std::move(request)}).wrap();
+
+    ASSERT_TRUE(result.is_error());
+    EXPECT_EQ(result.error().message().str(), "too many requests");
+
+    co_return {};
+  }
+};
+REGISTER_TEST(CandidateResolver, RejectsAllIngressRequestsWhenRateLimitIsZero);
+
 // =============================================================================
 // Tests: resolving candidates from peers (outgoing requests)
 // =============================================================================
