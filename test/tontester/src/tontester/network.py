@@ -237,12 +237,16 @@ class Network:
         install: Install,
         directory: Path,
         event_loop: asyncio.AbstractEventLoop | None = None,
+        quic_flood_control: int | None = -1,
+        verbosity: int | None = None,
     ):
         self._install = install
         self._directory = directory.absolute()
         self._port = 2000
         self._node_idx = 0
         self._status = _Status.INITED
+        self._quic_flood_control = quic_flood_control
+        self._verbosity = verbosity
 
         self._tonlib = install.tonlibjson
         self._event_loop = TonlibEventLoop(self._tonlib, event_loop)
@@ -540,18 +544,28 @@ class FullNode(Network.Node):
                 (static_dir / state.file_hash.hex().upper()).symlink_to(state.file)
             self._static_populated = True
 
+        additional_args = [
+            "--initial-sync-delay",
+            "5",
+            "--session-logs",
+            str(self.session_log_path),
+        ]
+        if self._network._quic_flood_control is not None:
+            additional_args += [
+                "--quic-flood-control",
+                str(self._network._quic_flood_control),
+            ]
+        if self._network._verbosity is not None:
+            additional_args += [
+                "--verbosity",
+                str(self._network._verbosity),
+            ]
+
         await self._run(
             self._install.validator_engine_exe,
             self._local_config,
             zerostate.as_validator_config(),
-            [
-                "--initial-sync-delay",
-                "5",
-                "--session-logs",
-                str(self.session_log_path),
-                "--quic-flood-control",
-                "-1",
-            ],
+            additional_args,
             debug=debug,
         )
 
