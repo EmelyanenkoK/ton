@@ -4259,9 +4259,11 @@ td::actor::Task<> Collator::process_external_and_new_messages() {
   while (true) {
     // 5. import inbound external messages (if space&gas left)
     LOG(INFO) << "process inbound external messages";
+    timer_guard.reset();
     if (!co_await process_inbound_external_messages()) {
       co_return td::Status::Error("cannot process inbound external messages");
     }
+    timer_guard = WorkTimerGuard(work_timer_);
     // 6. process newly-generated messages (if space&gas left)
     //    (if we were unable to process all inbound messages, all new messages must be queued)
     LOG(INFO) << "process newly-generated messages";
@@ -4337,6 +4339,7 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       }
       item = maybe.move_as_ok();
     }
+    WorkTimerGuard timer_guard(work_timer_);
     auto [ext_msg_ref, priority] = std::move(item);
     ++stats_.ext_msgs_total;
     if (register_external_message(ext_msg_ref, priority).is_error()) {
