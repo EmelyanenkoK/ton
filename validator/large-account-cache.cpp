@@ -20,6 +20,7 @@
 
 #include "td/utils/misc.h"
 #include "td/utils/port/path.h"
+#include "td/utils/ScopeGuard.h"
 #include "vm/boc.h"
 
 namespace ton::validator {
@@ -27,6 +28,7 @@ namespace {
 
 constexpr char LARGE_ACCOUNT_CACHE_VERSION = 1;
 constexpr const char* USED_BYTES_KEY = "meta/used_bytes";
+constexpr double MAX_UPDATE_QUEUE_AGE = 3.0;
 
 std::string entry_key(const td::Bits256& hash) {
   return PSTRING() << "entry/" << hash.to_hex();
@@ -150,17 +152,27 @@ void LargeAccountCache::start_up() {
     LOG(ERROR) << "Failed to open large-account cache DB at " << db_path_ << ": " << r_db.error();
     return;
   }
-  state_->kv = std::make_shared<td::RocksDb>(r_db.move_as_ok());
+  state_->write_kv = std::make_shared<td::RocksDb>(r_db.move_as_ok());
+  state_->read_kv = std::make_shared<td::RocksDb>(state_->write_kv->clone());
 }
 
 td::optional<LargeAccountCacheValue> LargeAccountCache::State::lookup(const td::Bits256& hash) const {
-  if (hash.is_zero() || !kv) {
+  if (hash.is_zero() || !read_kv) {
     return td::optional<LargeAccountCacheValue>();
   }
 
-  auto r_value = get_optional_string(*kv, entry_key(hash));
+  auto hash_hex = hash.to_hex();
+  {
+    std::lock_guard<std::mutex> lock(in_flight_mutex);
+    auto it = in_flight_entries.find(hash_hex);
+    if (it != in_flight_entries.end()) {
+      return it->second;
+    }
+  }
+
+  auto r_value = get_optional_string(*read_kv, entry_key(hash));
   if (r_value.is_error()) {
-    LOG(INFO) << "Failed to read large-account cache entry " << hash.to_hex() << ": " << r_value.error();
+    LOG(INFO) << "Failed to read large-account cache entry " << hash_hex << ": " << r_value.error();
     return td::optional<LargeAccountCacheValue>();
   }
   auto opt_value = r_value.move_as_ok();
@@ -170,13 +182,13 @@ td::optional<LargeAccountCacheValue> LargeAccountCache::State::lookup(const td::
 
   auto r_entry = deserialize_entry(*opt_value);
   if (r_entry.is_error()) {
-    LOG(INFO) << "Failed to decode large-account cache entry " << hash.to_hex() << ": " << r_entry.error();
+    LOG(INFO) << "Failed to decode large-account cache entry " << hash_hex << ": " << r_entry.error();
     return td::optional<LargeAccountCacheValue>();
   }
   auto entry = r_entry.move_as_ok();
   auto loaded_hash = td::Bits256{entry.dict_root->get_hash().bits()};
   if (loaded_hash != hash) {
-    LOG(INFO) << "Large-account cache entry hash mismatch: expected " << hash.to_hex() << " got "
+    LOG(INFO) << "Large-account cache entry hash mismatch: expected " << hash_hex << " got "
               << loaded_hash.to_hex();
     return td::optional<LargeAccountCacheValue>();
   }
@@ -184,7 +196,7 @@ td::optional<LargeAccountCacheValue> LargeAccountCache::State::lookup(const td::
 }
 
 void LargeAccountCache::get_access(td::Promise<LargeAccountCacheAccess> promise) {
-  if (!state_->kv) {
+  if (!state_->read_kv) {
     promise.set_value(LargeAccountCacheAccess{});
     return;
   }
@@ -197,10 +209,51 @@ void LargeAccountCache::get_access(td::Promise<LargeAccountCacheAccess> promise)
 }
 
 void LargeAccountCache::update(std::vector<LargeAccountCacheUpdate> updates) {
-  if (!state_->kv || updates.empty()) {
+  if (!state_->write_kv || updates.empty()) {
     return;
   }
-  auto status = update_impl(std::move(updates));
+  auto now = td::Timestamp::now();
+  std::vector<LargeAccountCacheUpdate> filtered;
+  filtered.reserve(updates.size());
+  std::size_t stale_updates = 0;
+  for (auto& update : updates) {
+    if (update.enqueued_at && now - update.enqueued_at > MAX_UPDATE_QUEUE_AGE) {
+      stale_updates++;
+      continue;
+    }
+    filtered.push_back(std::move(update));
+  }
+  if (stale_updates != 0) {
+    LOG(INFO) << "Large-account cache: skipped " << stale_updates << " stale update(s)";
+  }
+  if (filtered.empty()) {
+    return;
+  }
+  {
+    std::unordered_map<std::string, LargeAccountCacheValue> in_flight_entries;
+    in_flight_entries.reserve(filtered.size());
+    for (const auto& update : filtered) {
+      if (!update.has_storage_dict_hash() || update.dict_root.is_null()) {
+        continue;
+      }
+      in_flight_entries[update.storage_dict_hash.value().to_hex()] = LargeAccountCacheValue{update.dict_root, update.roots};
+    }
+    std::lock_guard<std::mutex> lock(state_->in_flight_mutex);
+    state_->in_flight_entries = std::move(in_flight_entries);
+  }
+  SCOPE_EXIT {
+    std::lock_guard<std::mutex> lock(state_->in_flight_mutex);
+    state_->in_flight_entries.clear();
+  };
+  std::function<void()> before_write_test_hook;
+  {
+    std::lock_guard<std::mutex> lock(state_->before_write_test_hook_mutex);
+    before_write_test_hook = state_->before_write_test_hook;
+  }
+  if (before_write_test_hook) {
+    before_write_test_hook();
+  }
+  auto status = update_impl(std::move(filtered));
   if (status.is_error()) {
     LOG(INFO) << "Large-account cache update failed: " << status;
   }
@@ -213,7 +266,7 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
     deduped[current_key(update.workchain, update.addr)] = std::move(update);
   }
 
-  auto& kv = *state_->kv;
+  auto& kv = *state_->write_kv;
   TRY_STATUS(kv.begin_write_batch());
   auto status = [&]() -> td::Status {
     TRY_RESULT(opt_used_bytes, get_optional_uint64(kv, td::Slice(USED_BYTES_KEY)));
@@ -366,6 +419,15 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
     return status;
   }
   return kv.commit_write_batch();
+}
+
+void LargeAccountCache::set_before_write_test_hook(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lock(state_->before_write_test_hook_mutex);
+  state_->before_write_test_hook = std::move(hook);
+}
+
+void LargeAccountCacheTestAccess::set_before_write_hook(LargeAccountCache& cache, std::function<void()> hook) {
+  cache.set_before_write_test_hook(std::move(hook));
 }
 
 }  // namespace ton::validator

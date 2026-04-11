@@ -20,7 +20,12 @@
 #include "td/actor/actor.h"
 #include "td/db/RocksDb.h"
 
+#include <mutex>
+#include <unordered_map>
+
 namespace ton::validator {
+
+struct LargeAccountCacheTestAccess;
 
 class LargeAccountCache : public td::actor::Actor {
  public:
@@ -35,7 +40,12 @@ class LargeAccountCache : public td::actor::Actor {
   struct State {
     td::uint64 size_cap_bytes{0};
     td::uint32 min_account_cells{0};
-    std::shared_ptr<td::RocksDb> kv;
+    std::shared_ptr<td::RocksDb> read_kv;
+    std::shared_ptr<td::RocksDb> write_kv;
+    mutable std::mutex in_flight_mutex;
+    std::unordered_map<std::string, LargeAccountCacheValue> in_flight_entries;
+    mutable std::mutex before_write_test_hook_mutex;
+    std::function<void()> before_write_test_hook;
 
     td::optional<LargeAccountCacheValue> lookup(const td::Bits256& hash) const;
   };
@@ -44,6 +54,13 @@ class LargeAccountCache : public td::actor::Actor {
   std::shared_ptr<State> state_ = std::make_shared<State>();
 
   td::Status update_impl(std::vector<LargeAccountCacheUpdate> updates);
+  void set_before_write_test_hook(std::function<void()> hook);
+
+  friend struct LargeAccountCacheTestAccess;
+};
+
+struct LargeAccountCacheTestAccess {
+  static void set_before_write_hook(LargeAccountCache& cache, std::function<void()> hook);
 };
 
 }  // namespace ton::validator

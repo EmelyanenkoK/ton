@@ -463,15 +463,13 @@ void ValidateQuery::start_up() {
                                                                 &ValidateQuery::after_get_storage_stat_cache,
                                                                 std::move(res), std::move(token));
                                 });
-  ++pending;
   LOG(DEBUG) << "sending get_large_account_cache_access() query to Manager";
   td::actor::send_closure_later(
       manager, &ValidatorManager::get_large_account_cache_access,
-      [self = get_self(), token = perf_log_.start_action("get_large_account_cache_access")](
-          td::Result<LargeAccountCacheAccess> res) mutable {
+      [self = get_self()](td::Result<LargeAccountCacheAccess> res) mutable {
         LOG(DEBUG) << "got answer to get_large_account_cache_access() query";
         td::actor::send_closure_later(std::move(self), &ValidateQuery::after_get_large_account_cache_access,
-                                      std::move(res), std::move(token));
+                                      std::move(res));
       });
   // ...
   REJECT_UNLESS_VOID(pending);
@@ -940,20 +938,12 @@ void ValidateQuery::after_get_storage_stat_cache(td::Result<std::function<td::Re
   }
 }
 
-void ValidateQuery::after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res,
-                                                         td::PerfLogAction token) {
-  token.finish(res);
-  --pending;
+void ValidateQuery::after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res) {
   if (res.is_error()) {
     LOG(INFO) << "after_get_large_account_cache_access : " << res.error();
   } else {
     LOG(DEBUG) << "after_get_large_account_cache_access : OK";
     large_account_cache_ = res.move_as_ok();
-  }
-  if (!pending) {
-    if (!try_validate()) {
-      fatal_error("cannot validate new block");
-    }
   }
 }
 

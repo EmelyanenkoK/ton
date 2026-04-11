@@ -109,6 +109,7 @@ struct LargeAccountCacheUpdate {
   td::optional<td::Bits256> storage_dict_hash;
   td::Ref<vm::Cell> dict_root;
   std::vector<td::Ref<vm::Cell>> roots;
+  td::Timestamp enqueued_at = td::Timestamp::now();
 
   bool has_storage_dict_hash() const {
     return storage_dict_hash && !storage_dict_hash.value().is_zero();

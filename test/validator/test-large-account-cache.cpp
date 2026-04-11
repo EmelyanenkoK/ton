@@ -1,5 +1,8 @@
 #include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -71,20 +74,23 @@ StdSmcAddress make_address(char hex_digit) {
   return addr;
 }
 
-LargeAccountCacheUpdate make_update(StdSmcAddress addr, const CacheEntryData& entry) {
+LargeAccountCacheUpdate make_update(StdSmcAddress addr, const CacheEntryData& entry,
+                                    td::Timestamp enqueued_at = td::Timestamp::now()) {
   LargeAccountCacheUpdate update;
   update.workchain = basechainId;
   update.addr = addr;
   update.storage_dict_hash = entry.hash();
   update.dict_root = entry.dict_root;
   update.roots = entry.roots;
+  update.enqueued_at = enqueued_at;
   return update;
 }
 
-LargeAccountCacheUpdate make_remove_update(StdSmcAddress addr) {
+LargeAccountCacheUpdate make_remove_update(StdSmcAddress addr, td::Timestamp enqueued_at = td::Timestamp::now()) {
   LargeAccountCacheUpdate update;
   update.workchain = basechainId;
   update.addr = addr;
+  update.enqueued_at = enqueued_at;
   return update;
 }
 
@@ -194,6 +200,62 @@ TEST(LargeAccountCache, SharedHashStaysUntilLastOwnerLeaves) {
   cache.update({make_remove_update(second_account)});
   ASSERT_TRUE(!access.lookup(shared_entry.hash()));
   assert_lookup_matches(access, replacement_entry);
+}
+
+TEST(LargeAccountCache, StaleUpdatesAreDropped) {
+  TempDir temp_dir("large-account-cache");
+  auto db_path = temp_dir.path() + "/db";
+  auto entry = make_entry('5');
+  auto address = make_address('5');
+
+  LargeAccountCache cache(db_path, 1 << 20, 16384);
+  cache.start_up();
+  auto access = get_large_account_cache_access(cache);
+
+  cache.update({make_update(address, entry, td::Timestamp::now() - 10.0)});
+  ASSERT_TRUE(!access.lookup(entry.hash()));
+}
+
+TEST(LargeAccountCache, LookupSeesInFlightWrite) {
+  TempDir temp_dir("large-account-cache");
+  auto db_path = temp_dir.path() + "/db";
+  auto entry = make_entry('6');
+  auto address = make_address('6');
+
+  LargeAccountCache cache(db_path, 1 << 20, 16384);
+  cache.start_up();
+  auto access = get_large_account_cache_access(cache);
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool write_is_paused = false;
+  bool continue_write = false;
+  LargeAccountCacheTestAccess::set_before_write_hook(cache, [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    write_is_paused = true;
+    cv.notify_all();
+    cv.wait(lock, [&] { return continue_write; });
+  });
+
+  std::thread writer([&] {
+    cache.update({make_update(address, entry)});
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return write_is_paused; });
+  }
+
+  assert_lookup_matches(access, entry);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    continue_write = true;
+  }
+  cv.notify_all();
+  writer.join();
+
+  assert_lookup_matches(access, entry);
 }
 
 TEST(StorageStatCache, LiveLookupSeesLaterUpdates) {

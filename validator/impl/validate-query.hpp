@@ -330,7 +330,7 @@ class ValidateQuery : public td::actor::Actor {
   void got_mc_handle(td::Result<BlockHandle> res, td::PerfLogAction token);
   void after_get_storage_stat_cache(td::Result<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> res,
                                     td::PerfLogAction token);
-  void after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res, td::PerfLogAction token);
+  void after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res);
   void after_get_shard_state(int idx, td::Result<Ref<ShardState>> res, td::PerfLogAction token);
   bool process_mc_state(Ref<MasterchainState> mc_state);
   bool try_unpack_mc_state();
