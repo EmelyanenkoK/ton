@@ -85,6 +85,36 @@ struct StorageStatCacheStats {
   }
 };
 
+struct LargeAccountCacheValue {
+  td::Ref<vm::Cell> dict_root;
+  std::vector<td::Ref<vm::Cell>> roots;
+
+  bool empty() const {
+    return dict_root.is_null();
+  }
+};
+
+struct LargeAccountCacheAccess {
+  td::uint32 min_account_cells{0};
+  std::function<td::optional<LargeAccountCacheValue>(const td::Bits256&)> lookup;
+
+  bool enabled() const {
+    return min_account_cells != 0 && static_cast<bool>(lookup);
+  }
+};
+
+struct LargeAccountCacheUpdate {
+  WorkchainId workchain{workchainInvalid};
+  StdSmcAddress addr;
+  td::optional<td::Bits256> storage_dict_hash;
+  td::Ref<vm::Cell> dict_root;
+  std::vector<td::Ref<vm::Cell>> roots;
+
+  bool has_storage_dict_hash() const {
+    return storage_dict_hash && !storage_dict_hash.value().is_zero();
+  }
+};
+
 struct CollationStats {
   BlockIdExt block_id{workchainInvalid, 0, 0, RootHash::zero(), FileHash::zero()};
   td::Status status = td::Status::OK();
@@ -442,6 +472,15 @@ class ValidatorManager : public ValidatorManagerInterface {
     promise.set_error(td::Status::Error("not implemented"));
   }
   virtual void update_storage_stat_cache(std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> data) {
+    // not implemented
+  }
+  virtual void get_large_account_cache_access(td::Promise<LargeAccountCacheAccess> promise) {
+    promise.set_value(LargeAccountCacheAccess{});
+  }
+  virtual void update_large_account_cache(std::vector<LargeAccountCacheUpdate> updates) {
+    // not implemented
+  }
+  virtual void populate_large_account_cache_from_block(td::Ref<BlockData> block, td::Ref<ShardState> state) {
     // not implemented
   }
 

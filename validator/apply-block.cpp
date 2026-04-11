@@ -193,6 +193,9 @@ void ApplyBlock::got_cur_state(td::Ref<ShardState> state) {
 
 void ApplyBlock::written_state() {
   VLOG(VALIDATOR_DEBUG) << "written_state";
+  if (block_.not_null() && state_.not_null()) {
+    td::actor::send_closure(manager_, &ValidatorManager::populate_large_account_cache_from_block, block_, state_);
+  }
   if (handle_->is_applied() && handle_->processed()) {
     finish_query();
     return;

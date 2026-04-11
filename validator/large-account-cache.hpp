@@ -14,25 +14,36 @@
     You should have received a copy of the GNU Lesser General Public License
     along with TON Blockchain Library.  If not, see <http://www.gnu.org/licenses/>.
 */
-#include "storage-stat-cache.hpp"
+#pragma once
+
+#include "interfaces/validator-manager.h"
+#include "td/actor/actor.h"
+#include "td/db/RocksDb.h"
 
 namespace ton::validator {
 
-void StorageStatCache::get_cache(td::Promise<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> promise) {
-  LOG(DEBUG) << "StorageStatCache::get_cache";
-  promise.set_value([state = state_](const td::Bits256& hash) -> td::Ref<vm::Cell> { return state->lookup(hash); });
-}
+class LargeAccountCache : public td::actor::Actor {
+ public:
+  LargeAccountCache(std::string db_path, td::uint64 size_cap_bytes, td::uint32 min_account_cells);
 
-void StorageStatCache::update(std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> data) {
-  for (auto& [cell, size] : data) {
-    if (size < MIN_ACCOUNT_CELLS) {
-      continue;
-    }
-    td::Bits256 hash = cell->get_hash().bits();
-    LOG(DEBUG) << "StorageStatCache::update " << hash.to_hex() << " " << size;
-    state_->set(hash, cell);
-    lru_.put(hash, Deleter{hash, state_}, true, size);
-  }
-}
+  void start_up() override;
+
+  void get_access(td::Promise<LargeAccountCacheAccess> promise);
+  void update(std::vector<LargeAccountCacheUpdate> updates);
+
+ private:
+  struct State {
+    td::uint64 size_cap_bytes{0};
+    td::uint32 min_account_cells{0};
+    std::shared_ptr<td::RocksDb> kv;
+
+    td::optional<LargeAccountCacheValue> lookup(const td::Bits256& hash) const;
+  };
+
+  std::string db_path_;
+  std::shared_ptr<State> state_ = std::make_shared<State>();
+
+  td::Status update_impl(std::vector<LargeAccountCacheUpdate> updates);
+};
 
 }  // namespace ton::validator

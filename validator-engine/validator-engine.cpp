@@ -1676,6 +1676,8 @@ td::Status ValidatorEngine::load_global_config() {
   if (celldb_cache_size_) {
     validator_options_.write().set_celldb_cache_size(celldb_cache_size_.value());
   }
+  validator_options_.write().set_large_celldb_size(large_celldb_size_);
+  validator_options_.write().set_large_celldb_min_account_cells(large_celldb_min_account_cells_);
   if (!celldb_cache_size_ || celldb_cache_size_.value() < (30ULL << 30)) {
     celldb_direct_io_ = false;
   }
@@ -5697,6 +5699,27 @@ int main(int argc, char *argv[]) {
           return td::Status::Error("celldb-cache-size should be positive");
         }
         acts.push_back([&x, v]() { td::actor::send_closure(x, &ValidatorEngine::set_celldb_cache_size, v); });
+        return td::Status::OK();
+      });
+  p.add_checked_option(
+      '\0', "large-celldb-size",
+      "persistent cache size cap for large-account storage-stat blobs, in bytes (default: 10737418240, 0 disables)",
+      [&](td::Slice s) -> td::Status {
+        TRY_RESULT(v, td::to_integer_safe<td::uint64>(s));
+        acts.push_back([&x, v]() { td::actor::send_closure(x, &ValidatorEngine::set_large_celldb_size, v); });
+        return td::Status::OK();
+      });
+  p.add_checked_option(
+      '\0', "large-celldb-min-account-cells",
+      "minimum account size in cells for persistent large-account cache participation (default: 16384)",
+      [&](td::Slice s) -> td::Status {
+        TRY_RESULT(v, td::to_integer_safe<td::uint32>(s));
+        if (v == 0) {
+          return td::Status::Error("large-celldb-min-account-cells should be positive");
+        }
+        acts.push_back([&x, v]() {
+          td::actor::send_closure(x, &ValidatorEngine::set_large_celldb_min_account_cells, v);
+        });
         return td::Status::OK();
       });
   p.add_option('\0', "celldb-direct-io",

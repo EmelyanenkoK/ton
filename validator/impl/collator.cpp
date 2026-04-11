@@ -86,6 +86,51 @@ class WorkTimerGuard {
   td::RealCpuTimer* timer_ = nullptr;
 };
 
+static td::optional<LargeAccountCacheUpdate> prepare_large_account_cache_update(const LargeAccountCacheAccess& access,
+                                                                                block::Account& account,
+                                                                                td::Slice source) {
+  if (!access.enabled()) {
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  bool had_old_hash = account.orig_storage_dict_hash && !account.orig_storage_dict_hash.value().is_zero();
+  bool has_new_hash = account.storage_dict_hash && !account.storage_dict_hash.value().is_zero();
+  bool should_store_new =
+      has_new_hash && account.storage.not_null() && account.storage_used.cells >= access.min_account_cells;
+  if (!had_old_hash && !should_store_new) {
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  LargeAccountCacheUpdate update;
+  update.workchain = account.workchain;
+  update.addr = account.addr;
+  if (!should_store_new) {
+    return update;
+  }
+  if (!account.account_storage_stat || !account.account_storage_stat.value().is_dict_ready()) {
+    LOG(INFO) << source << ": large-account cache payload is not ready for account " << account.addr.to_hex();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  auto r_dict_root = account.account_storage_stat.value().get_dict_root();
+  if (r_dict_root.is_error()) {
+    LOG(INFO) << source << ": failed to fetch dict root for account " << account.addr.to_hex() << ": "
+              << r_dict_root.error();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+  auto r_roots = account.get_account_storage_stat_roots();
+  if (r_roots.is_error()) {
+    LOG(INFO) << source << ": failed to fetch roots for account " << account.addr.to_hex() << ": "
+              << r_roots.error();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  update.storage_dict_hash = account.storage_dict_hash.value();
+  update.dict_root = r_dict_root.move_as_ok();
+  update.roots = r_roots.move_as_ok();
+  return update;
+}
+
 /**
  * Constructs a Collator object.
  *
@@ -273,6 +318,16 @@ void Collator::start_up() {
                                                                 &Collator::after_get_storage_stat_cache, std::move(res),
                                                                 std::move(token));
                                 });
+  ++pending;
+  LOG(DEBUG) << "sending get_large_account_cache_access() query to Manager";
+  td::actor::send_closure_later(
+      manager, &ValidatorManager::get_large_account_cache_access,
+      [self = get_self(), token = perf_log_.start_action("get_large_account_cache_access")](
+          td::Result<LargeAccountCacheAccess> res) mutable {
+        LOG(DEBUG) << "got answer to get_large_account_cache_access() query";
+        td::actor::send_closure_later(std::move(self), &Collator::after_get_large_account_cache_access,
+                                      std::move(res), std::move(token));
+      });
   // 6. set timeout
   alarm_timestamp() = timeout_;
   CHECK(pending);
@@ -840,6 +895,18 @@ void Collator::after_get_storage_stat_cache(td::Result<std::function<td::Ref<vm:
   } else {
     LOG(DEBUG) << "after_get_storage_stat_cache : OK";
     storage_stat_cache_ = res.move_as_ok();
+  }
+  check_pending();
+}
+
+void Collator::after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res, td::PerfLogAction token) {
+  --pending;
+  token.finish(res);
+  if (res.is_error()) {
+    LOG(INFO) << "after_get_large_account_cache_access : " << res.error();
+  } else {
+    LOG(DEBUG) << "after_get_large_account_cache_access : OK";
+    large_account_cache_ = res.move_as_ok();
   }
   check_pending();
 }
@@ -2772,6 +2839,14 @@ bool Collator::init_account_storage_dict(block::Account& account) {
   };
   td::Ref<vm::Cell> cached_dict_root =
       storage_stat_cache_ ? storage_stat_cache_(storage_dict_hash) : td::Ref<vm::Cell>{};
+  td::optional<LargeAccountCacheValue> large_cache_value;
+  if (cached_dict_root.is_null() && large_account_cache_.enabled() &&
+      account.storage_used.cells >= large_account_cache_.min_account_cells) {
+    large_cache_value = large_account_cache_.lookup(storage_dict_hash);
+    if (large_cache_value) {
+      cached_dict_root = large_cache_value.value().dict_root;
+    }
+  }
   if (cached_dict_root.not_null()) {
     CHECK(td::Bits256{cached_dict_root->get_hash().bits()} == storage_dict_hash);
     LOG(DEBUG) << "Inited storage stat from cache for account " << account.addr.to_hex() << " ("
@@ -2788,7 +2863,9 @@ bool Collator::init_account_storage_dict(block::Account& account) {
   }
   if (!full_collated_data_ || is_masterchain()) {
     if (cached_dict_root.not_null()) {
-      auto S = account.init_account_storage_stat(cached_dict_root);
+      auto S = large_cache_value
+                   ? account.init_account_storage_stat(cached_dict_root, std::move(large_cache_value.value().roots))
+                                 : account.init_account_storage_stat(cached_dict_root);
       if (S.is_error()) {
         return fatal_error(S.move_as_error_prefix(PSTRING() << "failed to init storage stat from cache for account "
                                                             << account.addr.to_hex() << ": "));
@@ -2821,7 +2898,9 @@ bool Collator::init_account_storage_dict(block::Account& account) {
     dict.mpb = vm::MerkleProofBuilder(std::move(dict_root));
     dict.mpb.set_cell_load_callback([&](const vm::LoadedCell& cell) { on_cell_loaded(cell); });
   }
-  auto S = account.init_account_storage_stat(dict.mpb.root());
+  auto S = large_cache_value
+               ? account.init_account_storage_stat(dict.mpb.root(), std::move(large_cache_value.value().roots))
+                             : account.init_account_storage_stat(dict.mpb.root());
   if (S.is_error()) {
     return fatal_error(S.move_as_error_prefix(PSTRING() << "Failed to init account storage dict for "
                                                         << account.addr.to_hex() << ": "));
@@ -2949,6 +3028,12 @@ bool Collator::process_account_storage_dict(block::Account& account) {
   SCOPE_EXIT {
     stats_.work_time.final_storage_stat += timer.elapsed_both();
   };
+  auto finish_success = [&]() {
+    if (auto update = prepare_large_account_cache_update(large_account_cache_, account, "Collator")) {
+      large_account_cache_update_.push_back(std::move(update.value()));
+    }
+    return true;
+  };
   bool store_dict_to_cache = account.storage_dict_hash && account.account_storage_stat &&
                              account.account_storage_stat.value().is_dict_ready() &&
                              account.storage_used.cells >= StorageStatCache::MIN_ACCOUNT_CELLS;
@@ -2957,7 +3042,7 @@ bool Collator::process_account_storage_dict(block::Account& account) {
       td::Ref<vm::Cell> dict_root = account.account_storage_stat.value().get_dict_root().move_as_ok();
       storage_stat_cache_update_.emplace_back(dict_root, account.storage_used.cells);
     }
-    return true;
+    return finish_success();
   }
   td::Bits256 storage_dict_hash = account.orig_storage_dict_hash.value();
   auto it = account_storage_dicts_.find(storage_dict_hash);
@@ -2966,7 +3051,7 @@ bool Collator::process_account_storage_dict(block::Account& account) {
       td::Ref<vm::Cell> dict_root = account.account_storage_stat.value().get_dict_root().move_as_ok();
       storage_stat_cache_update_.emplace_back(dict_root, account.storage_used.cells);
     }
-    return true;
+    return finish_success();
   }
   CHECK(full_collated_data_ && !is_masterchain());
   AccountStorageDict& dict = it->second;
@@ -2978,11 +3063,11 @@ bool Collator::process_account_storage_dict(block::Account& account) {
   }
   if (dict.add_to_collated_data) {
     LOG(DEBUG) << "Storage dict proof of account " << account.addr.to_hex() << " : already included";
-    return true;
+    return finish_success();
   }
   if (dict.storage_stat_updates.empty()) {
     LOG(DEBUG) << "Storage dict proof of account " << account.addr.to_hex() << " : not required (no storage updates)";
-    return true;
+    return finish_success();
   }
 
   td::HashSet<vm::CellHash> visited;
@@ -3053,7 +3138,7 @@ bool Collator::process_account_storage_dict(block::Account& account) {
     }
   }
 
-  return true;
+  return finish_success();
 }
 
 /**
@@ -6579,6 +6664,10 @@ bool Collator::create_block_candidate() {
   if (!storage_stat_cache_update_.empty()) {
     td::actor::send_closure(manager, &ValidatorManager::update_storage_stat_cache,
                             std::move(storage_stat_cache_update_));
+  }
+  if (!large_account_cache_update_.empty()) {
+    td::actor::send_closure(manager, &ValidatorManager::update_large_account_cache,
+                            std::move(large_account_cache_update_));
   }
   return true;
 }

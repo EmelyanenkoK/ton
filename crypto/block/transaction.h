@@ -310,7 +310,9 @@ struct Account {
   bool unpack(Ref<vm::CellSlice> account, ton::UnixTime now, bool special);
   bool init_new(ton::UnixTime now);
   td::Result<Ref<vm::Cell>> compute_account_storage_dict() const;
+  td::Result<std::vector<Ref<vm::Cell>>> get_account_storage_stat_roots() const;
   td::Status init_account_storage_stat(Ref<vm::Cell> dict_root);
+  td::Status init_account_storage_stat(Ref<vm::Cell> dict_root, std::vector<Ref<vm::Cell>> roots);
   bool deactivate();
   bool recompute_tmp_addr(Ref<vm::CellSlice>& tmp_addr, int fixed_prefix_length,
                           td::ConstBitPtr orig_addr_rewrite) const;

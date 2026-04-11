@@ -16,10 +16,11 @@
 */
 #pragma once
 #include <functional>
+#include <memory>
 
 #include "interfaces/validator-manager.h"
-#include "td/utils/ConcurrentHashTable.h"
 #include "td/utils/LRUCache.h"
+#include "td/utils/port/RwMutex.h"
 
 namespace ton::validator {
 
@@ -28,35 +29,53 @@ class StorageStatCache : public td::actor::Actor {
   void get_cache(td::Promise<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> promise);
 
   // (storage dict root, account total cells)
-  void update(std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> data);
+ void update(std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> data);
 
  private:
-  vm::Dictionary cache_{256};
+  struct State {
+    td::Ref<vm::Cell> lookup(const td::Bits256& hash) {
+      auto guard = rw_mutex_.lock_read().move_as_ok();
+      return cache_.lookup_ref(hash);
+    }
+
+    void set(const td::Bits256& hash, td::Ref<vm::Cell> cell) {
+      auto guard = rw_mutex_.lock_write().move_as_ok();
+      cache_.set_ref(hash, std::move(cell));
+    }
+
+    bool erase(const td::Bits256& hash) {
+      auto guard = rw_mutex_.lock_write().move_as_ok();
+      return cache_.lookup_delete_ref(hash).not_null();
+    }
+
+   private:
+    td::RwMutex rw_mutex_;
+    vm::Dictionary cache_{256};
+  };
 
   struct Deleter {
-    Deleter(const td::Bits256& hash, vm::Dictionary* cache) : hash(hash), cache(cache) {
+    Deleter(const td::Bits256& hash, std::shared_ptr<State> state) : hash(hash), state(std::move(state)) {
     }
     Deleter(const Deleter&) = delete;
-    Deleter(Deleter&& other) noexcept : hash(other.hash), cache(other.cache) {
-      other.cache = nullptr;
+    Deleter(Deleter&& other) noexcept : hash(other.hash), state(std::move(other.state)) {
     }
     Deleter& operator=(const Deleter&) = delete;
     Deleter& operator=(Deleter&& other) noexcept {
       hash = other.hash;
-      cache = other.cache;
-      other.cache = nullptr;
+      state = std::move(other.state);
       return *this;
     }
     ~Deleter() {
-      if (cache) {
-        CHECK(cache->lookup_delete_ref(hash).not_null());
+      if (state) {
+        CHECK(state->erase(hash));
         LOG(DEBUG) << "StorageStatCache remove " << hash.to_hex();
       }
     }
 
     td::Bits256 hash = td::Bits256::zero();
-    vm::Dictionary* cache;
+    std::shared_ptr<State> state;
   };
+  std::shared_ptr<State> state_ = std::make_shared<State>();
   td::LRUCache<td::Bits256, Deleter> lru_{MAX_CACHE_TOTAL_CELLS};
 
   static constexpr td::uint64 MAX_CACHE_TOTAL_CELLS = 1 << 24;

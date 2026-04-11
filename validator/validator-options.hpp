@@ -131,6 +131,12 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   td::optional<td::uint64> get_celldb_cache_size() const override {
     return celldb_cache_size_;
   }
+  td::uint64 get_large_celldb_size() const override {
+    return large_celldb_size_;
+  }
+  td::uint32 get_large_celldb_min_account_cells() const override {
+    return large_celldb_min_account_cells_;
+  }
   bool get_celldb_direct_io() const override {
     return celldb_direct_io_;
   }
@@ -263,6 +269,12 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   void set_celldb_cache_size(td::uint64 value) override {
     celldb_cache_size_ = value;
   }
+  void set_large_celldb_size(td::uint64 value) override {
+    large_celldb_size_ = value;
+  }
+  void set_large_celldb_min_account_cells(td::uint32 value) override {
+    large_celldb_min_account_cells_ = value;
+  }
   void set_celldb_direct_io(bool value) override {
     celldb_direct_io_ = value;
   }
@@ -369,6 +381,8 @@ struct ValidatorManagerOptionsImpl : public ValidatorManagerOptions {
   bool disable_rocksdb_stats_;
   bool nonfinal_ls_queries_enabled_ = false;
   td::optional<td::uint64> celldb_cache_size_;
+  td::uint64 large_celldb_size_ = 10ULL << 30;
+  td::uint32 large_celldb_min_account_cells_ = 16384;
   bool celldb_direct_io_ = false;
   bool celldb_preload_all_ = false;
   bool celldb_in_memory_ = false;

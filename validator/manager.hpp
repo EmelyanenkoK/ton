@@ -41,6 +41,7 @@
 #include "td/utils/port/StdStreams.h"
 
 #include "manager-init.h"
+#include "large-account-cache.hpp"
 #include "queue-size-counter.hpp"
 #include "shard-block-retainer.hpp"
 #include "shard-block-verifier.hpp"
@@ -633,6 +634,20 @@ class ValidatorManagerImpl : public ValidatorManager {
   void update_storage_stat_cache(std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> data) override {
     td::actor::send_closure(storage_stat_cache_, &StorageStatCache::update, std::move(data));
   }
+  void get_large_account_cache_access(td::Promise<LargeAccountCacheAccess> promise) override {
+    if (large_account_cache_.empty()) {
+      promise.set_value(LargeAccountCacheAccess{});
+      return;
+    }
+    td::actor::send_closure(large_account_cache_, &LargeAccountCache::get_access, std::move(promise));
+  }
+  void update_large_account_cache(std::vector<LargeAccountCacheUpdate> updates) override {
+    if (large_account_cache_.empty() || updates.empty()) {
+      return;
+    }
+    td::actor::send_closure(large_account_cache_, &LargeAccountCache::update, std::move(updates));
+  }
+  void populate_large_account_cache_from_block(td::Ref<BlockData> block, td::Ref<ShardState> state) override;
 
  private:
   td::Timestamp resend_shard_blocks_at_;
@@ -644,6 +659,7 @@ class ValidatorManagerImpl : public ValidatorManager {
 
  private:
   td::actor::ActorOwn<TokenManager> token_manager_;
+  td::actor::ActorOwn<LargeAccountCache> large_account_cache_;
 
  private:
   std::set<PublicKeyHash> permanent_keys_;

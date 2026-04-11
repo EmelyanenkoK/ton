@@ -260,6 +260,8 @@ class Collator final : public td::actor::Actor {
 
   std::function<td::Ref<vm::Cell>(const td::Bits256&)> storage_stat_cache_;
   std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> storage_stat_cache_update_;
+  LargeAccountCacheAccess large_account_cache_;
+  std::vector<LargeAccountCacheUpdate> large_account_cache_update_;
 
   td::PerfWarningTimer perf_timer_;
   td::PerfLog perf_log_;
@@ -286,6 +288,7 @@ class Collator final : public td::actor::Actor {
   void after_get_shard_blocks(td::Result<std::vector<Ref<ShardTopBlockDescription>>> res, td::PerfLogAction token);
   void after_get_storage_stat_cache(td::Result<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> res,
                                     td::PerfLogAction token);
+  void after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res, td::PerfLogAction token);
   bool preprocess_prev_mc_state();
   bool register_mc_state(Ref<MasterchainStateQ> other_mc_state);
   bool request_aux_mc_state(BlockSeqno seqno, Ref<MasterchainStateQ>& state);

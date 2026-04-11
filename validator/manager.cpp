@@ -20,6 +20,9 @@
 
 #include "auto/tl/lite_api.h"
 #include "auto/tl/ton_api_json.h"
+#include "block/block-auto.h"
+#include "block/block-parse.h"
+#include "block/transaction.h"
 #include "common/delay.h"
 #include "common/stats.h"
 #include "db/fileref.hpp"
@@ -56,6 +59,40 @@
 namespace ton {
 
 namespace validator {
+
+namespace {
+
+td::optional<LargeAccountCacheUpdate> prepare_large_account_cache_update_for_apply(td::uint32 min_account_cells,
+                                                                                    const block::Account& account) {
+  LargeAccountCacheUpdate update;
+  update.workchain = account.workchain;
+  update.addr = account.addr;
+
+  if (!account.storage_dict_hash || account.storage_dict_hash.value().is_zero() || account.storage.is_null() ||
+      account.storage_used.cells < min_account_cells) {
+    return update;
+  }
+
+  auto r_dict_root = account.compute_account_storage_dict();
+  if (r_dict_root.is_error()) {
+    LOG(INFO) << "ApplyBlock: failed to compute storage dict for account " << account.addr.to_hex() << ": "
+              << r_dict_root.error();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+  auto r_roots = account.get_account_storage_stat_roots();
+  if (r_roots.is_error()) {
+    LOG(INFO) << "ApplyBlock: failed to fetch storage roots for account " << account.addr.to_hex() << ": "
+              << r_roots.error();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  update.storage_dict_hash = account.storage_dict_hash.value();
+  update.dict_root = r_dict_root.move_as_ok();
+  update.roots = r_roots.move_as_ok();
+  return update;
+}
+
+}  // namespace
 
 void ValidatorManagerImpl::validate_block_is_next_proof(BlockIdExt prev_block_id, BlockIdExt next_block_id,
                                                         td::BufferSlice proof, td::Promise<td::Unit> promise) {
@@ -1933,6 +1970,11 @@ void ValidatorManagerImpl::start_up() {
   lite_server_cache_ = create_liteserver_cache_actor(actor_id(this), db_root_);
   token_manager_ = td::actor::create_actor<TokenManager>("tokenmanager");
   storage_stat_cache_ = td::actor::create_actor<StorageStatCache>("storagestatcache");
+  if (opts_->get_large_celldb_size() > 0) {
+    large_account_cache_ = td::actor::create_actor<LargeAccountCache>(
+        "largeaccountcache", db_root_ + "/large-celldb", opts_->get_large_celldb_size(),
+        opts_->get_large_celldb_min_account_cells());
+  }
   ext_message_pool_ = td::actor::create_actor<ExtMessagePool>("extmessages", opts_, actor_id(this));
   applied_ext_message_cleanup_actor_ = td::actor::create_actor<AppliedExtMessageCleanupActor>(
       "extmessagecleanup", ext_message_pool_.get(), actor_id(this));
@@ -3029,6 +3071,82 @@ bool ValidatorManagerImpl::is_shard_collator(ShardIdFull shard) {
     }
   }
   return is_validator() && opts_->get_collators_list()->self_collate;
+}
+
+void ValidatorManagerImpl::populate_large_account_cache_from_block(td::Ref<BlockData> block, td::Ref<ShardState> state) {
+  if (large_account_cache_.empty() || block.is_null() || state.is_null()) {
+    return;
+  }
+  if (!is_validator() && !is_shard_collator(state->get_shard())) {
+    return;
+  }
+
+  std::vector<LargeAccountCacheUpdate> updates;
+  try {
+    block::gen::Block::Record block_info;
+    block::gen::BlockExtra::Record extra;
+    block::gen::ShardStateUnsplit::Record shard_state;
+    if (!tlb::unpack_cell(block->root_cell(), block_info) || !tlb::unpack_cell(block_info.extra, extra) ||
+        !tlb::unpack_cell(state->root_cell(), shard_state)) {
+      LOG(INFO) << "ApplyBlock: failed to unpack block/state for large-account cache population for "
+                << state->get_block_id().to_str();
+      return;
+    }
+
+    vm::AugmentedDictionary account_blocks_dict{vm::load_cell_slice_ref(extra.account_blocks), 256,
+                                                block::tlb::aug_ShardAccountBlocks};
+    vm::AugmentedDictionary account_dict{vm::load_cell_slice(std::move(shard_state.accounts)).prefetch_ref(), 256,
+                                         block::tlb::aug_ShardAccounts};
+    WorkchainId workchain = state->get_shard().workchain;
+    td::uint32 min_account_cells = opts_->get_large_celldb_min_account_cells();
+    bool ok = account_blocks_dict.check_for_each_extra(
+        [&](Ref<vm::CellSlice> value, Ref<vm::CellSlice> extra_cs, td::ConstBitPtr key, int key_len) {
+          value.clear();
+          extra_cs.clear();
+          if (key_len != 256) {
+            return false;
+          }
+
+          StdSmcAddress addr{key};
+          auto account_entry = account_dict.lookup_extra(key, 256);
+          if (account_entry.first.is_null()) {
+            LargeAccountCacheUpdate update;
+            update.workchain = workchain;
+            update.addr = addr;
+            updates.push_back(std::move(update));
+            return true;
+          }
+
+          block::Account account{workchain, key};
+          if (!account.unpack(std::move(account_entry.first), state->get_unix_time(), false)) {
+            LOG(INFO) << "ApplyBlock: failed to unpack account " << addr.to_hex() << " from resulting state "
+                      << state->get_block_id().to_str();
+            return false;
+          }
+          account.block_lt = state->get_logical_time();
+          auto update = prepare_large_account_cache_update_for_apply(min_account_cells, account);
+          if (update) {
+            updates.push_back(std::move(update.value()));
+          }
+          return true;
+        });
+    if (!ok) {
+      LOG(INFO) << "ApplyBlock: failed to iterate changed accounts for " << state->get_block_id().to_str();
+      return;
+    }
+  } catch (vm::VmError& err) {
+    LOG(INFO) << "ApplyBlock: VM error while populating large-account cache for " << state->get_block_id().to_str()
+              << ": " << err.get_msg();
+    return;
+  } catch (vm::VmVirtError& err) {
+    LOG(INFO) << "ApplyBlock: virtualization error while populating large-account cache for "
+              << state->get_block_id().to_str() << ": " << err.get_msg();
+    return;
+  }
+
+  if (!updates.empty()) {
+    td::actor::send_closure(large_account_cache_, &LargeAccountCache::update, std::move(updates));
+  }
 }
 
 bool ValidatorManagerImpl::Collator::can_collate_shard(ShardIdFull shard) const {

@@ -261,6 +261,8 @@ class ValidateQuery : public td::actor::Actor {
 
   std::function<td::Ref<vm::Cell>(const td::Bits256&)> storage_stat_cache_;
   std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> storage_stat_cache_update_;
+  LargeAccountCacheAccess large_account_cache_;
+  std::vector<LargeAccountCacheUpdate> large_account_cache_update_;
 
   bool msg_metadata_enabled_ = false;
   bool deferring_messages_enabled_ = false;
@@ -328,6 +330,7 @@ class ValidateQuery : public td::actor::Actor {
   void got_mc_handle(td::Result<BlockHandle> res, td::PerfLogAction token);
   void after_get_storage_stat_cache(td::Result<std::function<td::Ref<vm::Cell>(const td::Bits256&)>> res,
                                     td::PerfLogAction token);
+  void after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res, td::PerfLogAction token);
   void after_get_shard_state(int idx, td::Result<Ref<ShardState>> res, td::PerfLogAction token);
   bool process_mc_state(Ref<MasterchainState> mc_state);
   bool try_unpack_mc_state();
@@ -414,6 +417,7 @@ class ValidateQuery : public td::actor::Actor {
       std::vector<std::tuple<Bits256, Bits256, bool>> lib_publishers{};
       bool defer_all_messages = false;
       std::vector<std::pair<td::Ref<vm::Cell>, td::uint32>> storage_stat_cache_update{};
+      std::vector<LargeAccountCacheUpdate> large_account_cache_update{};
       ValidationStats::WorkTimeStats work_time{};
 
       std::optional<td::Status> fatal_error;

@@ -649,6 +649,17 @@ td::Result<Ref<vm::Cell>> Account::compute_account_storage_dict() const {
   return stat.get_dict_root();
 }
 
+td::Result<std::vector<Ref<vm::Cell>>> Account::get_account_storage_stat_roots() const {
+  if (storage.is_null()) {
+    return std::vector<Ref<vm::Cell>>{};
+  }
+  auto storage_for_stat = storage_without_extra_currencies(storage);
+  if (storage_for_stat.is_null()) {
+    return td::Status::Error("cannot fetch storage stat roots: invalid storage");
+  }
+  return storage_for_stat->prefetch_all_refs();
+}
+
 /**
  * Initializes account_storage_stat of the account using the existing dict_root.
  * This is not strictly necessary, as the storage stat is recomputed in Transaction.
@@ -661,6 +672,11 @@ td::Result<Ref<vm::Cell>> Account::compute_account_storage_dict() const {
  * @returns Status of the operation.
  */
 td::Status Account::init_account_storage_stat(Ref<vm::Cell> dict_root) {
+  TRY_RESULT(roots, get_account_storage_stat_roots());
+  return init_account_storage_stat(std::move(dict_root), std::move(roots));
+}
+
+td::Status Account::init_account_storage_stat(Ref<vm::Cell> dict_root, std::vector<Ref<vm::Cell>> roots) {
   if (storage.is_null()) {
     if (dict_root.not_null()) {
       return td::Status::Error("storage is null, but dict_root is not null");
@@ -676,11 +692,14 @@ td::Status Account::init_account_storage_stat(Ref<vm::Cell> dict_root) {
     return td::Status::Error("cannot init storage dict: invalid storage");
   }
   // Root of AccountStorage is not counted in AccountStorageStat
-  if (storage_used.cells < 1 || storage_used.bits < storage_for_stat->size()) {
+  if (storage_used.cells < 1) {
+    return td::Status::Error(PSTRING() << "storage_used is too small: cells=" << storage_used.cells);
+  }
+  if (storage_used.bits < storage_for_stat->size()) {
     return td::Status::Error(PSTRING() << "storage_used is too small: cells=" << storage_used.cells << " bits="
                                        << storage_used.bits << " storage_root_bits=" << storage_for_stat->size());
   }
-  AccountStorageStat new_stat(std::move(dict_root), storage_for_stat->prefetch_all_refs(), storage_used.cells - 1,
+  AccountStorageStat new_stat(std::move(dict_root), std::move(roots), storage_used.cells - 1,
                               storage_used.bits - storage_for_stat->size());
   TRY_RESULT(root_hash, new_stat.get_dict_hash());
   if (storage_dict_hash.value() != root_hash) {

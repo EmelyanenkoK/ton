@@ -169,6 +169,8 @@ struct ValidatorManagerOptions : public td::CntObject {
   virtual bool get_disable_rocksdb_stats() const = 0;
   virtual bool nonfinal_ls_queries_enabled() const = 0;
   virtual td::optional<td::uint64> get_celldb_cache_size() const = 0;
+  virtual td::uint64 get_large_celldb_size() const = 0;
+  virtual td::uint32 get_large_celldb_min_account_cells() const = 0;
   virtual bool get_celldb_direct_io() const = 0;
   virtual bool get_celldb_preload_all() const = 0;
   virtual bool get_celldb_disable_bloom_filter() const = 0;
@@ -210,6 +212,8 @@ struct ValidatorManagerOptions : public td::CntObject {
   virtual void set_disable_rocksdb_stats(bool value) = 0;
   virtual void set_nonfinal_ls_queries_enabled(bool value) = 0;
   virtual void set_celldb_cache_size(td::uint64 value) = 0;
+  virtual void set_large_celldb_size(td::uint64 value) = 0;
+  virtual void set_large_celldb_min_account_cells(td::uint32 value) = 0;
   virtual void set_celldb_direct_io(bool value) = 0;
   virtual void set_celldb_preload_all(bool value) = 0;
   virtual void set_celldb_in_memory(bool value) = 0;

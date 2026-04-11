@@ -73,6 +73,51 @@ std::string ErrorCtx::as_string() const {
   return a;
 }
 
+static td::optional<LargeAccountCacheUpdate> prepare_large_account_cache_update(const LargeAccountCacheAccess& access,
+                                                                                block::Account& account,
+                                                                                td::Slice source) {
+  if (!access.enabled()) {
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  bool had_old_hash = account.orig_storage_dict_hash && !account.orig_storage_dict_hash.value().is_zero();
+  bool has_new_hash = account.storage_dict_hash && !account.storage_dict_hash.value().is_zero();
+  bool should_store_new =
+      has_new_hash && account.storage.not_null() && account.storage_used.cells >= access.min_account_cells;
+  if (!had_old_hash && !should_store_new) {
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  LargeAccountCacheUpdate update;
+  update.workchain = account.workchain;
+  update.addr = account.addr;
+  if (!should_store_new) {
+    return update;
+  }
+  if (!account.account_storage_stat || !account.account_storage_stat.value().is_dict_ready()) {
+    LOG(INFO) << source << ": large-account cache payload is not ready for account " << account.addr.to_hex();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  auto r_dict_root = account.account_storage_stat.value().get_dict_root();
+  if (r_dict_root.is_error()) {
+    LOG(INFO) << source << ": failed to fetch dict root for account " << account.addr.to_hex() << ": "
+              << r_dict_root.error();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+  auto r_roots = account.get_account_storage_stat_roots();
+  if (r_roots.is_error()) {
+    LOG(INFO) << source << ": failed to fetch roots for account " << account.addr.to_hex() << ": "
+              << r_roots.error();
+    return td::optional<LargeAccountCacheUpdate>();
+  }
+
+  update.storage_dict_hash = account.storage_dict_hash.value();
+  update.dict_root = r_dict_root.move_as_ok();
+  update.roots = r_roots.move_as_ok();
+  return update;
+}
+
 /**
  * Constructs a ValidateQuery object.
  *
@@ -418,6 +463,16 @@ void ValidateQuery::start_up() {
                                                                 &ValidateQuery::after_get_storage_stat_cache,
                                                                 std::move(res), std::move(token));
                                 });
+  ++pending;
+  LOG(DEBUG) << "sending get_large_account_cache_access() query to Manager";
+  td::actor::send_closure_later(
+      manager, &ValidatorManager::get_large_account_cache_access,
+      [self = get_self(), token = perf_log_.start_action("get_large_account_cache_access")](
+          td::Result<LargeAccountCacheAccess> res) mutable {
+        LOG(DEBUG) << "got answer to get_large_account_cache_access() query";
+        td::actor::send_closure_later(std::move(self), &ValidateQuery::after_get_large_account_cache_access,
+                                      std::move(res), std::move(token));
+      });
   // ...
   REJECT_UNLESS_VOID(pending);
 }
@@ -877,6 +932,23 @@ void ValidateQuery::after_get_storage_stat_cache(td::Result<std::function<td::Re
   } else {
     LOG(DEBUG) << "after_get_storage_stat_cache : OK";
     storage_stat_cache_ = res.move_as_ok();
+  }
+  if (!pending) {
+    if (!try_validate()) {
+      fatal_error("cannot validate new block");
+    }
+  }
+}
+
+void ValidateQuery::after_get_large_account_cache_access(td::Result<LargeAccountCacheAccess> res,
+                                                         td::PerfLogAction token) {
+  token.finish(res);
+  --pending;
+  if (res.is_error()) {
+    LOG(INFO) << "after_get_large_account_cache_access : " << res.error();
+  } else {
+    LOG(DEBUG) << "after_get_large_account_cache_access : OK";
+    large_account_cache_ = res.move_as_ok();
   }
   if (!pending) {
     if (!try_validate()) {
@@ -5503,6 +5575,7 @@ std::unique_ptr<block::Account> ValidateQuery::CheckAccountTxs::unpack_account(t
     return {};
   }
   if (new_acc->storage_dict_hash) {
+    bool storage_stat_inited = false;
     if (vq_.full_collated_data_ && !vq_.is_masterchain()) {
       auto it = vq_.virt_account_storage_dicts_.find(new_acc->storage_dict_hash.value());
       if (it != vq_.virt_account_storage_dicts_.end()) {
@@ -5514,11 +5587,25 @@ std::unique_ptr<block::Account> ValidateQuery::CheckAccountTxs::unpack_account(t
                        std::move(S));
           return {};
         }
+        storage_stat_inited = true;
       }
-    } else if (vq_.storage_stat_cache_ && new_acc->storage_dict_hash) {
-      auto dict_root = vq_.storage_stat_cache_(new_acc->storage_dict_hash.value());
+    }
+    if (!storage_stat_inited && (vq_.storage_stat_cache_ || vq_.large_account_cache_.enabled()) &&
+        new_acc->storage_dict_hash) {
+      auto dict_root =
+          vq_.storage_stat_cache_ ? vq_.storage_stat_cache_(new_acc->storage_dict_hash.value()) : td::Ref<vm::Cell>{};
+      td::optional<LargeAccountCacheValue> large_cache_value;
+      if (dict_root.is_null() && vq_.large_account_cache_.enabled() &&
+          new_acc->storage_used.cells >= vq_.large_account_cache_.min_account_cells) {
+        large_cache_value = vq_.large_account_cache_.lookup(new_acc->storage_dict_hash.value());
+        if (large_cache_value) {
+          dict_root = large_cache_value.value().dict_root;
+        }
+      }
       if (dict_root.not_null()) {
-        auto S = new_acc->init_account_storage_stat(dict_root);
+        auto S = large_cache_value
+                     ? new_acc->init_account_storage_stat(dict_root, std::move(large_cache_value.value().roots))
+                                   : new_acc->init_account_storage_stat(dict_root);
         if (S.is_error()) {
           fatal_error(S.move_as_error_prefix(PSTRING() << "failed to init storage stat from cache for account "
                                                        << addr.to_hex(256) << ": "));
@@ -6168,6 +6255,9 @@ bool ValidateQuery::CheckAccountTxs::try_check() {
       ctx_.storage_stat_cache_update.emplace_back(account.account_storage_stat.value().get_dict_root().move_as_ok(),
                                                   account.storage_used.cells);
     }
+    if (auto update = prepare_large_account_cache_update(vq_.large_account_cache_, account, "ValidateQuery")) {
+      ctx_.large_account_cache_update.push_back(std::move(update.value()));
+    }
     if (vq_.is_masterchain() && account.libraries_changed()) {
       return scan_account_libraries(account.orig_library, account.library, address_);
     } else {
@@ -6265,6 +6355,9 @@ void ValidateQuery::save_account_transactions_context(const StdSmcAddress& addre
 
   for (auto& e : ctx.storage_stat_cache_update) {
     storage_stat_cache_update_.push_back(e);
+  }
+  for (auto& e : ctx.large_account_cache_update) {
+    large_account_cache_update_.push_back(std::move(e));
   }
 
   stats_.work_time.trx_tvm += ctx.work_time.trx_tvm;
@@ -7612,6 +7705,10 @@ bool ValidateQuery::save_candidate() {
   if (!storage_stat_cache_update_.empty()) {
     td::actor::send_closure(manager, &ValidatorManager::update_storage_stat_cache,
                             std::move(storage_stat_cache_update_));
+  }
+  if (!large_account_cache_update_.empty()) {
+    td::actor::send_closure(manager, &ValidatorManager::update_large_account_cache,
+                            std::move(large_account_cache_update_));
   }
   if (skip_store_candidate_) {
     written_candidate({});
