@@ -218,25 +218,80 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
   auto status = [&]() -> td::Status {
     TRY_RESULT(opt_used_bytes, get_optional_uint64(kv, td::Slice(USED_BYTES_KEY)));
     td::uint64 used_bytes = opt_used_bytes ? opt_used_bytes.value() : 0;
+    td::HashMap<std::string, td::optional<td::Bits256>> current_hashes;
+    td::HashMap<std::string, td::uint64> refcnt_cache;
+    td::HashMap<std::string, td::uint64> entry_bytes_cache;
+    td::HashMap<std::string, bool> entry_exists_cache;
 
-    auto decrement_hash = [&](const td::Bits256& hash) -> td::Status {
+    auto read_current_hash = [&](const std::string& account_key) -> td::Result<td::optional<td::Bits256>> {
+      auto it = current_hashes.find(account_key);
+      if (it != current_hashes.end()) {
+        return it->second;
+      }
+      TRY_RESULT(value, get_optional_hash(kv, account_key));
+      current_hashes.emplace(account_key, value);
+      return value;
+    };
+
+    auto read_refcnt = [&](const td::Bits256& hash) -> td::Result<td::uint64> {
+      auto hash_hex = hash.to_hex();
+      auto it = refcnt_cache.find(hash_hex);
+      if (it != refcnt_cache.end()) {
+        return it->second;
+      }
       TRY_RESULT(opt_refcnt, get_optional_uint64(kv, refcnt_key(hash)));
       td::uint64 refcnt = opt_refcnt ? opt_refcnt.value() : 0;
+      refcnt_cache.emplace(std::move(hash_hex), refcnt);
+      return refcnt;
+    };
+
+    auto read_entry_bytes = [&](const td::Bits256& hash) -> td::Result<td::uint64> {
+      auto hash_hex = hash.to_hex();
+      auto it = entry_bytes_cache.find(hash_hex);
+      if (it != entry_bytes_cache.end()) {
+        return it->second;
+      }
+      TRY_RESULT(opt_entry_bytes, get_optional_uint64(kv, bytes_key(hash)));
+      td::uint64 entry_bytes = opt_entry_bytes ? opt_entry_bytes.value() : 0;
+      entry_bytes_cache.emplace(std::move(hash_hex), entry_bytes);
+      return entry_bytes;
+    };
+
+    auto has_entry = [&](const td::Bits256& hash) -> td::Result<bool> {
+      auto hash_hex = hash.to_hex();
+      auto it = entry_exists_cache.find(hash_hex);
+      if (it != entry_exists_cache.end()) {
+        return it->second;
+      }
+      TRY_RESULT(opt_entry, get_optional_string(kv, entry_key(hash)));
+      bool exists = static_cast<bool>(opt_entry);
+      entry_exists_cache.emplace(std::move(hash_hex), exists);
+      return exists;
+    };
+
+    auto decrement_hash = [&](const td::Bits256& hash) -> td::Status {
+      TRY_RESULT(refcnt, read_refcnt(hash));
+      auto hash_hex = hash.to_hex();
       if (refcnt <= 1) {
-        TRY_RESULT(opt_entry_bytes, get_optional_uint64(kv, bytes_key(hash)));
-        used_bytes = opt_entry_bytes && *opt_entry_bytes <= used_bytes ? used_bytes - *opt_entry_bytes : used_bytes;
+        TRY_RESULT(entry_bytes, read_entry_bytes(hash));
+        used_bytes = entry_bytes <= used_bytes ? used_bytes - entry_bytes : used_bytes;
+        refcnt_cache[hash_hex] = 0;
+        entry_bytes_cache[hash_hex] = 0;
+        entry_exists_cache[hash_hex] = false;
         TRY_STATUS(kv.erase(refcnt_key(hash)));
         TRY_STATUS(kv.erase(entry_key(hash)));
         TRY_STATUS(kv.erase(bytes_key(hash)));
       } else {
+        refcnt_cache[hash_hex] = refcnt - 1;
         TRY_STATUS(set_uint64(kv, refcnt_key(hash), refcnt - 1));
       }
       return td::Status::OK();
     };
 
     auto increment_hash = [&](const td::Bits256& hash) -> td::Status {
-      TRY_RESULT(opt_refcnt, get_optional_uint64(kv, refcnt_key(hash)));
-      TRY_STATUS(set_uint64(kv, refcnt_key(hash), (opt_refcnt ? opt_refcnt.value() : 0) + 1));
+      TRY_RESULT(refcnt, read_refcnt(hash));
+      refcnt_cache[hash.to_hex()] = refcnt + 1;
+      TRY_STATUS(set_uint64(kv, refcnt_key(hash), refcnt + 1));
       return td::Status::OK();
     };
 
@@ -245,15 +300,14 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
       if (update.dict_root.is_null()) {
         return td::Status::Error("missing dict_root for large-account cache write");
       }
-      TRY_RESULT(existing_entry, get_optional_string(kv, entry_key(hash)));
+      TRY_RESULT(existing_entry, has_entry(hash));
       if (!force_overwrite && existing_entry) {
         return td::Status::OK();
       }
 
       TRY_RESULT(serialized_entry, serialize_entry(update.dict_root, update.roots));
       auto new_size = static_cast<td::uint64>(serialized_entry.size());
-      TRY_RESULT(opt_existing_bytes, get_optional_uint64(kv, bytes_key(hash)));
-      td::uint64 existing_bytes = opt_existing_bytes ? opt_existing_bytes.value() : 0;
+      TRY_RESULT(existing_bytes, read_entry_bytes(hash));
 
       if (!force_overwrite && !existing_entry && used_bytes + new_size > state_->size_cap_bytes) {
         return td::Status::OK();
@@ -261,6 +315,9 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
 
       TRY_STATUS(kv.set(entry_key(hash), serialized_entry));
       TRY_STATUS(set_uint64(kv, bytes_key(hash), new_size));
+      auto hash_hex = hash.to_hex();
+      entry_exists_cache[hash_hex] = true;
+      entry_bytes_cache[hash_hex] = new_size;
       if (new_size >= existing_bytes) {
         used_bytes += new_size - existing_bytes;
       } else {
@@ -275,8 +332,9 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
         new_hash = update.storage_dict_hash.value();
       }
 
-      TRY_RESULT(old_hash, get_optional_hash(kv, account_key));
+      TRY_RESULT(old_hash, read_current_hash(account_key));
       if (old_hash && new_hash && old_hash.value() == new_hash.value()) {
+        current_hashes[account_key] = new_hash;
         TRY_STATUS(kv.set(account_key, new_hash.value().to_hex()));
         TRY_STATUS(maybe_store_entry(new_hash.value(), update, true));
         continue;
@@ -287,10 +345,12 @@ td::Status LargeAccountCache::update_impl(std::vector<LargeAccountCacheUpdate> u
       }
 
       if (new_hash) {
+        current_hashes[account_key] = new_hash;
         TRY_STATUS(kv.set(account_key, new_hash.value().to_hex()));
         TRY_STATUS(increment_hash(new_hash.value()));
         TRY_STATUS(maybe_store_entry(new_hash.value(), update, false));
       } else {
+        current_hashes[account_key] = td::optional<td::Bits256>();
         TRY_STATUS(kv.erase(account_key));
       }
     }
