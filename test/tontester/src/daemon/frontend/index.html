@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>tontester dashboard</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>tontester dashboard</h1>
+      <nav>
+        <a id="grafana-link" target="_blank" rel="noopener">Grafana</a>
+        <a id="prometheus-link" target="_blank" rel="noopener">Prometheus</a>
+      </nav>
+    </header>
+    <main>
+      <section>
+        <h2>Runs</h2>
+        <table id="runs">
+          <thead>
+            <tr>
+              <th>Run ID</th>
+              <th>Status</th>
+              <th>Started</th>
+              <th>Ended</th>
+              <th>Nodes</th>
+              <th>Description</th>
+              <th>Git</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>
