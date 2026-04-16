@@ -478,13 +478,15 @@ def _default_dashboard() -> dict[str, object]:
         # --- TL-breakdown traffic panels ---
         # RLDP answers carry the actual response body's TL (query wrappers are mostly overlay.query,
         # so the bytes panel for answers is where you see which payload types dominate the wire).
+        # RLDP traffic by inner TL. overlay.query / overlay.message wrappers are unwrapped at
+        # account time so these panels show the application-level request/response TL directly.
         panel(
             20,
-            "RLDP answer bytes/s by TL",
+            "RLDP queries sent bytes/s by TL",
             [
                 (
-                    f"sum by (tl) (rate(ton_rldp_app_deliver_bytes_by_tl_total{{"
-                    f'run_id=~"$run_id",node=~"$node",kind="answer"}}[1m]))',
+                    f"sum by (tl) (rate(ton_rldp_app_send_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="query"}}[1m]))',
                     "{{tl}}",
                 )
             ],
@@ -494,7 +496,35 @@ def _default_dashboard() -> dict[str, object]:
         ),
         panel(
             21,
-            "RLDP2 answer bytes/s by TL",
+            "RLDP answers received bytes/s by TL",
+            [
+                (
+                    f"sum by (tl) (rate(ton_rldp_app_deliver_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="answer"}}[1m]))',
+                    "{{tl}}",
+                )
+            ],
+            12,
+            64,
+            unit="Bps",
+        ),
+        panel(
+            26,
+            "RLDP2 queries sent bytes/s by TL",
+            [
+                (
+                    f"sum by (tl) (rate(ton_rldp2_app_send_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="query"}}[1m]))',
+                    "{{tl}}",
+                )
+            ],
+            0,
+            88,
+            unit="Bps",
+        ),
+        panel(
+            27,
+            "RLDP2 answers received bytes/s by TL",
             [
                 (
                     f"sum by (tl) (rate(ton_rldp2_app_deliver_bytes_by_tl_total{{"
@@ -503,7 +533,35 @@ def _default_dashboard() -> dict[str, object]:
                 )
             ],
             12,
-            64,
+            88,
+            unit="Bps",
+        ),
+        panel(
+            28,
+            "RLDP messages sent bytes/s by TL",
+            [
+                (
+                    f"sum by (tl) (rate(ton_rldp_app_send_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="message"}}[1m]))',
+                    "{{tl}}",
+                )
+            ],
+            0,
+            96,
+            unit="Bps",
+        ),
+        panel(
+            29,
+            "RLDP messages received bytes/s by TL",
+            [
+                (
+                    f"sum by (tl) (rate(ton_rldp_app_deliver_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="message"}}[1m]))',
+                    "{{tl}}",
+                )
+            ],
+            12,
+            96,
             unit="Bps",
         ),
         # Overlay broadcasts: split by overlay type (consensus / shard / fast-sync) and inner TL
