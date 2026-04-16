@@ -267,38 +267,49 @@ class GrafanaController(ContainerController):
 
 
 def _default_dashboard() -> dict[str, object]:
-    def panel(panel_id: int, title: str, expr: str, x: int, y: int) -> dict[str, object]:
-        return {
+    def panel(
+        panel_id: int,
+        title: str,
+        targets: str | list[tuple[str, str]],
+        x: int,
+        y: int,
+        unit: str = "",
+    ) -> dict[str, object]:
+        if isinstance(targets, str):
+            targets = [(targets, "{{node}} ({{instance}})")]
+        p: dict[str, object] = {
             "id": panel_id,
             "title": title,
             "type": "timeseries",
             "datasource": {"type": "prometheus", "uid": "prometheus"},
             "gridPos": {"h": 8, "w": 12, "x": x, "y": y},
-            "targets": [{"expr": expr, "refId": "A", "legendFormat": "{{node}} ({{instance}})"}],
+            "targets": [
+                {"expr": expr, "refId": chr(ord("A") + i), "legendFormat": legend}
+                for i, (expr, legend) in enumerate(targets)
+            ],
             "options": {
                 "legend": {"displayMode": "list", "placement": "bottom"},
                 "tooltip": {"mode": "multi"},
             },
         }
+        if unit:
+            p["fieldConfig"] = {"defaults": {"unit": unit}, "overrides": []}
+        return p
 
     run_filter = '{run_id=~"$run_id", node=~"$node"}'
+
+    # Sum away `kind` label on app-level QUIC metrics so ratios line-match cleanly.
+    def app_rate(metric: str) -> str:
+        return f"sum without (kind) (rate({metric}{run_filter}[1m]))"
+
+    def rate(metric: str) -> str:
+        return f"rate({metric}{run_filter}[1m])"
+
     panels = [
         panel(1, "Up", f"up{run_filter}", 0, 0),
-        panel(2, "Scrape duration", f"scrape_duration_seconds{run_filter}", 12, 0),
-        panel(
-            3,
-            "ADNL ingress bytes/s",
-            f"rate(ton_adnl_net_udp_ingress_bytes_total{run_filter}[1m])",
-            0,
-            8,
-        ),
-        panel(
-            4,
-            "ADNL egress bytes/s",
-            f"rate(ton_adnl_net_udp_egress_bytes_total{run_filter}[1m])",
-            12,
-            8,
-        ),
+        panel(2, "Scrape duration", f"scrape_duration_seconds{run_filter}", 12, 0, unit="s"),
+        panel(3, "ADNL ingress bytes/s", rate("ton_adnl_net_udp_ingress_bytes_total"), 0, 8, unit="Bps"),
+        panel(4, "ADNL egress bytes/s", rate("ton_adnl_net_udp_egress_bytes_total"), 12, 8, unit="Bps"),
         panel(5, "ADNL peers", f"ton_adnl_peers{run_filter}", 0, 16),
         panel(
             6,
@@ -306,6 +317,253 @@ def _default_dashboard() -> dict[str, object]:
             f"ton_exporter_last_collection_duration_seconds{run_filter}",
             12,
             16,
+            unit="s",
+        ),
+        # --- QUIC / ngtcp2 overhead investigation ---
+        panel(
+            10,
+            "QUIC TX bytes/s: app vs ngtcp2 vs UDP",
+            [
+                (app_rate("ton_quic_app_send_bytes_total"), "{{node}} app_send"),
+                (rate("ton_quic_summary_tx_bytes_total"), "{{node}} ngtcp2_tx"),
+                (rate("ton_quic_udp_egress_bytes_total"), "{{node}} udp_egress"),
+            ],
+            0,
+            24,
+            unit="Bps",
+        ),
+        panel(
+            11,
+            "QUIC RX bytes/s: app vs stream vs UDP",
+            [
+                (app_rate("ton_quic_app_deliver_bytes_total"), "{{node}} app_deliver"),
+                (rate("ton_quic_summary_stream_bytes_received_total"), "{{node}} stream_rx"),
+                (rate("ton_quic_udp_ingress_bytes_total"), "{{node}} udp_ingress"),
+            ],
+            12,
+            24,
+            unit="Bps",
+        ),
+        panel(
+            12,
+            "QUIC TX expansion ratio (bytes)",
+            [
+                (
+                    f"{rate('ton_quic_summary_tx_bytes_total')} "
+                    f"/ {app_rate('ton_quic_app_send_bytes_total')}",
+                    "{{node}} ngtcp2/app",
+                ),
+                (
+                    f"{rate('ton_quic_udp_egress_bytes_total')} "
+                    f"/ {rate('ton_quic_summary_tx_bytes_total')}",
+                    "{{node}} UDP/ngtcp2",
+                ),
+                (
+                    f"{rate('ton_quic_udp_egress_bytes_total')} "
+                    f"/ {app_rate('ton_quic_app_send_bytes_total')}",
+                    "{{node}} UDP/app",
+                ),
+            ],
+            0,
+            32,
+        ),
+        panel(
+            13,
+            "QUIC RX expansion ratio (bytes)",
+            [
+                (
+                    f"{rate('ton_quic_summary_stream_bytes_received_total')} "
+                    f"/ {app_rate('ton_quic_app_deliver_bytes_total')}",
+                    "{{node}} stream/app",
+                ),
+                (
+                    f"{rate('ton_quic_udp_ingress_bytes_total')} "
+                    f"/ {rate('ton_quic_summary_stream_bytes_received_total')}",
+                    "{{node}} UDP/stream",
+                ),
+                (
+                    f"{rate('ton_quic_udp_ingress_bytes_total')} "
+                    f"/ {app_rate('ton_quic_app_deliver_bytes_total')}",
+                    "{{node}} UDP/app",
+                ),
+            ],
+            12,
+            32,
+        ),
+        panel(
+            14,
+            "UDP packets/s",
+            [
+                (rate("ton_quic_udp_egress_packets_total"), "{{node}} egress"),
+                (rate("ton_quic_udp_ingress_packets_total"), "{{node}} ingress"),
+            ],
+            0,
+            40,
+            unit="pps",
+        ),
+        panel(
+            15,
+            "Avg UDP packet size",
+            [
+                (
+                    f"{rate('ton_quic_udp_egress_bytes_total')} "
+                    f"/ {rate('ton_quic_udp_egress_packets_total')}",
+                    "{{node}} egress",
+                ),
+                (
+                    f"{rate('ton_quic_udp_ingress_bytes_total')} "
+                    f"/ {rate('ton_quic_udp_ingress_packets_total')}",
+                    "{{node}} ingress",
+                ),
+            ],
+            12,
+            40,
+            unit="bytes",
+        ),
+        panel(
+            16,
+            "ngtcp2 packets/s (sent / recv / lost)",
+            [
+                (rate("ton_quic_summary_pkt_sent_total"), "{{node}} sent"),
+                (rate("ton_quic_summary_pkt_recv_total"), "{{node}} recv"),
+                (rate("ton_quic_summary_pkt_lost_total"), "{{node}} lost"),
+            ],
+            0,
+            48,
+            unit="pps",
+        ),
+        panel(
+            17,
+            "UDP packets per syscall (batching)",
+            [
+                (
+                    f"{rate('ton_quic_udp_egress_packets_total')} "
+                    f"/ {rate('ton_quic_udp_egress_syscalls_total')}",
+                    "{{node}} egress",
+                ),
+                (
+                    f"{rate('ton_quic_udp_ingress_packets_total')} "
+                    f"/ {rate('ton_quic_udp_ingress_syscalls_total')}",
+                    "{{node}} ingress",
+                ),
+            ],
+            12,
+            48,
+        ),
+        panel(
+            18,
+            "QUIC RTT",
+            [
+                (f"ton_quic_summary_latest_rtt_seconds{run_filter}", "{{node}} latest"),
+                (f"ton_quic_summary_min_rtt_seconds{run_filter}", "{{node}} min"),
+                (f"ton_quic_summary_rttvar_seconds{run_filter}", "{{node}} var"),
+            ],
+            0,
+            56,
+            unit="s",
+        ),
+        panel(
+            19,
+            "QUIC congestion state",
+            [
+                (f"ton_quic_summary_cwnd_bytes{run_filter}", "{{node}} cwnd"),
+                (f"ton_quic_summary_bytes_in_flight{run_filter}", "{{node}} in_flight"),
+                (f"ton_quic_summary_unacked_bytes{run_filter}", "{{node}} unacked"),
+                (f"ton_quic_summary_unsent_bytes{run_filter}", "{{node}} unsent"),
+            ],
+            12,
+            56,
+            unit="bytes",
+        ),
+        # --- TL-breakdown traffic panels ---
+        # RLDP answers carry the actual response body's TL (query wrappers are mostly overlay.query,
+        # so the bytes panel for answers is where you see which payload types dominate the wire).
+        panel(
+            20,
+            "RLDP answer bytes/s by TL",
+            [
+                (
+                    f"sum by (tl) (rate(ton_rldp_app_deliver_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="answer"}}[1m]))',
+                    "{{tl}}",
+                )
+            ],
+            0,
+            64,
+            unit="Bps",
+        ),
+        panel(
+            21,
+            "RLDP2 answer bytes/s by TL",
+            [
+                (
+                    f"sum by (tl) (rate(ton_rldp2_app_deliver_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node",kind="answer"}}[1m]))',
+                    "{{tl}}",
+                )
+            ],
+            12,
+            64,
+            unit="Bps",
+        ),
+        # Overlay broadcasts: split by overlay type (consensus / shard / fast-sync) and inner TL
+        # so it's obvious which broadcast kind carries the bulk of the traffic.
+        panel(
+            22,
+            "Overlay broadcasts sent bytes/s by type + TL",
+            [
+                (
+                    f"sum by (type, tl) (rate(ton_overlay_broadcasts_sent_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node"}}[1m]))',
+                    "{{type}} {{tl}}",
+                )
+            ],
+            0,
+            72,
+            unit="Bps",
+        ),
+        panel(
+            23,
+            "Overlay broadcasts received bytes/s by type + TL",
+            [
+                (
+                    f"sum by (type, tl) (rate(ton_overlay_broadcasts_received_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node"}}[1m]))',
+                    "{{type}} {{tl}}",
+                )
+            ],
+            12,
+            72,
+            unit="Bps",
+        ),
+        # Overlay direct (non-broadcast) messages — useful for seeing catchain / dht / etc payloads.
+        panel(
+            24,
+            "Overlay messages sent bytes/s by type + TL",
+            [
+                (
+                    f"sum by (type, tl) (rate(ton_overlay_messages_sent_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node"}}[1m]))',
+                    "{{type}} {{tl}}",
+                )
+            ],
+            0,
+            80,
+            unit="Bps",
+        ),
+        panel(
+            25,
+            "Overlay messages received bytes/s by type + TL",
+            [
+                (
+                    f"sum by (type, tl) (rate(ton_overlay_messages_received_bytes_by_tl_total{{"
+                    f'run_id=~"$run_id",node=~"$node"}}[1m]))',
+                    "{{type}} {{tl}}",
+                )
+            ],
+            12,
+            80,
+            unit="Bps",
         ),
     ]
 
