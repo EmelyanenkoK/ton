@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <utility>
 
 #include "auto/tl/ton_api.hpp"
@@ -282,6 +283,43 @@ void QuicSender::add_id(adnl::AdnlNodeIdShort local_id) {
   add_local_id_coro(local_id).start().detach("add local id");
 }
 
+void QuicSender::add_protected_peers(adnl::AdnlNodeIdShort local_id,
+                                     std::vector<adnl::AdnlNodeIdShort> peer_ids) {
+  for (const auto &peer_id : peer_ids) {
+    auto &entry = protected_peers_[local_id][peer_id];
+    entry.refs++;
+    if (entry.endpoint.has_value()) {
+      add_protected_endpoint_ref(local_id, *entry.endpoint);
+    } else {
+      resolve_protected_peer_endpoint(local_id, peer_id).start().detach("resolve protected peer endpoint");
+    }
+  }
+}
+
+void QuicSender::remove_protected_peers(adnl::AdnlNodeIdShort local_id,
+                                        std::vector<adnl::AdnlNodeIdShort> peer_ids) {
+  auto local_it = protected_peers_.find(local_id);
+  if (local_it == protected_peers_.end()) {
+    return;
+  }
+  for (const auto &peer_id : peer_ids) {
+    auto peer_it = local_it->second.find(peer_id);
+    if (peer_it == local_it->second.end()) {
+      continue;
+    }
+    auto &entry = peer_it->second;
+    if (entry.endpoint.has_value()) {
+      remove_protected_endpoint_ref(local_id, *entry.endpoint);
+    }
+    if (--entry.refs == 0) {
+      local_it->second.erase(peer_it);
+    }
+  }
+  if (local_it->second.empty()) {
+    protected_peers_.erase(local_it);
+  }
+}
+
 void QuicSender::log_stats(std::string reason) {
   for (auto &it : servers_) {
     td::actor::send_closure(it.second.get(), &QuicServer::log_stats, reason);
@@ -435,7 +473,32 @@ td::actor::Task<> QuicSender::add_local_id_coro(adnl::AdnlNodeIdShort local_id) 
                                   std::make_unique<ServerCallback>(local_id, actor_id(this)),
                                   get_local_id_mtu(local_id), "ton", "0.0.0.0", server_options_, std::move(peers_mtu));
   servers_[local_id] = std::move(server);
+  if (auto it = protected_endpoint_refs_.find(local_id); it != protected_endpoint_refs_.end()) {
+    for (const auto &[endpoint, refs] : it->second) {
+      td::actor::send_closure(servers_[local_id].get(), &QuicServer::add_protected_flood_endpoint, endpoint, refs);
+    }
+  }
 
+  co_return td::Unit{};
+}
+
+td::actor::Task<> QuicSender::resolve_protected_peer_endpoint(adnl::AdnlNodeIdShort local_id,
+                                                              adnl::AdnlNodeIdShort peer_id) {
+  auto node_result = co_await td::actor::ask(adnl_, &adnl::Adnl::get_peer_node, local_id, peer_id).wrap();
+  if (node_result.is_error()) {
+    LOG(DEBUG) << "Failed to resolve protected peer " << local_id << " -> " << peer_id << ": "
+               << node_result.error();
+    co_return td::Unit{};
+  }
+
+  auto endpoint_result = get_ip_address(node_result.move_as_ok());
+  if (endpoint_result.is_error()) {
+    LOG(DEBUG) << "Failed to resolve protected peer endpoint " << local_id << " -> " << peer_id << ": "
+               << endpoint_result.error();
+    co_return td::Unit{};
+  }
+
+  update_protected_peer_endpoint(local_id, peer_id, endpoint_result.move_as_ok());
   co_return td::Unit{};
 }
 
@@ -482,6 +545,7 @@ td::actor::Task<td::Unit> QuicSender::init_connection_inner(AdnlPath path, std::
   auto node = co_await ask(adnl_, &adnl::Adnl::get_peer_node, path.first, path.second).trace("get_peer_node");
 
   auto peer_addr = co_await get_ip_address(node);
+  update_protected_peer_endpoint(path.first, path.second, peer_addr);
   auto peer_host = peer_addr.get_ip_host();
   auto peer_port = peer_addr.get_port();
 
@@ -687,6 +751,69 @@ void QuicSender::on_answer(Connection &connection, QuicStreamID stream_id, ton_a
   }
   it->second.set_result(std::move(answer.data_));
   connection.responses.erase(it);
+}
+
+void QuicSender::update_protected_peer_endpoint(adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id,
+                                                std::optional<td::IPAddress> endpoint) {
+  auto local_it = protected_peers_.find(local_id);
+  if (local_it == protected_peers_.end()) {
+    return;
+  }
+  auto peer_it = local_it->second.find(peer_id);
+  if (peer_it == local_it->second.end()) {
+    return;
+  }
+
+  auto &entry = peer_it->second;
+  if (entry.endpoint == endpoint) {
+    return;
+  }
+  if (entry.endpoint.has_value()) {
+    remove_protected_endpoint_ref(local_id, *entry.endpoint, entry.refs);
+  }
+  entry.endpoint = std::move(endpoint);
+  if (entry.endpoint.has_value()) {
+    add_protected_endpoint_ref(local_id, *entry.endpoint, entry.refs);
+  }
+}
+
+void QuicSender::add_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint,
+                                            size_t refs) {
+  if (refs == 0) {
+    return;
+  }
+  protected_endpoint_refs_[local_id][endpoint] += refs;
+  if (auto it = servers_.find(local_id); it != servers_.end()) {
+    td::actor::send_closure(it->second.get(), &QuicServer::add_protected_flood_endpoint, endpoint, refs);
+  }
+}
+
+void QuicSender::remove_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint,
+                                               size_t refs) {
+  if (refs == 0) {
+    return;
+  }
+  auto local_it = protected_endpoint_refs_.find(local_id);
+  if (local_it == protected_endpoint_refs_.end()) {
+    return;
+  }
+  auto endpoint_it = local_it->second.find(endpoint);
+  if (endpoint_it == local_it->second.end()) {
+    return;
+  }
+
+  const size_t removed_refs = std::min(endpoint_it->second, refs);
+  if (endpoint_it->second == removed_refs) {
+    local_it->second.erase(endpoint_it);
+  } else {
+    endpoint_it->second -= removed_refs;
+  }
+  if (local_it->second.empty()) {
+    protected_endpoint_refs_.erase(local_it);
+  }
+  if (auto it = servers_.find(local_id); it != servers_.end()) {
+    td::actor::send_closure(it->second.get(), &QuicServer::remove_protected_flood_endpoint, endpoint, removed_refs);
+  }
 }
 
 }  // namespace ton::quic

@@ -141,6 +141,7 @@ class ValidatorGroup : public IValidatorGroup {
   td::actor::ActorId<CollationManager> collation_manager_;
   td::actor::ActorOwn<validatorsession::ValidatorSession> session_;
   adnl::AdnlNodeIdShort local_adnl_id_;
+  std::vector<adnl::AdnlNodeIdShort> protected_validator_peer_ids_;
 
   bool init_ = false;
   bool started_ = false;
@@ -588,6 +589,16 @@ void ValidatorGroup::create_session() {
   CHECK(found);
 
   td::actor::send_closure(adnl_sender_, &adnl::AdnlSenderEx::add_id, local_adnl_id_);
+  protected_validator_peer_ids_.clear();
+  for (const auto &peer_id : adnl_ids) {
+    if (peer_id != local_adnl_id_) {
+      protected_validator_peer_ids_.push_back(peer_id);
+    }
+  }
+  if (!protected_validator_peer_ids_.empty()) {
+    td::actor::send_closure(adnl_sender_, &adnl::AdnlSenderEx::add_protected_peers, local_adnl_id_,
+                            protected_validator_peer_ids_);
+  }
   config_.catchain_opts.broadcast_speed_multiplier = opts_->get_catchain_broadcast_speed_multiplier();
   if (!config_.new_catchain_ids) {
     session_ = validatorsession::ValidatorSession::create(
@@ -664,6 +675,10 @@ void ValidatorGroup::destroy() {
     return;
   }
   destroying_ = true;
+  if (!protected_validator_peer_ids_.empty()) {
+    td::actor::send_closure(adnl_sender_, &adnl::AdnlSenderEx::remove_protected_peers, local_adnl_id_,
+                            std::move(protected_validator_peer_ids_));
+  }
   if (!session_.empty()) {
     td::actor::send_closure(session_, &validatorsession::ValidatorSession::get_end_stats,
                             [manager = manager_](td::Result<validatorsession::EndValidatorGroupStats> R) {

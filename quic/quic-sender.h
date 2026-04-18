@@ -31,6 +31,8 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
 
   void set_quic_options(QuicServer::Options options);
   void add_id(adnl::AdnlNodeIdShort local_id) override;
+  void add_protected_peers(adnl::AdnlNodeIdShort local_id, std::vector<adnl::AdnlNodeIdShort> peer_ids) override;
+  void remove_protected_peers(adnl::AdnlNodeIdShort local_id, std::vector<adnl::AdnlNodeIdShort> peer_ids) override;
   void log_stats(std::string reason = "stats");
 
   struct Stats {
@@ -81,6 +83,12 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
   std::map<AdnlPath, std::shared_ptr<Connection>> outbound_;
   std::map<AdnlPath, std::shared_ptr<Connection>> inbound_;
   std::map<QuicConnectionId, std::shared_ptr<Connection>> by_cid_;
+  struct ProtectedPeerState {
+    size_t refs = 0;
+    std::optional<td::IPAddress> endpoint;
+  };
+  std::map<adnl::AdnlNodeIdShort, std::map<adnl::AdnlNodeIdShort, ProtectedPeerState>> protected_peers_;
+  std::map<adnl::AdnlNodeIdShort, std::map<td::IPAddress, size_t>> protected_endpoint_refs_;
 
   std::map<adnl::AdnlNodeIdShort, td::actor::ActorOwn<QuicServer>> servers_;
   std::map<adnl::AdnlNodeIdShort, td::Ed25519::PrivateKey> local_keys_;
@@ -96,6 +104,7 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
                                                    std::optional<td::uint64> limit);
   td::actor::Task<std::string> get_conn_ip_str_coro(adnl::AdnlNodeIdShort l_id, adnl::AdnlNodeIdShort p_id);
   td::actor::Task<> add_local_id_coro(adnl::AdnlNodeIdShort local_id);
+  td::actor::Task<> resolve_protected_peer_endpoint(adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id);
 
   td::actor::Task<std::shared_ptr<Connection>> find_or_create_connection(AdnlPath path);
   td::actor::Task<td::Unit> init_connection(AdnlPath path, std::shared_ptr<Connection> connection);
@@ -117,6 +126,10 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
   td::actor::Task<> on_inbound_query(std::shared_ptr<Connection> connection, QuicStreamID stream_id,
                                      td::BufferSlice query);
   void on_answer(Connection& connection, QuicStreamID stream_id, ton_api::quic_answer& answer);
+  void update_protected_peer_endpoint(adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id,
+                                      std::optional<td::IPAddress> endpoint);
+  void add_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint, size_t refs = 1);
+  void remove_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint, size_t refs = 1);
 
   static td::Result<td::IPAddress> get_ip_address(const adnl::AdnlNode& node);
 };
