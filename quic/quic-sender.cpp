@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <sstream>
 #include <utility>
 
 #include "auto/tl/ton_api.hpp"
@@ -291,9 +292,10 @@ void QuicSender::add_protected_peers(adnl::AdnlNodeIdShort local_id,
     if (entry.endpoint.has_value()) {
       add_protected_endpoint_ref(local_id, *entry.endpoint);
     } else {
-      resolve_protected_peer_endpoint(local_id, peer_id).start().detach("resolve protected peer endpoint");
+      schedule_protected_peer_endpoint_resolve(local_id, peer_id);
     }
   }
+  schedule_protected_endpoints_log();
 }
 
 void QuicSender::remove_protected_peers(adnl::AdnlNodeIdShort local_id,
@@ -318,6 +320,7 @@ void QuicSender::remove_protected_peers(adnl::AdnlNodeIdShort local_id,
   if (local_it->second.empty()) {
     protected_peers_.erase(local_it);
   }
+  schedule_protected_endpoints_log();
 }
 
 void QuicSender::log_stats(std::string reason) {
@@ -401,7 +404,12 @@ QuicSender::Connection::~Connection() {
 
 void QuicSender::start_up() {
   AdnlSenderInterface::start_up();
-  alarm_timestamp() = td::Timestamp::now();
+  alarm_timestamp() = td::Timestamp::never();
+}
+
+void QuicSender::alarm() {
+  maybe_log_protected_endpoints("periodic", true);
+  alarm_timestamp() = next_protected_endpoints_log_at_;
 }
 
 td::actor::Task<td::Unit> QuicSender::send_message_coro(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst,
@@ -478,27 +486,59 @@ td::actor::Task<> QuicSender::add_local_id_coro(adnl::AdnlNodeIdShort local_id) 
       td::actor::send_closure(servers_[local_id].get(), &QuicServer::add_protected_flood_endpoint, endpoint, refs);
     }
   }
+  schedule_protected_endpoints_log();
 
   co_return td::Unit{};
 }
 
 td::actor::Task<> QuicSender::resolve_protected_peer_endpoint(adnl::AdnlNodeIdShort local_id,
-                                                              adnl::AdnlNodeIdShort peer_id) {
-  auto node_result = co_await td::actor::ask(adnl_, &adnl::Adnl::get_peer_node, local_id, peer_id).wrap();
-  if (node_result.is_error()) {
-    LOG(DEBUG) << "Failed to resolve protected peer " << local_id << " -> " << peer_id << ": "
-               << node_result.error();
-    co_return td::Unit{};
+                                                              adnl::AdnlNodeIdShort peer_id, td::uint64 generation) {
+  double retry_delay = 1.0;
+  td::Result<td::IPAddress> last_error = td::Status::Error("not attempted");
+  size_t attempt = 0;
+
+  while (is_protected_peer_registered(local_id, peer_id, generation)) {
+    attempt++;
+
+    auto node_result = co_await td::actor::ask(adnl_, &adnl::Adnl::get_peer_node, local_id, peer_id).wrap();
+    if (node_result.is_ok()) {
+      auto endpoint_result = get_ip_address(node_result.move_as_ok());
+      if (endpoint_result.is_ok()) {
+        auto endpoint = endpoint_result.move_as_ok();
+        if (is_protected_peer_registered(local_id, peer_id, generation)) {
+          auto &entry = protected_peers_[local_id][peer_id];
+          entry.resolve_failures = 0;
+          update_protected_peer_endpoint(local_id, peer_id, endpoint);
+          if (attempt > 1) {
+            LOG(INFO) << "Resolved protected QUIC flood endpoint " << local_id << " -> " << peer_id << " endpoint="
+                      << endpoint.get_ip_str() << ":" << endpoint.get_port() << " attempts=" << attempt;
+          }
+          schedule_protected_endpoints_log();
+        }
+        finish_protected_peer_endpoint_resolve(local_id, peer_id, generation);
+        co_return td::Unit{};
+      }
+      last_error = endpoint_result.move_as_error();
+    } else {
+      last_error = node_result.move_as_error();
+    }
+
+    if (!is_protected_peer_registered(local_id, peer_id, generation)) {
+      break;
+    }
+
+    auto &entry = protected_peers_[local_id][peer_id];
+    entry.resolve_failures++;
+    if (attempt == 1 || attempt % 8 == 0) {
+      LOG(INFO) << "Retrying protected QUIC flood endpoint resolve " << local_id << " -> " << peer_id
+                << " attempt=" << attempt << " retry_in=" << retry_delay << "s error=" << last_error.error();
+    }
+
+    co_await td::actor::coro_sleep(td::Timestamp::in(retry_delay));
+    retry_delay = std::min(retry_delay * 2.0, PROTECTED_PEER_RESOLVE_RETRY_MAX_DELAY);
   }
 
-  auto endpoint_result = get_ip_address(node_result.move_as_ok());
-  if (endpoint_result.is_error()) {
-    LOG(DEBUG) << "Failed to resolve protected peer endpoint " << local_id << " -> " << peer_id << ": "
-               << endpoint_result.error();
-    co_return td::Unit{};
-  }
-
-  update_protected_peer_endpoint(local_id, peer_id, endpoint_result.move_as_ok());
+  finish_protected_peer_endpoint_resolve(local_id, peer_id, generation);
   co_return td::Unit{};
 }
 
@@ -775,6 +815,131 @@ void QuicSender::update_protected_peer_endpoint(adnl::AdnlNodeIdShort local_id, 
   if (entry.endpoint.has_value()) {
     add_protected_endpoint_ref(local_id, *entry.endpoint, entry.refs);
   }
+  schedule_protected_endpoints_log();
+}
+
+void QuicSender::schedule_protected_peer_endpoint_resolve(adnl::AdnlNodeIdShort local_id,
+                                                          adnl::AdnlNodeIdShort peer_id) {
+  auto local_it = protected_peers_.find(local_id);
+  if (local_it == protected_peers_.end()) {
+    return;
+  }
+  auto peer_it = local_it->second.find(peer_id);
+  if (peer_it == local_it->second.end()) {
+    return;
+  }
+  auto &entry = peer_it->second;
+  if (entry.refs == 0 || entry.endpoint.has_value() || entry.resolve_in_flight) {
+    return;
+  }
+  entry.resolve_in_flight = true;
+  entry.resolve_generation = next_protected_peer_resolve_generation_++;
+  resolve_protected_peer_endpoint(local_id, peer_id, entry.resolve_generation)
+      .start()
+      .detach("resolve protected peer endpoint");
+}
+
+void QuicSender::finish_protected_peer_endpoint_resolve(adnl::AdnlNodeIdShort local_id,
+                                                        adnl::AdnlNodeIdShort peer_id, td::uint64 generation) {
+  auto local_it = protected_peers_.find(local_id);
+  if (local_it == protected_peers_.end()) {
+    return;
+  }
+  auto peer_it = local_it->second.find(peer_id);
+  if (peer_it == local_it->second.end()) {
+    return;
+  }
+  auto &entry = peer_it->second;
+  if (entry.resolve_generation != generation) {
+    return;
+  }
+  entry.resolve_in_flight = false;
+}
+
+bool QuicSender::is_protected_peer_registered(adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id,
+                                              td::uint64 generation) const {
+  auto local_it = protected_peers_.find(local_id);
+  if (local_it == protected_peers_.end()) {
+    return false;
+  }
+  auto peer_it = local_it->second.find(peer_id);
+  if (peer_it == local_it->second.end()) {
+    return false;
+  }
+  const auto &entry = peer_it->second;
+  return entry.refs > 0 && entry.resolve_in_flight && entry.resolve_generation == generation;
+}
+
+void QuicSender::schedule_protected_endpoints_log(double delay) {
+  auto next = td::Timestamp::in(delay);
+  if (next_protected_endpoints_log_at_ && next_protected_endpoints_log_at_.at() <= next.at()) {
+    return;
+  }
+  next_protected_endpoints_log_at_ = next;
+  alarm_timestamp().relax(next_protected_endpoints_log_at_);
+}
+
+void QuicSender::maybe_log_protected_endpoints(std::string reason, bool force) {
+  if (!force && (!next_protected_endpoints_log_at_ || !next_protected_endpoints_log_at_.is_in_past())) {
+    return;
+  }
+
+  size_t resolved_count = 0;
+  size_t resolved_refs = 0;
+  size_t unresolved_count = 0;
+  std::ostringstream endpoints;
+  std::ostringstream unresolved;
+  size_t logged_endpoints = 0;
+  size_t logged_unresolved = 0;
+
+  for (const auto &[local_id, endpoint_map] : protected_endpoint_refs_) {
+    for (const auto &[endpoint, refs] : endpoint_map) {
+      resolved_count++;
+      resolved_refs += refs;
+      if (logged_endpoints++ < PROTECTED_ENDPOINTS_LOG_LIMIT) {
+        if (logged_endpoints > 1) {
+          endpoints << ", ";
+        }
+        endpoints << (PSTRING() << local_id << "=>" << endpoint.get_ip_str() << ":" << endpoint.get_port()
+                                 << "(refs=" << refs << ")");
+      }
+    }
+  }
+
+  for (const auto &[local_id, peer_map] : protected_peers_) {
+    for (const auto &[peer_id, entry] : peer_map) {
+      if (entry.refs == 0 || entry.endpoint.has_value()) {
+        continue;
+      }
+      unresolved_count++;
+      if (logged_unresolved++ < PROTECTED_UNRESOLVED_LOG_LIMIT) {
+        if (logged_unresolved > 1) {
+          unresolved << ", ";
+        }
+        unresolved << (PSTRING() << local_id << "->" << peer_id << "(refs=" << entry.refs
+                                   << ", failures=" << entry.resolve_failures
+                                   << ", resolving=" << entry.resolve_in_flight << ")");
+      }
+    }
+  }
+
+  if (resolved_count == 0 && unresolved_count == 0) {
+    next_protected_endpoints_log_at_ = td::Timestamp::never();
+    return;
+  }
+
+  if (resolved_count > PROTECTED_ENDPOINTS_LOG_LIMIT) {
+    endpoints << ", ...";
+  }
+  if (unresolved_count > PROTECTED_UNRESOLVED_LOG_LIMIT) {
+    unresolved << ", ...";
+  }
+
+  LOG(INFO) << "QUIC protected flood endpoints reason=" << reason << " local_ids=" << protected_peers_.size()
+            << " resolved=" << resolved_count << " resolved_refs=" << resolved_refs
+            << " unresolved=" << unresolved_count << " endpoints=[" << endpoints.str() << "] unresolved_peers=["
+            << unresolved.str() << "]";
+  next_protected_endpoints_log_at_ = td::Timestamp::in(PROTECTED_ENDPOINTS_LOG_PERIOD);
 }
 
 void QuicSender::add_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint,
@@ -786,6 +951,7 @@ void QuicSender::add_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, cons
   if (auto it = servers_.find(local_id); it != servers_.end()) {
     td::actor::send_closure(it->second.get(), &QuicServer::add_protected_flood_endpoint, endpoint, refs);
   }
+  schedule_protected_endpoints_log();
 }
 
 void QuicSender::remove_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint,
@@ -814,6 +980,7 @@ void QuicSender::remove_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, c
   if (auto it = servers_.find(local_id); it != servers_.end()) {
     td::actor::send_closure(it->second.get(), &QuicServer::remove_protected_flood_endpoint, endpoint, removed_refs);
   }
+  schedule_protected_endpoints_log();
 }
 
 }  // namespace ton::quic
