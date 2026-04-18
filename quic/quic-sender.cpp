@@ -284,8 +284,7 @@ void QuicSender::add_id(adnl::AdnlNodeIdShort local_id) {
   add_local_id_coro(local_id).start().detach("add local id");
 }
 
-void QuicSender::add_protected_peers(adnl::AdnlNodeIdShort local_id,
-                                     std::vector<adnl::AdnlNodeIdShort> peer_ids) {
+void QuicSender::add_protected_peers(adnl::AdnlNodeIdShort local_id, std::vector<adnl::AdnlNodeIdShort> peer_ids) {
   for (const auto &peer_id : peer_ids) {
     auto &entry = protected_peers_[local_id][peer_id];
     entry.refs++;
@@ -298,8 +297,7 @@ void QuicSender::add_protected_peers(adnl::AdnlNodeIdShort local_id,
   schedule_protected_endpoints_log();
 }
 
-void QuicSender::remove_protected_peers(adnl::AdnlNodeIdShort local_id,
-                                        std::vector<adnl::AdnlNodeIdShort> peer_ids) {
+void QuicSender::remove_protected_peers(adnl::AdnlNodeIdShort local_id, std::vector<adnl::AdnlNodeIdShort> peer_ids) {
   auto local_it = protected_peers_.find(local_id);
   if (local_it == protected_peers_.end()) {
     return;
@@ -510,8 +508,8 @@ td::actor::Task<> QuicSender::resolve_protected_peer_endpoint(adnl::AdnlNodeIdSh
           entry.resolve_failures = 0;
           update_protected_peer_endpoint(local_id, peer_id, endpoint);
           if (attempt > 1) {
-            LOG(INFO) << "Resolved protected QUIC flood endpoint " << local_id << " -> " << peer_id << " endpoint="
-                      << endpoint.get_ip_str() << ":" << endpoint.get_port() << " attempts=" << attempt;
+            LOG(INFO) << "Resolved protected QUIC flood endpoint " << local_id << " -> " << peer_id
+                      << " endpoint=" << endpoint.get_ip_str() << ":" << endpoint.get_port() << " attempts=" << attempt;
           }
           schedule_protected_endpoints_log();
         }
@@ -839,8 +837,8 @@ void QuicSender::schedule_protected_peer_endpoint_resolve(adnl::AdnlNodeIdShort 
       .detach("resolve protected peer endpoint");
 }
 
-void QuicSender::finish_protected_peer_endpoint_resolve(adnl::AdnlNodeIdShort local_id,
-                                                        adnl::AdnlNodeIdShort peer_id, td::uint64 generation) {
+void QuicSender::finish_protected_peer_endpoint_resolve(adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id,
+                                                        td::uint64 generation) {
   auto local_it = protected_peers_.find(local_id);
   if (local_it == protected_peers_.end()) {
     return;
@@ -901,7 +899,7 @@ void QuicSender::maybe_log_protected_endpoints(std::string reason, bool force) {
           endpoints << ", ";
         }
         endpoints << (PSTRING() << local_id << "=>" << endpoint.get_ip_str() << ":" << endpoint.get_port()
-                                 << "(refs=" << refs << ")");
+                                << "(refs=" << refs << ")");
       }
     }
   }
@@ -916,9 +914,8 @@ void QuicSender::maybe_log_protected_endpoints(std::string reason, bool force) {
         if (logged_unresolved > 1) {
           unresolved << ", ";
         }
-        unresolved << (PSTRING() << local_id << "->" << peer_id << "(refs=" << entry.refs
-                                   << ", failures=" << entry.resolve_failures
-                                   << ", resolving=" << entry.resolve_in_flight << ")");
+        unresolved << (PSTRING() << local_id << "->" << peer_id << "(refs=" << entry.refs << ", failures="
+                                 << entry.resolve_failures << ", resolving=" << entry.resolve_in_flight << ")");
       }
     }
   }

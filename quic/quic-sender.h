@@ -148,8 +148,8 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
                                     td::uint64 generation) const;
   void schedule_protected_endpoints_log(double delay = PROTECTED_ENDPOINTS_INITIAL_LOG_DELAY);
   void maybe_log_protected_endpoints(std::string reason, bool force = false);
-  void add_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint, size_t refs = 1);
-  void remove_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress &endpoint, size_t refs = 1);
+  void add_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress& endpoint, size_t refs = 1);
+  void remove_protected_endpoint_ref(adnl::AdnlNodeIdShort local_id, const td::IPAddress& endpoint, size_t refs = 1);
 
   static td::Result<td::IPAddress> get_ip_address(const adnl::AdnlNode& node);
 };
