@@ -325,6 +325,11 @@ class ValidatorManager : public ValidatorManagerInterface {
                                    td::uint32 validator_set_hash, bool cache_only, td::Promise<td::Unit> promise) = 0;
   virtual void send_block_candidate_broadcast(BlockIdExt id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                               td::BufferSlice data, int mode) = 0;
+  virtual void schedule_block_candidate_fast_sync_backup(BlockIdExt id, CatchainSeqno cc_seqno,
+                                                         td::uint32 validator_set_hash, td::Timestamp deadline) {
+  }
+  virtual void mark_block_candidate_fast_sync_backup_validated(BlockIdExt id) {
+  }
 
   virtual void wait_prev_block_state(BlockHandle handle, td::uint32 priority, td::Timestamp timeout,
                                      td::Promise<td::Ref<ShardState>> promise) = 0;

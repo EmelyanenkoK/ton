@@ -88,6 +88,15 @@ class ManagerFacadeImpl : public ManagerFacade {
                             std::move(data), mode);
   }
 
+  void schedule_block_candidate_fast_sync_backup(BlockIdExt id, td::Timestamp deadline) override {
+    td::actor::send_closure(manager_, &ValidatorManager::schedule_block_candidate_fast_sync_backup, id,
+                            validator_set_->get_catchain_seqno(), validator_set_->get_validator_set_hash(), deadline);
+  }
+
+  void mark_block_candidate_fast_sync_backup_validated(BlockIdExt id) override {
+    td::actor::send_closure(manager_, &ValidatorManager::mark_block_candidate_fast_sync_backup_validated, id);
+  }
+
   void update_collator_options(td::Ref<ValidatorManagerOptions> opts) {
     opts_ = std::move(opts);
   }

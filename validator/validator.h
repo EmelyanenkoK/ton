@@ -354,6 +354,10 @@ class ValidatorManagerInterface : public td::actor::Actor {
     co_return td::Unit{};
   }
 
+  virtual void mark_block_candidate_fast_sync_seen(BlockIdExt block_id, CatchainSeqno cc_seqno,
+                                                   td::uint32 validator_set_hash) {
+  }
+
   virtual void add_ext_server_id(adnl::AdnlNodeIdShort id) = 0;
   virtual void add_ext_server_port(td::uint16 port) = 0;
 

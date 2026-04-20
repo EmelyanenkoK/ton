@@ -205,6 +205,15 @@ class ValidatorManagerImpl : public ValidatorManager {
 
   td::LRUCache<BlockIdExt, td::BufferSlice> cached_block_data_{/* max_size = */ 128};
   td::LRUCache<BlockIdExt, td::Unit> cached_checked_shard_block_descriptions_{/* max_size = */ 1024};
+  struct CandidateFastSyncBackup {
+    CatchainSeqno cc_seqno = 0;
+    td::uint32 validator_set_hash = 0;
+    td::Timestamp fast_sync_deadline = td::Timestamp::never();
+    bool validated = false;
+    bool seen_fast_sync = false;
+    bool sent_fast_sync = false;
+  };
+  std::map<BlockIdExt, CandidateFastSyncBackup> candidate_fast_sync_backups_;
 
   td::actor::ActorOwn<ExtMessagePool> ext_message_pool_;
   td::actor::ActorOwn<AppliedExtMessageCleanupActor> applied_ext_message_cleanup_actor_;
@@ -408,6 +417,11 @@ class ValidatorManagerImpl : public ValidatorManager {
                            td::uint32 validator_set_hash, bool cache_only, td::Promise<td::Unit> promise) override;
   void send_block_candidate_broadcast(BlockIdExt id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                       td::BufferSlice data, int mode) override;
+  void schedule_block_candidate_fast_sync_backup(BlockIdExt id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
+                                                 td::Timestamp deadline) override;
+  void mark_block_candidate_fast_sync_backup_validated(BlockIdExt id) override;
+  void mark_block_candidate_fast_sync_seen(BlockIdExt block_id, CatchainSeqno cc_seqno,
+                                           td::uint32 validator_set_hash) override;
 
   void wait_block_state_merge(BlockIdExt left_id, BlockIdExt right_id, td::uint32 priority, td::Timestamp timeout,
                               td::Promise<td::Ref<ShardState>> promise) override;

@@ -31,6 +31,12 @@ class ManagerFacade : public td::actor::Actor {
 
   virtual void send_block_candidate_broadcast(BlockIdExt id, td::BufferSlice data, int mode) {
   }
+
+  virtual void schedule_block_candidate_fast_sync_backup(BlockIdExt id, td::Timestamp deadline) {
+  }
+
+  virtual void mark_block_candidate_fast_sync_backup_validated(BlockIdExt id) {
+  }
 };
 
 }  // namespace ton::validator::consensus

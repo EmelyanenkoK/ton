@@ -190,6 +190,8 @@ void FullNodeFastSyncOverlay::process_block_candidate_broadcast(PublicKeyHash sr
     return;
   }
   VLOG(FULL_NODE_DEBUG) << "Received newBlockCandidate in fast sync overlay from " << src << ": " << block_id.to_str();
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::mark_block_candidate_fast_sync_seen, block_id,
+                          cc_seqno, validator_set_hash);
   td::actor::send_closure(full_node_, &FullNode::process_block_candidate_broadcast, block_id, cc_seqno,
                           validator_set_hash, std::move(data));
 }

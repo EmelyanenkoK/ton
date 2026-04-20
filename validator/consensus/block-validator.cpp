@@ -102,6 +102,7 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
                                             std::move(validate_params), td::Timestamp::in(60.0));
       if (result.has<CandidateAccept>()) {
         td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate, block.clone());
+        td::actor::send_closure(bus.manager, &ManagerFacade::mark_block_candidate_fast_sync_backup_validated, block.id);
       }
       co_return result;
     };

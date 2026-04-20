@@ -44,6 +44,7 @@
 
 #include "checksum.h"
 #include "fabric.h"
+#include "full-node.h"
 #include "get-next-key-blocks.h"
 #include "import-db-slice-local.hpp"
 #include "import-db-slice.hpp"
@@ -56,6 +57,12 @@
 namespace ton {
 
 namespace validator {
+
+namespace {
+
+constexpr double kCandidateFastSyncBackupGcTtl = 60.0;
+
+}  // namespace
 
 void ValidatorManagerImpl::validate_block_is_next_proof(BlockIdExt prev_block_id, BlockIdExt next_block_id,
                                                         td::BufferSlice proof, td::Promise<td::Unit> promise) {
@@ -1483,7 +1490,58 @@ void ValidatorManagerImpl::set_block_candidate(BlockIdExt id, BlockCandidate can
 void ValidatorManagerImpl::send_block_candidate_broadcast(BlockIdExt id, CatchainSeqno cc_seqno,
                                                           td::uint32 validator_set_hash, td::BufferSlice data,
                                                           int mode) {
+  if (!id.is_masterchain() && (mode & fullnode::FullNode::broadcast_mode_fast_sync)) {
+    auto &backup = candidate_fast_sync_backups_[id];
+    backup.cc_seqno = cc_seqno;
+    backup.validator_set_hash = validator_set_hash;
+    backup.seen_fast_sync = true;
+    backup.sent_fast_sync = true;
+    if (!backup.fast_sync_deadline) {
+      backup.fast_sync_deadline = td::Timestamp::in(kCandidateFastSyncBackupGcTtl);
+    }
+    alarm_timestamp().relax(backup.fast_sync_deadline);
+  }
   callback_->send_block_candidate(id, cc_seqno, validator_set_hash, std::move(data), mode);
+}
+
+void ValidatorManagerImpl::schedule_block_candidate_fast_sync_backup(BlockIdExt id, CatchainSeqno cc_seqno,
+                                                                     td::uint32 validator_set_hash,
+                                                                     td::Timestamp deadline) {
+  if (id.is_masterchain()) {
+    return;
+  }
+  auto &backup = candidate_fast_sync_backups_[id];
+  backup.cc_seqno = cc_seqno;
+  backup.validator_set_hash = validator_set_hash;
+  backup.fast_sync_deadline = deadline;
+  alarm_timestamp().relax(backup.fast_sync_deadline);
+}
+
+void ValidatorManagerImpl::mark_block_candidate_fast_sync_backup_validated(BlockIdExt id) {
+  if (id.is_masterchain()) {
+    return;
+  }
+  auto &backup = candidate_fast_sync_backups_[id];
+  backup.validated = true;
+  if (!backup.fast_sync_deadline) {
+    backup.fast_sync_deadline = td::Timestamp::in(kCandidateFastSyncBackupGcTtl);
+  }
+  alarm_timestamp().relax(backup.fast_sync_deadline);
+}
+
+void ValidatorManagerImpl::mark_block_candidate_fast_sync_seen(BlockIdExt id, CatchainSeqno cc_seqno,
+                                                               td::uint32 validator_set_hash) {
+  if (id.is_masterchain()) {
+    return;
+  }
+  auto &backup = candidate_fast_sync_backups_[id];
+  backup.cc_seqno = cc_seqno;
+  backup.validator_set_hash = validator_set_hash;
+  backup.seen_fast_sync = true;
+  if (!backup.fast_sync_deadline) {
+    backup.fast_sync_deadline = td::Timestamp::in(kCandidateFastSyncBackupGcTtl);
+  }
+  alarm_timestamp().relax(backup.fast_sync_deadline);
 }
 
 void ValidatorManagerImpl::write_handle(BlockHandle handle, td::Promise<td::Unit> promise) {
@@ -2889,6 +2947,31 @@ void ValidatorManagerImpl::alarm() {
     }
   }
   alarm_timestamp().relax(resend_shard_blocks_at_);
+  for (auto it = candidate_fast_sync_backups_.begin(); it != candidate_fast_sync_backups_.end();) {
+    auto &backup = it->second;
+    if (!backup.fast_sync_deadline || !backup.fast_sync_deadline.is_in_past()) {
+      ++it;
+      continue;
+    }
+
+    if (backup.seen_fast_sync || backup.sent_fast_sync || !backup.validated) {
+      it = candidate_fast_sync_backups_.erase(it);
+      continue;
+    }
+
+    auto nonfinal_it = nonfinal_info_.find({it->first.shard_full(), backup.cc_seqno});
+    if (nonfinal_it != nonfinal_info_.end() && nonfinal_it->second.last_accepted.is_valid() &&
+        nonfinal_it->second.last_accepted.seqno() >= it->first.seqno()) {
+      it = candidate_fast_sync_backups_.erase(it);
+      continue;
+    }
+
+    if (auto cached = cached_block_data_.get_if_exists(it->first, false)) {
+      send_block_candidate_broadcast(it->first, backup.cc_seqno, backup.validator_set_hash, cached->clone(),
+                                     fullnode::FullNode::broadcast_mode_fast_sync);
+    }
+    it = candidate_fast_sync_backups_.erase(it);
+  }
   if (check_waiters_at_.is_in_past()) {
     check_waiters_at_ = td::Timestamp::in(1.0);
     for (auto &w : wait_block_data_) {
