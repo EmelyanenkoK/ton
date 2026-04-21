@@ -61,6 +61,7 @@ struct FullNodeOptions {
   double public_broadcast_speed_multiplier_ = 1.0;
   double private_broadcast_speed_multiplier_ = 1.0;
   double fast_sync_broadcast_speed_multiplier_ = 1.0;
+  double fast_sync_public_rebroadcast_delay_ = 0.0;
   double initial_sync_delay_ = 60.0;
   double ratelimit_window_size_ = 1.0;
   size_t ratelimit_global_ = 96, ratelimit_heavy_ = 64, ratelimit_medium_ = 72;
@@ -81,6 +82,12 @@ struct CustomOverlayParams {
 
 class FullNode : public td::actor::Actor {
  public:
+  enum class BlockBroadcastSource : td::uint8 {
+    public_overlay,
+    fast_sync_overlay,
+    custom_overlay,
+  };
+
   virtual ~FullNode() = default;
 
   virtual void update_dht_node(td::actor::ActorId<dht::Dht> dht) = 0;
@@ -102,7 +109,8 @@ class FullNode : public td::actor::Actor {
   virtual void add_custom_overlay(CustomOverlayParams params, td::Promise<td::Unit> promise) = 0;
   virtual void del_custom_overlay(std::string name, td::Promise<td::Unit> promise) = 0;
 
-  virtual void process_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) = 0;
+  virtual void process_block_broadcast(BlockBroadcast broadcast, BlockBroadcastSource source,
+                                       bool signatures_checked = false) = 0;
   virtual void process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                  td::uint32 validator_set_hash, td::BufferSlice data) = 0;
   virtual void process_shard_block_info_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,

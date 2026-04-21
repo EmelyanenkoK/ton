@@ -272,6 +272,7 @@ class ValidatorEngine : public td::actor::Actor {
                                                                   .public_broadcast_speed_multiplier_ = 3.33,
                                                                   .private_broadcast_speed_multiplier_ = 3.33,
                                                                   .fast_sync_broadcast_speed_multiplier_ = 3.33,
+                                                                  .fast_sync_public_rebroadcast_delay_ = 0.0,
                                                                   .initial_sync_delay_ = 60.0};
 
   std::set<ton::CatchainSeqno> unsafe_catchains_;
@@ -388,6 +389,9 @@ class ValidatorEngine : public td::actor::Actor {
   }
   void set_broadcast_speed_multiplier_fast_sync(double value) {
     full_node_options_.fast_sync_broadcast_speed_multiplier_ = value;
+  }
+  void set_fast_sync_public_rebroadcast_delay(double value) {
+    full_node_options_.fast_sync_public_rebroadcast_delay_ = value;
   }
   void set_permanent_celldb(bool value) {
     permanent_celldb_ = value;

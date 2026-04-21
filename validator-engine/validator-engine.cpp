@@ -5806,6 +5806,19 @@ int main(int argc, char *argv[]) {
             [&x, v]() { td::actor::send_closure(x, &ValidatorEngine::set_broadcast_speed_multiplier_fast_sync, v); });
         return td::Status::OK();
       });
+  p.add_checked_option(
+      '\0', "fast-sync-public-rebroadcast-delay",
+      "if a final fast-sync block is not seen on the public overlay, rebroadcast it there after this many seconds "
+      "(0 disables)",
+      [&](td::Slice s) -> td::Status {
+        auto v = td::to_double(s);
+        if (v < 0.0) {
+          return td::Status::Error("fast-sync-public-rebroadcast-delay should be non-negative");
+        }
+        acts.push_back(
+            [&x, v]() { td::actor::send_closure(x, &ValidatorEngine::set_fast_sync_public_rebroadcast_delay, v); });
+        return td::Status::OK();
+      });
   p.add_option(
       '\0', "permanent-celldb",
       "disable garbage collection in CellDb. This improves performance on archival nodes (once enabled, this option "

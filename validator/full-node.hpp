@@ -94,7 +94,8 @@ class FullNodeImpl : public FullNode {
   void got_key_block_config(td::Ref<ConfigHolder> config);
   void new_key_block(BlockHandle handle);
 
-  void process_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) override;
+  void process_block_broadcast(BlockBroadcast broadcast, BlockBroadcastSource source,
+                               bool signatures_checked = false) override;
   void process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                          td::BufferSlice data) override;
   void process_shard_block_info_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::BufferSlice data) override;
@@ -183,6 +184,22 @@ class FullNodeImpl : public FullNode {
   PublicKeyHash validator_telemetry_collector_key_ = PublicKeyHash::zero();
 
   void update_validator_telemetry_collector();
+
+  struct PendingFastSyncPublicRebroadcast {
+    td::Timestamp deadline = td::Timestamp::never();
+    BlockBroadcast broadcast;
+  };
+
+  std::map<BlockIdExt, td::Timestamp> recent_public_seen_blocks_;
+  std::map<BlockIdExt, td::Timestamp> recent_public_rebroadcasted_blocks_;
+  std::map<BlockIdExt, PendingFastSyncPublicRebroadcast> pending_fast_sync_public_rebroadcasts_;
+
+  void note_public_overlay_block_seen(const BlockIdExt& block_id);
+  void schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast);
+  void on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id);
+  void cleanup_fast_sync_public_rebroadcast_caches();
+  bool has_recent_block_entry(std::map<BlockIdExt, td::Timestamp>& cache, const BlockIdExt& block_id);
+  void remember_recent_block(std::map<BlockIdExt, td::Timestamp>& cache, const BlockIdExt& block_id);
 
   td::actor::ActorOwn<TokenManager> out_msg_queue_query_token_manager_ =
       td::actor::create_actor<TokenManager>("tokens", /* max_tokens = */ 1);
