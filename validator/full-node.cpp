@@ -36,6 +36,8 @@ namespace fullnode {
 
 static const double INACTIVE_SHARD_TTL = (double)overlay::Overlays::overlay_peer_ttl() + 60.0;
 static constexpr double RECENT_PUBLIC_BLOCK_TTL = 60.0;
+static constexpr double FAST_SYNC_PUBLIC_REBROADCAST_TTL = 600.0;
+static constexpr double FAST_SYNC_PUBLIC_REBROADCAST_MIN_RETRY_INTERVAL = 10.0;
 
 namespace {
 
@@ -660,30 +662,29 @@ void FullNodeImpl::new_key_block(BlockHandle handle) {
 
 void FullNodeImpl::process_block_broadcast(BlockBroadcast broadcast, BlockBroadcastSource source,
                                           bool signatures_checked) {
-  if (source == BlockBroadcastSource::public_overlay) {
-    note_public_overlay_block_seen(broadcast.block_id);
-  }
   send_block_broadcast_to_custom_overlays(broadcast);
+  const BlockIdExt block_id = broadcast.block_id;
+  const bool note_public_on_accept = source == BlockBroadcastSource::public_overlay;
   bool schedule_rebroadcast = source == BlockBroadcastSource::fast_sync_overlay &&
                               fast_sync_public_rebroadcast_enabled() &&
                               should_schedule_fast_sync_public_rebroadcast(broadcast);
-  if (schedule_rebroadcast) {
-    auto accepted_broadcast = broadcast.clone();
-    td::actor::send_closure(
-        validator_manager_, &ValidatorManagerInterface::new_block_broadcast, std::move(broadcast), signatures_checked,
-        [SelfId = actor_id(this), accepted_broadcast = std::move(accepted_broadcast)](td::Result<td::Unit> R) mutable {
-          if (R.is_error()) {
-            log_block_broadcast_result(std::move(R));
-            return;
-          }
+  auto accepted_broadcast = schedule_rebroadcast ? broadcast.clone() : BlockBroadcast{};
+  td::actor::send_closure(
+      validator_manager_, &ValidatorManagerInterface::new_block_broadcast, std::move(broadcast), signatures_checked,
+      [SelfId = actor_id(this), block_id, note_public_on_accept, accepted_broadcast = std::move(accepted_broadcast)](
+          td::Result<td::Unit> R) mutable {
+        if (R.is_error()) {
+          log_block_broadcast_result(std::move(R));
+          return;
+        }
+        if (note_public_on_accept) {
+          td::actor::send_closure(SelfId, &FullNodeImpl::note_public_overlay_block_seen, block_id);
+        }
+        if (accepted_broadcast.block_id.is_valid()) {
           td::actor::send_closure(SelfId, &FullNodeImpl::schedule_fast_sync_public_rebroadcast,
                                   std::move(accepted_broadcast));
-        });
-    return;
-  }
-  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::new_block_broadcast, std::move(broadcast),
-                          signatures_checked,
-                          [](td::Result<td::Unit> R) { log_block_broadcast_result(std::move(R)); });
+        }
+      });
 }
 
 void FullNodeImpl::note_public_overlay_block_seen(const BlockIdExt &block_id) {
@@ -696,8 +697,13 @@ void FullNodeImpl::note_public_overlay_block_seen(const BlockIdExt &block_id) {
     return;
   }
 
-  VLOG(FULL_NODE_DEBUG) << "Canceled pending fast-sync public rebroadcast after public-overlay receipt: "
-                        << block_id.to_str();
+  if (it->second.attempts > 0) {
+    LOG(INFO) << "Observed validated public block after fast-sync public rebroadcast attempts: "
+              << block_id.to_str() << " attempts=" << it->second.attempts;
+  } else {
+    VLOG(FULL_NODE_DEBUG) << "Canceled pending fast-sync public rebroadcast after public-overlay receipt: "
+                          << block_id.to_str();
+  }
   pending_fast_sync_public_rebroadcasts_.erase(it);
 }
 
@@ -707,6 +713,12 @@ bool FullNodeImpl::fast_sync_public_rebroadcast_enabled() const {
 
 double FullNodeImpl::fast_sync_public_rebroadcast_delay() const {
   return opts_.fast_sync_public_rebroadcast_immediate_ ? 0.0 : opts_.fast_sync_public_rebroadcast_delay_;
+}
+
+double FullNodeImpl::fast_sync_public_rebroadcast_retry_interval() const {
+  return fast_sync_public_rebroadcast_delay() > FAST_SYNC_PUBLIC_REBROADCAST_MIN_RETRY_INTERVAL
+             ? fast_sync_public_rebroadcast_delay()
+             : FAST_SYNC_PUBLIC_REBROADCAST_MIN_RETRY_INTERVAL;
 }
 
 void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast) {
@@ -719,11 +731,6 @@ void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcas
   if (has_recent_block_entry(recent_public_seen_blocks_, block_id)) {
     VLOG(FULL_NODE_DEBUG) << "Skipping fast-sync public rebroadcast scheduling because block is already seen on public "
                           << "overlay: " << block_id.to_str();
-    return;
-  }
-  if (has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
-    VLOG(FULL_NODE_DEBUG) << "Skipping fast-sync public rebroadcast scheduling because block was already "
-                          << "rebroadcasted: " << block_id.to_str();
     return;
   }
 
@@ -739,16 +746,14 @@ void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcas
     auto [new_it, _] = pending_fast_sync_public_rebroadcasts_.emplace(block_id, PendingFastSyncPublicRebroadcast{});
     it = new_it;
     it->second.deadline = td::Timestamp::in(fast_sync_public_rebroadcast_delay());
-    it->second.expire_at = td::Timestamp::in(RECENT_PUBLIC_BLOCK_TTL);
+    it->second.expire_at = td::Timestamp::in(FAST_SYNC_PUBLIC_REBROADCAST_TTL);
     if (!opts_.fast_sync_public_rebroadcast_immediate_) {
       VLOG(FULL_NODE_DEBUG) << "Scheduled fast-sync public rebroadcast in "
                             << fast_sync_public_rebroadcast_delay() << "s for " << block_id.to_str();
-      delay_action(
-          [SelfId = actor_id(this), block_id]() {
-            td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_timeout, block_id);
-          },
-          it->second.deadline);
+      schedule_fast_sync_public_rebroadcast_wakeup(block_id, it->second.deadline);
     }
+  } else {
+    it->second.expire_at = td::Timestamp::in(FAST_SYNC_PUBLIC_REBROADCAST_TTL);
   }
 
   auto current_sig = current_sig_set(it->second);
@@ -779,7 +784,7 @@ void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcas
     it->second.proof = it->second.broadcast.proof.clone();
   }
 
-  if (opts_.fast_sync_public_rebroadcast_immediate_) {
+  if (opts_.fast_sync_public_rebroadcast_immediate_ || (it->second.has_broadcast && it->second.deadline.is_in_past())) {
     trigger_fast_sync_public_rebroadcast(block_id);
   }
 }
@@ -801,8 +806,7 @@ void FullNodeImpl::schedule_fast_sync_public_rebroadcast_from_shard_description(
   }
 
   const BlockIdExt block_id = desc->block_id();
-  if (has_recent_block_entry(recent_public_seen_blocks_, block_id) ||
-      has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
+  if (has_recent_block_entry(recent_public_seen_blocks_, block_id)) {
     return;
   }
 
@@ -818,16 +822,14 @@ void FullNodeImpl::schedule_fast_sync_public_rebroadcast_from_shard_description(
     auto [new_it, _] = pending_fast_sync_public_rebroadcasts_.emplace(block_id, PendingFastSyncPublicRebroadcast{});
     it = new_it;
     it->second.deadline = td::Timestamp::in(fast_sync_public_rebroadcast_delay());
-    it->second.expire_at = td::Timestamp::in(RECENT_PUBLIC_BLOCK_TTL);
+    it->second.expire_at = td::Timestamp::in(FAST_SYNC_PUBLIC_REBROADCAST_TTL);
     if (!opts_.fast_sync_public_rebroadcast_immediate_) {
       VLOG(FULL_NODE_DEBUG) << "Scheduled fast-sync public rebroadcast in "
                             << fast_sync_public_rebroadcast_delay() << "s for " << block_id.to_str();
-      delay_action(
-          [SelfId = actor_id(this), block_id]() {
-            td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_timeout, block_id);
-          },
-          it->second.deadline);
+      schedule_fast_sync_public_rebroadcast_wakeup(block_id, it->second.deadline);
     }
+  } else {
+    it->second.expire_at = td::Timestamp::in(FAST_SYNC_PUBLIC_REBROADCAST_TTL);
   }
 
   auto current_sig = current_sig_set(it->second);
@@ -857,8 +859,7 @@ void FullNodeImpl::attach_fast_sync_public_rebroadcast_candidate_data(const Bloc
       it->second.proof.empty()) {
     return;
   }
-  if (has_recent_block_entry(recent_public_seen_blocks_, block_id) ||
-      has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
+  if (has_recent_block_entry(recent_public_seen_blocks_, block_id)) {
     pending_fast_sync_public_rebroadcasts_.erase(it);
     return;
   }
@@ -868,10 +869,24 @@ void FullNodeImpl::attach_fast_sync_public_rebroadcast_candidate_data(const Bloc
                         << describe_fast_sync_public_rebroadcast_sig_set(it->second.sig_set);
   it->second.broadcast = BlockBroadcast{block_id, it->second.sig_set, data.clone(), it->second.proof.clone()};
   it->second.has_broadcast = true;
+  it->second.expire_at = td::Timestamp::in(FAST_SYNC_PUBLIC_REBROADCAST_TTL);
 
   if (opts_.fast_sync_public_rebroadcast_immediate_ || it->second.deadline.is_in_past()) {
     trigger_fast_sync_public_rebroadcast(block_id);
   }
+}
+
+void FullNodeImpl::schedule_fast_sync_public_rebroadcast_wakeup(const BlockIdExt &block_id, td::Timestamp when) {
+  auto it = pending_fast_sync_public_rebroadcasts_.find(block_id);
+  if (it == pending_fast_sync_public_rebroadcasts_.end()) {
+    return;
+  }
+  it->second.wake_at = when;
+  delay_action(
+      [SelfId = actor_id(this), block_id, when]() {
+        td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_timeout, block_id, when);
+      },
+      when);
 }
 
 void FullNodeImpl::trigger_fast_sync_public_rebroadcast(BlockIdExt block_id) {
@@ -881,35 +896,43 @@ void FullNodeImpl::trigger_fast_sync_public_rebroadcast(BlockIdExt block_id) {
     return;
   }
   if (has_recent_block_entry(recent_public_seen_blocks_, block_id)) {
-    VLOG(FULL_NODE_DEBUG) << "Skipping fast-sync public rebroadcast after timer because block is already seen on "
+    VLOG(FULL_NODE_DEBUG) << "Skipping fast-sync public rebroadcast because block is already seen on "
                           << "public overlay: " << block_id.to_str();
     pending_fast_sync_public_rebroadcasts_.erase(it);
     return;
   }
-  if (has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
+  if (it->second.expire_at.is_in_past()) {
+    LOG(INFO) << "Stopping fast-sync public rebroadcast retries after timeout without validated public-overlay "
+              << "receipt: " << block_id.to_str() << " attempts=" << it->second.attempts << " best_sig_set="
+              << describe_fast_sync_public_rebroadcast_sig_set(
+                     it->second.has_broadcast ? it->second.broadcast.sig_set : it->second.sig_set);
     pending_fast_sync_public_rebroadcasts_.erase(it);
     return;
   }
+  it->second.wake_at = td::Timestamp::never();
 
-  const auto log_rebroadcast = [&](const td::Ref<block::BlockSignatureSet> &sig_set) {
+  const auto log_rebroadcast = [&](const td::Ref<block::BlockSignatureSet> &sig_set, td::uint32 attempt) {
     if (opts_.fast_sync_public_rebroadcast_immediate_) {
       LOG(INFO) << "Rebroadcasting accepted fast-sync finalized block to public overlay immediately: "
                 << block_id.to_str() << " signatures=" << sig_set->get_size()
-                << " sig_kind=" << (sig_set->is_final() ? "final" : "approve");
+                << " sig_kind=" << (sig_set->is_final() ? "final" : "approve") << " attempt=" << attempt;
     } else {
       LOG(INFO) << "Rebroadcasting accepted fast-sync final block to public overlay after "
                 << fast_sync_public_rebroadcast_delay() << "s timeout: " << block_id.to_str()
                 << " signatures=" << sig_set->get_size()
-                << " sig_kind=" << (sig_set->is_final() ? "final" : "approve");
+                << " sig_kind=" << (sig_set->is_final() ? "final" : "approve") << " attempt=" << attempt;
     }
   };
 
   if (it->second.has_broadcast) {
     auto broadcast = it->second.broadcast.clone();
-    pending_fast_sync_public_rebroadcasts_.erase(it);
-    remember_recent_block(recent_public_rebroadcasted_blocks_, block_id);
-    log_rebroadcast(broadcast.sig_set);
+    ++it->second.attempts;
+    log_rebroadcast(broadcast.sig_set, it->second.attempts);
     send_broadcast(std::move(broadcast), broadcast_mode_public);
+    auto next_retry_at = td::Timestamp::in(fast_sync_public_rebroadcast_retry_interval());
+    if (next_retry_at.at() < it->second.expire_at.at()) {
+      schedule_fast_sync_public_rebroadcast_wakeup(block_id, next_retry_at);
+    }
     return;
   }
 
@@ -918,8 +941,7 @@ void FullNodeImpl::trigger_fast_sync_public_rebroadcast(BlockIdExt block_id) {
   }
 
   it->second.fetch_in_progress = true;
-  auto wait_timeout = td::Timestamp::in(fast_sync_public_rebroadcast_delay() > 10.0 ? fast_sync_public_rebroadcast_delay()
-                                                                                     : 10.0);
+  auto wait_timeout = td::Timestamp::in(fast_sync_public_rebroadcast_retry_interval());
   auto P = td::PromiseCreator::lambda(
       [SelfId = actor_id(this), block_id](td::Result<td::Ref<BlockData>> R) mutable {
         td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_block_data, block_id,
@@ -938,17 +960,17 @@ void FullNodeImpl::on_fast_sync_public_rebroadcast_block_data(BlockIdExt block_i
   it->second.fetch_in_progress = false;
   if (R.is_error()) {
     if (it->second.expire_at.is_in_past()) {
-      LOG(INFO) << "Skipping fast-sync public rebroadcast because block data stayed unavailable for "
+      LOG(INFO) << "Stopping fast-sync public rebroadcast retries because block data stayed unavailable for "
                 << block_id.to_str() << ": " << R.move_as_error();
       pending_fast_sync_public_rebroadcasts_.erase(it);
     } else {
       VLOG(FULL_NODE_DEBUG) << "Waiting for later block data to complete fast-sync public rebroadcast for "
                             << block_id.to_str() << ": " << R.move_as_error();
+      schedule_fast_sync_public_rebroadcast_wakeup(block_id, td::Timestamp::in(fast_sync_public_rebroadcast_retry_interval()));
     }
     return;
   }
-  if (has_recent_block_entry(recent_public_seen_blocks_, block_id) ||
-      has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
+  if (has_recent_block_entry(recent_public_seen_blocks_, block_id)) {
     pending_fast_sync_public_rebroadcasts_.erase(it);
     return;
   }
@@ -958,24 +980,15 @@ void FullNodeImpl::on_fast_sync_public_rebroadcast_block_data(BlockIdExt block_i
   }
 
   auto block = R.move_as_ok();
-  BlockBroadcast broadcast{block_id, it->second.sig_set, block->data(), it->second.proof.clone()};
-  pending_fast_sync_public_rebroadcasts_.erase(it);
-  remember_recent_block(recent_public_rebroadcasted_blocks_, block_id);
-  if (opts_.fast_sync_public_rebroadcast_immediate_) {
-    LOG(INFO) << "Rebroadcasting accepted fast-sync finalized block to public overlay immediately: "
-              << block_id.to_str() << " signatures=" << broadcast.sig_set->get_size()
-              << " sig_kind=" << (broadcast.sig_set->is_final() ? "final" : "approve");
-  } else {
-    LOG(INFO) << "Rebroadcasting accepted fast-sync final block to public overlay after "
-              << fast_sync_public_rebroadcast_delay() << "s timeout: " << block_id.to_str()
-              << " signatures=" << broadcast.sig_set->get_size()
-              << " sig_kind=" << (broadcast.sig_set->is_final() ? "final" : "approve");
-  }
-  send_broadcast(std::move(broadcast), broadcast_mode_public);
+  it->second.broadcast = BlockBroadcast{block_id, it->second.sig_set, block->data(), it->second.proof.clone()};
+  it->second.has_broadcast = true;
+  trigger_fast_sync_public_rebroadcast(block_id);
 }
 
-void FullNodeImpl::on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id) {
-  if (opts_.fast_sync_public_rebroadcast_immediate_) {
+void FullNodeImpl::on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id, td::Timestamp scheduled_at) {
+  cleanup_fast_sync_public_rebroadcast_caches();
+  auto it = pending_fast_sync_public_rebroadcasts_.find(block_id);
+  if (it == pending_fast_sync_public_rebroadcasts_.end() || it->second.wake_at.at() != scheduled_at.at()) {
     return;
   }
   trigger_fast_sync_public_rebroadcast(block_id);
@@ -983,9 +996,14 @@ void FullNodeImpl::on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id) 
 
 void FullNodeImpl::cleanup_fast_sync_public_rebroadcast_caches() {
   cleanup_expired_entries(recent_public_seen_blocks_);
-  cleanup_expired_entries(recent_public_rebroadcasted_blocks_);
   for (auto it = pending_fast_sync_public_rebroadcasts_.begin(); it != pending_fast_sync_public_rebroadcasts_.end();) {
     if (it->second.expire_at.is_in_past()) {
+      if (it->second.attempts > 0 || it->second.has_broadcast || it->second.sig_set.not_null()) {
+        LOG(INFO) << "Stopping fast-sync public rebroadcast retries after timeout without validated public-overlay "
+                  << "receipt: " << it->first.to_str() << " attempts=" << it->second.attempts << " best_sig_set="
+                  << describe_fast_sync_public_rebroadcast_sig_set(
+                         it->second.has_broadcast ? it->second.broadcast.sig_set : it->second.sig_set);
+      }
       it = pending_fast_sync_public_rebroadcasts_.erase(it);
     } else {
       ++it;

@@ -191,26 +191,29 @@ class FullNodeImpl : public FullNode {
   struct PendingFastSyncPublicRebroadcast {
     td::Timestamp deadline = td::Timestamp::never();
     td::Timestamp expire_at = td::Timestamp::never();
+    td::Timestamp wake_at = td::Timestamp::never();
     td::Ref<block::BlockSignatureSet> sig_set;
     td::BufferSlice proof;
     BlockBroadcast broadcast;
     bool has_broadcast = false;
     bool fetch_in_progress = false;
+    td::uint32 attempts = 0;
   };
 
   std::map<BlockIdExt, td::Timestamp> recent_public_seen_blocks_;
-  std::map<BlockIdExt, td::Timestamp> recent_public_rebroadcasted_blocks_;
   std::map<BlockIdExt, PendingFastSyncPublicRebroadcast> pending_fast_sync_public_rebroadcasts_;
 
   void note_public_overlay_block_seen(const BlockIdExt& block_id);
   bool fast_sync_public_rebroadcast_enabled() const;
   double fast_sync_public_rebroadcast_delay() const;
+  double fast_sync_public_rebroadcast_retry_interval() const;
   void schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast);
   void schedule_fast_sync_public_rebroadcast_from_shard_description(td::Ref<ShardTopBlockDescription> desc);
   void attach_fast_sync_public_rebroadcast_candidate_data(const BlockIdExt& block_id, const td::BufferSlice& data);
+  void schedule_fast_sync_public_rebroadcast_wakeup(const BlockIdExt& block_id, td::Timestamp when);
   void trigger_fast_sync_public_rebroadcast(BlockIdExt block_id);
   void on_fast_sync_public_rebroadcast_block_data(BlockIdExt block_id, td::Result<td::Ref<BlockData>> R);
-  void on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id);
+  void on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id, td::Timestamp scheduled_at);
   void cleanup_fast_sync_public_rebroadcast_caches();
   bool has_recent_block_entry(std::map<BlockIdExt, td::Timestamp>& cache, const BlockIdExt& block_id);
   void remember_recent_block(std::map<BlockIdExt, td::Timestamp>& cache, const BlockIdExt& block_id);
