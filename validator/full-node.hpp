@@ -207,6 +207,7 @@ class FullNodeImpl : public FullNode {
   bool fast_sync_public_rebroadcast_enabled() const;
   double fast_sync_public_rebroadcast_delay() const;
   double fast_sync_public_rebroadcast_retry_interval() const;
+  size_t fast_sync_public_rebroadcast_total_send_limit() const;
   void schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast);
   void schedule_fast_sync_public_rebroadcast_from_shard_description(td::Ref<ShardTopBlockDescription> desc);
   void attach_fast_sync_public_rebroadcast_candidate_data(const BlockIdExt& block_id, const td::BufferSlice& data);

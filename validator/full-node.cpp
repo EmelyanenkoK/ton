@@ -721,6 +721,10 @@ double FullNodeImpl::fast_sync_public_rebroadcast_retry_interval() const {
              : FAST_SYNC_PUBLIC_REBROADCAST_MIN_RETRY_INTERVAL;
 }
 
+size_t FullNodeImpl::fast_sync_public_rebroadcast_total_send_limit() const {
+  return opts_.fast_sync_public_rebroadcast_retries_ + 1;
+}
+
 void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast) {
   cleanup_fast_sync_public_rebroadcast_caches();
   if (!fast_sync_public_rebroadcast_enabled() || !should_schedule_fast_sync_public_rebroadcast(broadcast)) {
@@ -925,13 +929,29 @@ void FullNodeImpl::trigger_fast_sync_public_rebroadcast(BlockIdExt block_id) {
   };
 
   if (it->second.has_broadcast) {
+    if (static_cast<size_t>(it->second.attempts) >= fast_sync_public_rebroadcast_total_send_limit()) {
+      LOG(INFO) << "Stopping fast-sync public rebroadcast retries after reaching configured retry limit without "
+                << "validated public-overlay receipt: " << block_id.to_str() << " attempts="
+                << it->second.attempts << " retry_limit=" << opts_.fast_sync_public_rebroadcast_retries_
+                << " best_sig_set="
+                << describe_fast_sync_public_rebroadcast_sig_set(it->second.broadcast.sig_set);
+      pending_fast_sync_public_rebroadcasts_.erase(it);
+      return;
+    }
     auto broadcast = it->second.broadcast.clone();
     ++it->second.attempts;
     log_rebroadcast(broadcast.sig_set, it->second.attempts);
     send_broadcast(std::move(broadcast), broadcast_mode_public);
     auto next_retry_at = td::Timestamp::in(fast_sync_public_rebroadcast_retry_interval());
-    if (next_retry_at.at() < it->second.expire_at.at()) {
+    if (static_cast<size_t>(it->second.attempts) < fast_sync_public_rebroadcast_total_send_limit() &&
+        next_retry_at.at() < it->second.expire_at.at()) {
       schedule_fast_sync_public_rebroadcast_wakeup(block_id, next_retry_at);
+    } else if (static_cast<size_t>(it->second.attempts) >= fast_sync_public_rebroadcast_total_send_limit()) {
+      LOG(INFO) << "Reached configured fast-sync public rebroadcast retry limit without validated public-overlay "
+                << "receipt: " << block_id.to_str() << " attempts=" << it->second.attempts
+                << " retry_limit=" << opts_.fast_sync_public_rebroadcast_retries_ << " best_sig_set="
+                << describe_fast_sync_public_rebroadcast_sig_set(broadcast.sig_set);
+      pending_fast_sync_public_rebroadcasts_.erase(it);
     }
     return;
   }
@@ -966,7 +986,16 @@ void FullNodeImpl::on_fast_sync_public_rebroadcast_block_data(BlockIdExt block_i
     } else {
       VLOG(FULL_NODE_DEBUG) << "Waiting for later block data to complete fast-sync public rebroadcast for "
                             << block_id.to_str() << ": " << R.move_as_error();
-      schedule_fast_sync_public_rebroadcast_wakeup(block_id, td::Timestamp::in(fast_sync_public_rebroadcast_retry_interval()));
+      if (static_cast<size_t>(it->second.attempts) < fast_sync_public_rebroadcast_total_send_limit()) {
+        schedule_fast_sync_public_rebroadcast_wakeup(block_id,
+                                                    td::Timestamp::in(fast_sync_public_rebroadcast_retry_interval()));
+      } else {
+        LOG(INFO) << "Stopping fast-sync public rebroadcast retries because block data is still unavailable after "
+                  << "the configured retry budget: " << block_id.to_str() << " attempts=" << it->second.attempts
+                  << " retry_limit=" << opts_.fast_sync_public_rebroadcast_retries_ << " best_sig_set="
+                  << describe_fast_sync_public_rebroadcast_sig_set(it->second.sig_set);
+        pending_fast_sync_public_rebroadcasts_.erase(it);
+      }
     }
     return;
   }
