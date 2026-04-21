@@ -5820,6 +5820,15 @@ int main(int argc, char *argv[]) {
         return td::Status::OK();
       });
   p.add_option(
+      '\0', "fast-sync-public-rebroadcast-immediate",
+      "rebroadcast finalized fast-sync blocks to the public overlay immediately after acceptance "
+      "(overrides --fast-sync-public-rebroadcast-delay)",
+      [&]() {
+        acts.push_back([&x]() {
+          td::actor::send_closure(x, &ValidatorEngine::set_fast_sync_public_rebroadcast_immediate, true);
+        });
+      });
+  p.add_option(
       '\0', "permanent-celldb",
       "disable garbage collection in CellDb. This improves performance on archival nodes (once enabled, this option "
       "cannot be disabled)",

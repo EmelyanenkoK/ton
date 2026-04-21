@@ -32,6 +32,7 @@
 #include "interfaces/persistent-state.h"
 #include "interfaces/proof.h"
 #include "interfaces/shard.h"
+#include "interfaces/shard-block.h"
 #include "overlay/overlays.h"
 #include "td/actor/actor.h"
 #include "td/actor/coro_task.h"
@@ -348,7 +349,8 @@ class ValidatorManagerInterface : public td::actor::Actor {
   }
   virtual void new_ihr_message(td::BufferSlice data) = 0;
   virtual void new_shard_block_description_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
-                                                     td::BufferSlice data) = 0;
+                                                     td::BufferSlice data,
+                                                     td::Promise<td::Ref<ShardTopBlockDescription>> promise) = 0;
   virtual td::actor::Task<> new_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                           td::BufferSlice data) {
     co_return td::Unit{};
@@ -383,6 +385,10 @@ class ValidatorManagerInterface : public td::actor::Actor {
                                 td::Promise<td::Ref<ShardState>> promise) = 0;
   virtual void wait_block_state_short(BlockIdExt block_id, td::uint32 priority, td::Timestamp timeout, bool wait_store,
                                       td::Promise<td::Ref<ShardState>> promise) = 0;
+  virtual void wait_block_data(BlockHandle handle, td::uint32 priority, td::Timestamp timeout,
+                               td::Promise<td::Ref<BlockData>> promise) = 0;
+  virtual void wait_block_data_short(BlockIdExt block_id, td::uint32 priority, td::Timestamp timeout,
+                                     td::Promise<td::Ref<BlockData>> promise) = 0;
   virtual void wait_block_state_merge(BlockIdExt left_id, BlockIdExt right_id, td::uint32 priority,
                                       td::Timestamp timeout, td::Promise<td::Ref<ShardState>> promise) = 0;
   virtual void wait_state_by_prev_blocks(BlockIdExt block_id, std::vector<BlockIdExt> prev_blocks,

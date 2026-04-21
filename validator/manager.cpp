@@ -476,28 +476,38 @@ void ValidatorManagerImpl::new_ihr_message(td::BufferSlice data) {
 }
 
 void ValidatorManagerImpl::new_shard_block_description_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
-                                                                 td::BufferSlice data) {
+                                                                 td::BufferSlice data,
+                                                                 td::Promise<td::Ref<ShardTopBlockDescription>> promise) {
   if (!last_masterchain_block_handle_ || !started_) {
     VLOG(VALIDATOR_DEBUG) << "dropping shard block description broadcast: not inited";
+    promise.set_error(td::Status::Error(ErrorCode::notready, "not inited"));
     return;
   }
   if (!is_validator() && !opts_->need_monitor(block_id.shard_full(), last_masterchain_state_)) {
+    promise.set_error(td::Status::Error("not monitoring shard"));
     return;
   }
   if (cached_checked_shard_block_descriptions_.contains(block_id)) {
     VLOG(VALIDATOR_DEBUG) << "dropping duplicate shard block description broadcast";
+    promise.set_error(td::Status::Error(ErrorCode::cancelled, "duplicate shard block description"));
     return;
   }
   auto it = shard_blocks_.find(ShardTopBlockDescriptionId{block_id.shard_full(), cc_seqno});
   if (it != shard_blocks_.end() && block_id.id.seqno <= it->second.latest_desc->block_id().id.seqno) {
     VLOG(VALIDATOR_DEBUG) << "dropping duplicate shard block broadcast";
+    promise.set_error(td::Status::Error(ErrorCode::cancelled, "duplicate shard block broadcast"));
     return;
   }
-  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<ShardTopBlockDescription>> R) {
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), promise = std::move(promise)](
+                                          td::Result<td::Ref<ShardTopBlockDescription>> R) mutable {
     if (R.is_error()) {
-      VLOG(VALIDATOR_NOTICE) << "dropping invalid new shard block description: " << R.move_as_error();
+      auto error = R.move_as_error();
+      VLOG(VALIDATOR_NOTICE) << "dropping invalid new shard block description: " << error;
+      promise.set_error(std::move(error));
     } else {
-      td::actor::send_closure(SelfId, &ValidatorManagerImpl::add_shard_block_description, R.move_as_ok());
+      auto desc = R.move_as_ok();
+      td::actor::send_closure(SelfId, &ValidatorManagerImpl::add_shard_block_description, desc);
+      promise.set_result(desc);
     }
   });
   run_validate_shard_block_description(std::move(data), last_masterchain_block_handle_, last_masterchain_state_,

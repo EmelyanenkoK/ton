@@ -18,7 +18,8 @@
 */
 #pragma once
 
-#include "interfaces/block-handle.h"
+#include "block/signature-set.h"
+#include "block-handle.h"
 #include "ton/ton-types.h"
 
 #include "shard.h"
@@ -38,6 +39,8 @@ class ShardTopBlockDescription : public td::CntObject {
   virtual CatchainSeqno catchain_seqno() const = 0;
   virtual const std::vector<BlockIdExt>& get_chain_blocks() const = 0;
   virtual UnixTime generated_at() const = 0;
+  virtual td::Ref<block::BlockSignatureSet> signatures() const = 0;
+  virtual td::Result<td::BufferSlice> proof_link_data() const = 0;
 
   // if method returns false this shard block description is discarded
   // if it returns true it will be supplied to collator

@@ -83,6 +83,15 @@ class ShardTopBlockDescrQ final : public ShardTopBlockDescrQBase {
   CatchainSeqno catchain_seqno() const override {
     return catchain_seqno_;
   }
+  Ref<block::BlockSignatureSet> signatures() const override {
+    return sig_set_;
+  }
+  td::Result<td::BufferSlice> proof_link_data() const override {
+    if (!is_valid() || proof_roots_.empty()) {
+      return td::Status::Error("proof link is not available");
+    }
+    return vm::std_boc_serialize(proof_roots_.front(), 0);
+  }
   std::vector<BlockIdExt> get_prev_at(int pos) const;
   Ref<block::McShardHash> get_prev_descr(int pos, int sum_cnt = 0) const;
   Ref<block::McShardHash> get_top_descr(int sum_cnt = 0) const {

@@ -640,7 +640,7 @@ void FullNodeImpl::process_block_broadcast(BlockBroadcast broadcast, BlockBroadc
   }
   send_block_broadcast_to_custom_overlays(broadcast);
   bool schedule_rebroadcast = source == BlockBroadcastSource::fast_sync_overlay &&
-                              opts_.fast_sync_public_rebroadcast_delay_ > 0.0 && broadcast.sig_set->is_final();
+                              fast_sync_public_rebroadcast_enabled() && broadcast.sig_set->is_final();
   if (schedule_rebroadcast) {
     auto accepted_broadcast = broadcast.clone();
     td::actor::send_closure(
@@ -675,9 +675,17 @@ void FullNodeImpl::note_public_overlay_block_seen(const BlockIdExt &block_id) {
   pending_fast_sync_public_rebroadcasts_.erase(it);
 }
 
+bool FullNodeImpl::fast_sync_public_rebroadcast_enabled() const {
+  return opts_.fast_sync_public_rebroadcast_immediate_ || opts_.fast_sync_public_rebroadcast_delay_ > 0.0;
+}
+
+double FullNodeImpl::fast_sync_public_rebroadcast_delay() const {
+  return opts_.fast_sync_public_rebroadcast_immediate_ ? 0.0 : opts_.fast_sync_public_rebroadcast_delay_;
+}
+
 void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast) {
   cleanup_fast_sync_public_rebroadcast_caches();
-  if (opts_.fast_sync_public_rebroadcast_delay_ <= 0.0 || !broadcast.sig_set->is_final()) {
+  if (!fast_sync_public_rebroadcast_enabled() || !broadcast.sig_set->is_final()) {
     return;
   }
 
@@ -693,30 +701,113 @@ void FullNodeImpl::schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcas
     return;
   }
 
+  const auto current_sig_size = [&](const PendingFastSyncPublicRebroadcast &pending) -> std::size_t {
+    if (pending.has_broadcast && pending.broadcast.sig_set.not_null()) {
+      return pending.broadcast.sig_set->get_size();
+    }
+    if (pending.sig_set.not_null()) {
+      return pending.sig_set->get_size();
+    }
+    return 0;
+  };
+
   auto it = pending_fast_sync_public_rebroadcasts_.find(block_id);
   if (it == pending_fast_sync_public_rebroadcasts_.end()) {
-    auto deadline = td::Timestamp::in(opts_.fast_sync_public_rebroadcast_delay_);
-    pending_fast_sync_public_rebroadcasts_.emplace(block_id,
-                                                   PendingFastSyncPublicRebroadcast{deadline, std::move(broadcast)});
-    VLOG(FULL_NODE_DEBUG) << "Scheduled fast-sync public rebroadcast in "
-                          << opts_.fast_sync_public_rebroadcast_delay_ << "s for " << block_id.to_str();
-    delay_action(
-        [SelfId = actor_id(this), block_id]() {
-          td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_timeout, block_id);
-        },
-        deadline);
-    return;
+    auto [new_it, _] = pending_fast_sync_public_rebroadcasts_.emplace(block_id, PendingFastSyncPublicRebroadcast{});
+    it = new_it;
+    it->second.deadline = td::Timestamp::in(fast_sync_public_rebroadcast_delay());
+    if (!opts_.fast_sync_public_rebroadcast_immediate_) {
+      VLOG(FULL_NODE_DEBUG) << "Scheduled fast-sync public rebroadcast in "
+                            << fast_sync_public_rebroadcast_delay() << "s for " << block_id.to_str();
+      delay_action(
+          [SelfId = actor_id(this), block_id]() {
+            td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_timeout, block_id);
+          },
+          it->second.deadline);
+    }
   }
 
-  if (broadcast.sig_set->get_size() > it->second.broadcast.sig_set->get_size()) {
+  if (!it->second.has_broadcast || broadcast.sig_set->get_size() > current_sig_size(it->second)) {
     VLOG(FULL_NODE_DEBUG) << "Updating pending fast-sync public rebroadcast with richer signature set for "
-                          << block_id.to_str() << ": " << it->second.broadcast.sig_set->get_size() << " -> "
+                          << block_id.to_str() << ": " << current_sig_size(it->second) << " -> "
                           << broadcast.sig_set->get_size();
     it->second.broadcast = std::move(broadcast);
+    it->second.sig_set = it->second.broadcast.sig_set;
+    it->second.proof = it->second.broadcast.proof.clone();
+    it->second.has_broadcast = true;
+  }
+
+  if (opts_.fast_sync_public_rebroadcast_immediate_) {
+    trigger_fast_sync_public_rebroadcast(block_id);
   }
 }
 
-void FullNodeImpl::on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id) {
+void FullNodeImpl::schedule_fast_sync_public_rebroadcast_from_shard_description(td::Ref<ShardTopBlockDescription> desc) {
+  cleanup_fast_sync_public_rebroadcast_caches();
+  if (!fast_sync_public_rebroadcast_enabled() || desc.is_null()) {
+    return;
+  }
+  auto sig_set = desc->signatures();
+  if (sig_set.is_null() || !sig_set->is_final()) {
+    return;
+  }
+  auto proof = desc->proof_link_data();
+  if (proof.is_error()) {
+    VLOG(FULL_NODE_WARNING) << "Failed to prepare fast-sync public rebroadcast proof link for "
+                            << desc->block_id().to_str() << ": " << proof.move_as_error();
+    return;
+  }
+
+  const BlockIdExt block_id = desc->block_id();
+  if (has_recent_block_entry(recent_public_seen_blocks_, block_id) ||
+      has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
+    return;
+  }
+
+  const auto current_sig_size = [&](const PendingFastSyncPublicRebroadcast &pending) -> std::size_t {
+    if (pending.has_broadcast && pending.broadcast.sig_set.not_null()) {
+      return pending.broadcast.sig_set->get_size();
+    }
+    if (pending.sig_set.not_null()) {
+      return pending.sig_set->get_size();
+    }
+    return 0;
+  };
+
+  auto it = pending_fast_sync_public_rebroadcasts_.find(block_id);
+  if (it == pending_fast_sync_public_rebroadcasts_.end()) {
+    auto [new_it, _] = pending_fast_sync_public_rebroadcasts_.emplace(block_id, PendingFastSyncPublicRebroadcast{});
+    it = new_it;
+    it->second.deadline = td::Timestamp::in(fast_sync_public_rebroadcast_delay());
+    if (!opts_.fast_sync_public_rebroadcast_immediate_) {
+      VLOG(FULL_NODE_DEBUG) << "Scheduled fast-sync public rebroadcast in "
+                            << fast_sync_public_rebroadcast_delay() << "s for " << block_id.to_str();
+      delay_action(
+          [SelfId = actor_id(this), block_id]() {
+            td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_timeout, block_id);
+          },
+          it->second.deadline);
+    }
+  }
+
+  if (sig_set->get_size() > current_sig_size(it->second) || it->second.sig_set.is_null()) {
+    VLOG(FULL_NODE_DEBUG) << "Updating pending fast-sync public rebroadcast from shard finality for "
+                          << block_id.to_str() << ": " << current_sig_size(it->second) << " -> "
+                          << sig_set->get_size();
+    it->second.sig_set = std::move(sig_set);
+    it->second.proof = proof.move_as_ok();
+    if (it->second.has_broadcast) {
+      it->second.broadcast.sig_set = it->second.sig_set;
+      it->second.broadcast.proof = it->second.proof.clone();
+    }
+  }
+
+  if (opts_.fast_sync_public_rebroadcast_immediate_) {
+    trigger_fast_sync_public_rebroadcast(block_id);
+  }
+}
+
+void FullNodeImpl::trigger_fast_sync_public_rebroadcast(BlockIdExt block_id) {
   cleanup_fast_sync_public_rebroadcast_caches();
   auto it = pending_fast_sync_public_rebroadcasts_.find(block_id);
   if (it == pending_fast_sync_public_rebroadcasts_.end()) {
@@ -733,13 +824,85 @@ void FullNodeImpl::on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id) 
     return;
   }
 
-  auto broadcast = it->second.broadcast.clone();
+  const auto log_rebroadcast = [&](std::size_t signatures) {
+    if (opts_.fast_sync_public_rebroadcast_immediate_) {
+      LOG(INFO) << "Rebroadcasting accepted fast-sync finalized block to public overlay immediately: "
+                << block_id.to_str() << " signatures=" << signatures;
+    } else {
+      LOG(INFO) << "Rebroadcasting accepted fast-sync final block to public overlay after "
+                << fast_sync_public_rebroadcast_delay() << "s timeout: " << block_id.to_str()
+                << " signatures=" << signatures;
+    }
+  };
+
+  if (it->second.has_broadcast) {
+    auto broadcast = it->second.broadcast.clone();
+    pending_fast_sync_public_rebroadcasts_.erase(it);
+    remember_recent_block(recent_public_rebroadcasted_blocks_, block_id);
+    log_rebroadcast(broadcast.sig_set->get_size());
+    send_broadcast(std::move(broadcast), broadcast_mode_public);
+    return;
+  }
+
+  if (it->second.fetch_in_progress || it->second.sig_set.is_null() || it->second.proof.empty()) {
+    return;
+  }
+
+  it->second.fetch_in_progress = true;
+  auto wait_timeout = td::Timestamp::in(fast_sync_public_rebroadcast_delay() > 10.0 ? fast_sync_public_rebroadcast_delay()
+                                                                                     : 10.0);
+  auto P = td::PromiseCreator::lambda(
+      [SelfId = actor_id(this), block_id](td::Result<td::Ref<BlockData>> R) mutable {
+        td::actor::send_closure(SelfId, &FullNodeImpl::on_fast_sync_public_rebroadcast_block_data, block_id,
+                                std::move(R));
+      });
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::wait_block_data_short, block_id, 0,
+                          wait_timeout, std::move(P));
+}
+
+void FullNodeImpl::on_fast_sync_public_rebroadcast_block_data(BlockIdExt block_id, td::Result<td::Ref<BlockData>> R) {
+  cleanup_fast_sync_public_rebroadcast_caches();
+  auto it = pending_fast_sync_public_rebroadcasts_.find(block_id);
+  if (it == pending_fast_sync_public_rebroadcasts_.end()) {
+    return;
+  }
+  it->second.fetch_in_progress = false;
+  if (R.is_error()) {
+    LOG(INFO) << "Skipping fast-sync public rebroadcast because block data is unavailable for " << block_id.to_str()
+              << ": " << R.move_as_error();
+    pending_fast_sync_public_rebroadcasts_.erase(it);
+    return;
+  }
+  if (has_recent_block_entry(recent_public_seen_blocks_, block_id) ||
+      has_recent_block_entry(recent_public_rebroadcasted_blocks_, block_id)) {
+    pending_fast_sync_public_rebroadcasts_.erase(it);
+    return;
+  }
+  if (it->second.sig_set.is_null() || it->second.proof.empty()) {
+    pending_fast_sync_public_rebroadcasts_.erase(it);
+    return;
+  }
+
+  auto block = R.move_as_ok();
+  BlockBroadcast broadcast{block_id, it->second.sig_set, block->data(), it->second.proof.clone()};
   pending_fast_sync_public_rebroadcasts_.erase(it);
   remember_recent_block(recent_public_rebroadcasted_blocks_, block_id);
-  LOG(INFO) << "Rebroadcasting accepted fast-sync final block to public overlay after "
-            << opts_.fast_sync_public_rebroadcast_delay_ << "s timeout: " << block_id.to_str()
-            << " signatures=" << broadcast.sig_set->get_size();
+  if (opts_.fast_sync_public_rebroadcast_immediate_) {
+    LOG(INFO) << "Rebroadcasting accepted fast-sync finalized block to public overlay immediately: "
+              << block_id.to_str() << " signatures=" << broadcast.sig_set->get_size();
+  } else {
+    LOG(INFO) << "Rebroadcasting accepted fast-sync final block to public overlay after "
+              << fast_sync_public_rebroadcast_delay() << "s timeout: " << block_id.to_str()
+              << " signatures=" << broadcast.sig_set->get_size();
+  }
   send_broadcast(std::move(broadcast), broadcast_mode_public);
+}
+
+void FullNodeImpl::on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id) {
+  if (opts_.fast_sync_public_rebroadcast_immediate_) {
+    return;
+  }
+  trigger_fast_sync_public_rebroadcast(block_id);
 }
 
 void FullNodeImpl::cleanup_fast_sync_public_rebroadcast_caches() {
@@ -772,10 +935,20 @@ void FullNodeImpl::process_block_candidate_broadcast(BlockIdExt block_id, Catcha
 }
 
 void FullNodeImpl::process_shard_block_info_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
-                                                      td::BufferSlice data) {
+                                                      td::BufferSlice data, BlockBroadcastSource source) {
   send_shard_block_info_to_custom_overlays(block_id, cc_seqno, data);
+  auto P = td::PromiseCreator::lambda(
+      [SelfId = actor_id(this), source](td::Result<td::Ref<ShardTopBlockDescription>> R) mutable {
+        if (R.is_error()) {
+          return;
+        }
+        if (source == BlockBroadcastSource::fast_sync_overlay) {
+          td::actor::send_closure(SelfId, &FullNodeImpl::schedule_fast_sync_public_rebroadcast_from_shard_description,
+                                  R.move_as_ok());
+        }
+      });
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::new_shard_block_description_broadcast,
-                          block_id, cc_seqno, std::move(data));
+                          block_id, cc_seqno, std::move(data), std::move(P));
 }
 
 void FullNodeImpl::get_out_msg_queue_query_token(td::Promise<std::unique_ptr<ActionToken>> promise) {

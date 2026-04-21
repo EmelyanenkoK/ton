@@ -349,8 +349,8 @@ class ValidatorManagerImpl : public ValidatorManager {
                                                     td::actor::StartedTask<> wait_allow_broadcast);
 
   void new_ihr_message(td::BufferSlice data) override;
-  void new_shard_block_description_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
-                                             td::BufferSlice data) override;
+  void new_shard_block_description_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::BufferSlice data,
+                                             td::Promise<td::Ref<ShardTopBlockDescription>> promise) override;
   td::actor::Task<> new_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                   td::BufferSlice data) override;
 

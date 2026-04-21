@@ -310,18 +310,25 @@ void ValidatorManagerImpl::new_ihr_message(td::BufferSlice data) {
 }
 
 void ValidatorManagerImpl::new_shard_block_description_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
-                                                                 td::BufferSlice data) {
+                                                                 td::BufferSlice data,
+                                                                 td::Promise<td::Ref<ShardTopBlockDescription>> promise) {
   if (!last_masterchain_block_handle_) {
     shard_blocks_raw_.push_back(std::move(data));
+    promise.set_error(td::Status::Error(ErrorCode::notready, "not inited"));
     return;
   }
-  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<ShardTopBlockDescription>> R) {
+  auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), promise = std::move(promise)](
+                                          td::Result<td::Ref<ShardTopBlockDescription>> R) mutable {
     if (R.is_error()) {
-      LOG(WARNING) << "dropping invalid new shard block description: " << R.move_as_error();
+      auto error = R.move_as_error();
+      LOG(WARNING) << "dropping invalid new shard block description: " << error;
+      promise.set_error(std::move(error));
       td::actor::send_closure(SelfId, &ValidatorManagerImpl::dec_pending_new_blocks);
     } else {
+      auto desc = R.move_as_ok();
+      promise.set_result(desc);
       // LOG(DEBUG) << "run_validate_shard_block_description() completed successfully";
-      td::actor::send_closure(SelfId, &ValidatorManagerImpl::add_shard_block_description, R.move_as_ok());
+      td::actor::send_closure(SelfId, &ValidatorManagerImpl::add_shard_block_description, desc);
     }
   });
   ++pending_new_shard_block_descr_;
@@ -568,7 +575,8 @@ void ValidatorManagerImpl::get_shard_blocks_for_collator(
   }
   if (!shard_blocks_raw_.empty()) {
     for (auto &raw : shard_blocks_raw_) {
-      new_shard_block_description_broadcast(BlockIdExt{}, 0, std::move(raw));
+      new_shard_block_description_broadcast(BlockIdExt{}, 0, std::move(raw),
+                                            [](td::Result<td::Ref<ShardTopBlockDescription>>) {});
     }
     shard_blocks_raw_.clear();
   }
@@ -1014,7 +1022,8 @@ void ValidatorManagerImpl::update_shard_blocks() {
   }
   if (!shard_blocks_raw_.empty()) {
     for (auto &raw : shard_blocks_raw_) {
-      new_shard_block_description_broadcast(BlockIdExt{}, 0, std::move(raw));
+      new_shard_block_description_broadcast(BlockIdExt{}, 0, std::move(raw),
+                                            [](td::Result<td::Ref<ShardTopBlockDescription>>) {});
     }
     shard_blocks_raw_.clear();
   }

@@ -26,8 +26,10 @@
 #include <set>
 #include <token-manager.h>
 
+#include "interfaces/block.h"
 #include "interfaces/proof.h"
 #include "interfaces/shard.h"
+#include "interfaces/shard-block.h"
 #include "td/utils/LRUCache.h"
 
 #include "full-node-custom-overlays.hpp"
@@ -98,7 +100,8 @@ class FullNodeImpl : public FullNode {
                                bool signatures_checked = false) override;
   void process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                          td::BufferSlice data) override;
-  void process_shard_block_info_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::BufferSlice data) override;
+  void process_shard_block_info_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::BufferSlice data,
+                                          BlockBroadcastSource source) override;
   void get_out_msg_queue_query_token(td::Promise<std::unique_ptr<ActionToken>> promise) override;
 
   void set_validator_telemetry_filename(std::string value) override;
@@ -187,7 +190,11 @@ class FullNodeImpl : public FullNode {
 
   struct PendingFastSyncPublicRebroadcast {
     td::Timestamp deadline = td::Timestamp::never();
+    td::Ref<block::BlockSignatureSet> sig_set;
+    td::BufferSlice proof;
     BlockBroadcast broadcast;
+    bool has_broadcast = false;
+    bool fetch_in_progress = false;
   };
 
   std::map<BlockIdExt, td::Timestamp> recent_public_seen_blocks_;
@@ -195,7 +202,12 @@ class FullNodeImpl : public FullNode {
   std::map<BlockIdExt, PendingFastSyncPublicRebroadcast> pending_fast_sync_public_rebroadcasts_;
 
   void note_public_overlay_block_seen(const BlockIdExt& block_id);
+  bool fast_sync_public_rebroadcast_enabled() const;
+  double fast_sync_public_rebroadcast_delay() const;
   void schedule_fast_sync_public_rebroadcast(BlockBroadcast broadcast);
+  void schedule_fast_sync_public_rebroadcast_from_shard_description(td::Ref<ShardTopBlockDescription> desc);
+  void trigger_fast_sync_public_rebroadcast(BlockIdExt block_id);
+  void on_fast_sync_public_rebroadcast_block_data(BlockIdExt block_id, td::Result<td::Ref<BlockData>> R);
   void on_fast_sync_public_rebroadcast_timeout(BlockIdExt block_id);
   void cleanup_fast_sync_public_rebroadcast_caches();
   bool has_recent_block_entry(std::map<BlockIdExt, td::Timestamp>& cache, const BlockIdExt& block_id);
