@@ -69,13 +69,20 @@ class BroadcastFec : public td::ListNode {
   }
 
   td::Status add_part(td::uint32 seqno, td::BufferSlice data, td::BufferSlice serialized_fec_part_short,
-                      td::BufferSlice serialized_fec_part) {
+                      td::BufferSlice serialized_fec_part, PublicKeyHash source,
+                      adnl::AdnlNodeIdShort src_peer_id) {
     if (decoder_) {
+      auto symbol_size = data.size();
       td::fec::Symbol s;
       s.id = seqno;
       s.data = std::move(data);
 
-      decoder_->add_symbol(std::move(s));
+      auto status = decoder_->add_symbol(std::move(s));
+      if (status.is_error()) {
+        LOG(INFO) << "overlay fec add_symbol failed: broadcast=" << hash_ << " seqno=" << seqno
+                  << " sender=" << source << " src_peer=" << src_peer_id << " symbol_size=" << symbol_size
+                  << " expected_symbol_size=" << fec_type_.symbol_size() << " error=" << status;
+      }
     }
     parts_[seqno] = std::pair<td::BufferSlice, td::BufferSlice>(std::move(serialized_fec_part_short),
                                                                 std::move(serialized_fec_part));
@@ -339,12 +346,15 @@ td::Status BroadcastFecPart::run(OverlayImpl *overlay, BroadcastFec &bcast) {
           signature_.clone()),
       create_serialize_tl_object<ton_api::overlay_broadcastFec>(
           source_.tl(), cert_ ? cert_->tl() : Certificate::empty_tl(), bcast.data_hash_, bcast.fec_type_.size(),
-          bcast.flags_, data_.clone(), seqno_, bcast.fec_type_.tl(), date_, signature_.clone())));
+          bcast.flags_, data_.clone(), seqno_, bcast.fec_type_.tl(), date_, signature_.clone()),
+      source_.compute_short_id(), src_peer_id_));
   if (!bcast.ready_) {
     auto R = bcast.finish();
     if (R.is_error()) {
       auto S = R.move_as_error();
       if (S.code() != ErrorCode::notready) {
+        LOG(INFO) << "overlay fec decoder failed: broadcast=" << broadcast_hash_ << " seqno=" << seqno_
+                  << " sender=" << source_.compute_short_id() << " src_peer=" << src_peer_id_ << " error=" << S;
         return S;
       }
     } else {
