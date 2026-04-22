@@ -26,6 +26,7 @@
 
 namespace ton {
 
+
 td::BufferSlice serialize_tl_object(const ton_api::Object *T, bool boxed, td::BufferSlice &&suffix) {
   return serialize_tl_object(T, boxed, suffix.as_slice());
 }

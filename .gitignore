@@ -23,8 +23,9 @@ dev/
 .ruff_cache
 *.egg-info
 
-# Work directory for integration tests
+# Work directories for integration tests
 test/integration/.network
+test/integration/.dashboard
 
 test/tontester/tests/tl/generated
 test/tontester/src/tonapi
