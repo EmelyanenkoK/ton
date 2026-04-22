@@ -31,6 +31,10 @@ class ManagerFacade : public td::actor::Actor {
 
   virtual void send_block_candidate_broadcast(BlockIdExt id, td::BufferSlice data, int mode) {
   }
+
+  virtual void log_received_block_copy(BlockIdExt block_id, PublicKeyHash src, ReceivedBlockSource source,
+                                       ReceivedBlockPayloadKind kind) {
+  }
 };
 
 }  // namespace ton::validator::consensus

@@ -280,6 +280,10 @@ class ValidatorManager : public ValidatorManagerInterface {
  public:
   virtual void init_last_masterchain_state(td::Ref<MasterchainState> state) {
   }
+  virtual void log_received_block_copy(BlockIdExt block_id, PublicKeyHash src, ReceivedBlockSource source,
+                                       ReceivedBlockPayloadKind kind) {
+    ValidatorManagerInterface::log_received_block_copy(block_id, src, source, kind);
+  }
   virtual void set_block_state(BlockHandle handle, td::Ref<ShardState> state, vm::StoreCellHint hint,
                                td::Promise<td::Ref<ShardState>> promise) = 0;
   virtual void store_block_state_part(BlockId effective_block, td::Ref<vm::Cell> cell,

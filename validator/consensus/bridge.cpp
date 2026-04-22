@@ -88,6 +88,11 @@ class ManagerFacadeImpl : public ManagerFacade {
                             std::move(data), mode);
   }
 
+  void log_received_block_copy(BlockIdExt block_id, PublicKeyHash src, ReceivedBlockSource source,
+                               ReceivedBlockPayloadKind kind) override {
+    td::actor::send_closure(manager_, &ValidatorManager::log_received_block_copy, block_id, src, source, kind);
+  }
+
   void update_collator_options(td::Ref<ValidatorManagerOptions> opts) {
     opts_ = std::move(opts);
   }

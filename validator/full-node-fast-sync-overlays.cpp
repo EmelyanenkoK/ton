@@ -74,6 +74,8 @@ void FullNodeFastSyncOverlay::process_block_broadcast(PublicKeyHash src, ton_api
     LOG(DEBUG) << "dropped broadcast: " << B.move_as_error();
     return;
   }
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::log_received_block_copy, B.ok().block_id,
+                          src, ReceivedBlockSource::fast_sync_overlay, ReceivedBlockPayloadKind::block);
   VLOG(FULL_NODE_DEBUG) << "Received block broadcast " << (B.ok().sig_set->is_final() ? "" : "(approve signatures) ")
                         << "in fast sync overlay from " << src << ": " << B.ok().block_id.to_str();
   td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), false);
@@ -111,6 +113,8 @@ void FullNodeFastSyncOverlay::process_block_broadcast_with_state(PublicKeyHash s
     return;
   }
 
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::log_received_block_copy, B.ok().block_id,
+                          src, ReceivedBlockSource::fast_sync_overlay, ReceivedBlockPayloadKind::block);
   VLOG(FULL_NODE_DEBUG) << "Received V2 block broadcast in fast sync overlay from " << src << ": "
                         << B.ok().block_id.to_str();
   td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), true);
@@ -189,6 +193,8 @@ void FullNodeFastSyncOverlay::process_block_candidate_broadcast(PublicKeyHash sr
     VLOG(FULL_NODE_WARNING) << "received block candidate with incorrect file hash from " << src;
     return;
   }
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::log_received_block_copy, block_id, src,
+                          ReceivedBlockSource::fast_sync_overlay, ReceivedBlockPayloadKind::candidate);
   VLOG(FULL_NODE_DEBUG) << "Received newBlockCandidate in fast sync overlay from " << src << ": " << block_id.to_str();
   td::actor::send_closure(full_node_, &FullNode::process_block_candidate_broadcast, block_id, cc_seqno,
                           validator_set_hash, std::move(data));

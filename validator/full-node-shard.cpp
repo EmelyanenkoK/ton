@@ -811,6 +811,8 @@ void FullNodeShardImpl::process_block_candidate_broadcast(PublicKeyHash src, ton
     VLOG(FULL_NODE_WARNING) << "received block candidate with incorrect file hash from " << src;
     return;
   }
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::log_received_block_copy, block_id, src,
+                          ReceivedBlockSource::public_overlay, ReceivedBlockPayloadKind::candidate);
   VLOG(FULL_NODE_DEBUG) << "Received newBlockCandidate from " << src << ": " << block_id.to_str();
   td::actor::send_closure(full_node_, &FullNode::process_block_candidate_broadcast, block_id, cc_seqno,
                           validator_set_hash, std::move(data));
@@ -861,6 +863,8 @@ void FullNodeShardImpl::process_block_broadcast(PublicKeyHash src, ton_api::tonN
   //                         << " block=" << block_id.to_str();
   //  return;
   //}
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::log_received_block_copy, B.ok().block_id,
+                          src, ReceivedBlockSource::public_overlay, ReceivedBlockPayloadKind::block);
   VLOG(FULL_NODE_DEBUG) << "Received block broadcast " << (B.ok().sig_set->is_final() ? "" : "(approve signatures) ")
                         << "from " << src << ": " << B.ok().block_id.to_str();
   td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), false);
@@ -898,6 +902,8 @@ void FullNodeShardImpl::process_block_broadcast_with_state(PublicKeyHash src,
     LOG(DEBUG) << "Failed to deserialize block broadcast: " << B.move_as_error();
     return;
   }
+  td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::log_received_block_copy, B.ok().block_id,
+                          src, ReceivedBlockSource::public_overlay, ReceivedBlockPayloadKind::block);
   VLOG(FULL_NODE_DEBUG) << "Received block broadcast from " << src << ": " << B.ok().block_id.to_str();
   td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), true);
 }

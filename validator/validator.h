@@ -54,6 +54,10 @@ struct PerfTimerStats {
   std::deque<std::pair<double, double>> stats;  // <Time::now(), duration>
 };
 
+enum class ReceivedBlockSource : td::uint8 { private_overlay, fast_sync_overlay, public_overlay };
+
+enum class ReceivedBlockPayloadKind : td::uint8 { block, candidate };
+
 struct CollatorOptions : public td::CntObject {
   bool deferring_enabled = true;
 
@@ -309,6 +313,9 @@ class ValidatorManagerInterface : public td::actor::Actor {
   virtual void new_block_broadcast(BlockBroadcast broadcast, bool signatures_checked,
                                    td::Promise<td::Unit> promise) = 0;
   virtual void validate_block_broadcast_signatures(BlockBroadcast broadcast, td::Promise<td::Unit> promise) = 0;
+  virtual void log_received_block_copy(BlockIdExt block_id, PublicKeyHash src, ReceivedBlockSource source,
+                                       ReceivedBlockPayloadKind kind) {
+  }
 
   //virtual void create_validate_block(BlockId block, td::BufferSlice data, td::Promise<Block> promise) = 0;
   virtual void sync_complete(td::Promise<td::Unit> promise) = 0;

@@ -184,7 +184,10 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
                    << maybe_candidate.move_as_error();
       return;
     }
-    owning_bus().publish<CandidateReceived>(maybe_candidate.move_as_ok());
+    auto candidate = maybe_candidate.move_as_ok();
+    td::actor::send_closure(owning_bus()->manager, &ManagerFacade::log_received_block_copy, candidate->block_id(), src,
+                            ReceivedBlockSource::private_overlay, ReceivedBlockPayloadKind::candidate);
+    owning_bus().publish<CandidateReceived>(std::move(candidate));
   }
 
   td::actor::Task<> precheck_broadcast(PublicKeyHash src, td::Bits256 broadcast_id, td::BufferSlice extra,

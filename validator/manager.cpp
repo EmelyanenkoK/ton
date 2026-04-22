@@ -57,6 +57,55 @@ namespace ton {
 
 namespace validator {
 
+namespace {
+
+constexpr const char *k_received_block_copy_log_tag = "[block-copy-trace]";
+
+const char *received_block_source_name(ReceivedBlockSource source) {
+  switch (source) {
+    case ReceivedBlockSource::private_overlay:
+      return "private";
+    case ReceivedBlockSource::fast_sync_overlay:
+      return "fast-sync";
+    case ReceivedBlockSource::public_overlay:
+      return "public";
+  }
+  UNREACHABLE();
+}
+
+const char *received_block_payload_kind_name(ReceivedBlockPayloadKind kind) {
+  switch (kind) {
+    case ReceivedBlockPayloadKind::block:
+      return "block";
+    case ReceivedBlockPayloadKind::candidate:
+      return "candidate";
+  }
+  UNREACHABLE();
+}
+
+const char *received_block_copy_suffix(td::uint32 copy_no) {
+  td::uint32 mod100 = copy_no % 100;
+  if (mod100 >= 11 && mod100 <= 13) {
+    return "th";
+  }
+  switch (copy_no % 10) {
+    case 1:
+      return "st";
+    case 2:
+      return "nd";
+    case 3:
+      return "rd";
+    default:
+      return "th";
+  }
+}
+
+std::string format_received_block_copy(td::uint32 copy_no) {
+  return PSTRING() << copy_no << received_block_copy_suffix(copy_no);
+}
+
+}  // namespace
+
 void ValidatorManagerImpl::validate_block_is_next_proof(BlockIdExt prev_block_id, BlockIdExt next_block_id,
                                                         td::BufferSlice proof, td::Promise<td::Unit> promise) {
   if (!prev_block_id.is_masterchain() || !next_block_id.is_masterchain()) {
@@ -255,6 +304,19 @@ void ValidatorManagerImpl::validate_block_broadcast_signatures(BlockBroadcast br
                                              last_masterchain_state_, last_known_key_block_handle_, actor_id(this),
                                              td::Timestamp::in(2.0), std::move(promise), true)
       .release();
+}
+
+void ValidatorManagerImpl::log_received_block_copy(BlockIdExt block_id, PublicKeyHash src, ReceivedBlockSource source,
+                                                   ReceivedBlockPayloadKind kind) {
+  td::uint32 copy_no = 1;
+  if (auto *existing = received_block_copy_counts_.get_if_exists(block_id)) {
+    copy_no = *existing + 1;
+  }
+  received_block_copy_counts_.put(block_id, copy_no);
+
+  LOG(INFO) << k_received_block_copy_log_tag << " Received " << format_received_block_copy(copy_no) << " copy of "
+            << received_block_payload_kind_name(kind) << " for " << block_id.to_str() << " via "
+            << received_block_source_name(source) << " overlay from " << src;
 }
 
 td::actor::Task<> ValidatorManagerImpl::validated_accepted_block_broadcast(BlockIdExt block_id,
