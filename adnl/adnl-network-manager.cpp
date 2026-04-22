@@ -350,8 +350,7 @@ void AdnlNetworkManagerImpl::collect(metrics::MetricsPromise P) {
   set.push_scalar("udp_egress_packets_total", "counter", m_.udp_egress_packets,
                   "Total UDP packets sent on ADNL sockets.");
   set.push_labeled_scalar("udp_egress_drops_total", "counter", "reason",
-                          {{"unknown_src", m_.udp_egress_drop_unknown_src},
-                           {"no_route", m_.udp_egress_drop_no_route}},
+                          {{"unknown_src", m_.udp_egress_drop_unknown_src}, {"no_route", m_.udp_egress_drop_no_route}},
                           "ADNL outbound packets dropped, by reason.");
   set.push_scalar("udp_proxy_egress_bytes_total", "counter", m_.udp_proxy_egress_bytes,
                   "Total inner payload bytes wrapped through ADNL proxy.");

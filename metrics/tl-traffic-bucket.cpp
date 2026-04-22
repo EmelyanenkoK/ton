@@ -1,7 +1,7 @@
-#include "tl-traffic-bucket.h"
-
 #include "auto/tl/ton_api_id_names.h"
 #include "td/utils/as.h"
+
+#include "tl-traffic-bucket.h"
 
 namespace ton::metrics {
 
@@ -61,8 +61,7 @@ void TlTrafficBucket::account(td::Slice data) {
     return;
   }
   td::int32 magic = td::as<td::int32>(data.data());
-  if (td::int32 inner = unwrap_overlay_inner_magic(magic, data);
-      inner != 0 && ton_api_id_name(inner)) {
+  if (td::int32 inner = unwrap_overlay_inner_magic(magic, data); inner != 0 && ton_api_id_name(inner)) {
     magic = inner;
   }
   account_with_magic(magic, data.size());
@@ -84,8 +83,7 @@ void render_tl_bucket(MetricSet &set, const std::string &base, const std::string
                       std::optional<std::string> messages_help, std::string bucket_label_key) {
   auto build = [&](std::string name_suffix, std::optional<std::string> help, auto extract_value,
                    td::uint64 unknown_value) {
-    MetricFamily fam{
-        .name = base + name_suffix, .type = "counter", .help = std::move(help), .metrics = {}};
+    MetricFamily fam{.name = base + name_suffix, .type = "counter", .help = std::move(help), .metrics = {}};
     auto push = [&](std::string tl_name, td::uint64 value) {
       fam.metrics.push_back(Metric{
           .suffix = "",
@@ -99,10 +97,12 @@ void render_tl_bucket(MetricSet &set, const std::string &base, const std::string
     push("unknown", unknown_value);
     set.families.push_back(std::move(fam));
   };
-  build("_bytes_by_tl_total", std::move(bytes_help),
-        [](const TlTrafficBucket::Counter &c) { return c.bytes; }, bucket.unknown.bytes);
-  build("_messages_by_tl_total", std::move(messages_help),
-        [](const TlTrafficBucket::Counter &c) { return c.msgs; }, bucket.unknown.msgs);
+  build(
+      "_bytes_by_tl_total", std::move(bytes_help), [](const TlTrafficBucket::Counter &c) { return c.bytes; },
+      bucket.unknown.bytes);
+  build(
+      "_messages_by_tl_total", std::move(messages_help), [](const TlTrafficBucket::Counter &c) { return c.msgs; },
+      bucket.unknown.msgs);
 }
 
 }  // namespace ton::metrics

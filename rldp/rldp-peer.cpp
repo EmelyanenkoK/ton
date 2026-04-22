@@ -104,13 +104,10 @@ void RldpTransferSenderImpl::complete(td::uint32 part) {
   }
 }
 
-td::actor::ActorOwn<RldpTransferSender> RldpTransferSender::create(TransferId transfer_id,
-                                                                   adnl::AdnlNodeIdShort local_id,
-                                                                   adnl::AdnlNodeIdShort peer_id, td::BufferSlice data,
-                                                                   td::Timestamp timeout,
-                                                                   td::actor::ActorId<RldpImpl> rldp,
-                                                                   td::actor::ActorId<adnl::Adnl> adnl,
-                                                                   std::shared_ptr<RldpMetrics> metrics) {
+td::actor::ActorOwn<RldpTransferSender> RldpTransferSender::create(
+    TransferId transfer_id, adnl::AdnlNodeIdShort local_id, adnl::AdnlNodeIdShort peer_id, td::BufferSlice data,
+    td::Timestamp timeout, td::actor::ActorId<RldpImpl> rldp, td::actor::ActorId<adnl::Adnl> adnl,
+    std::shared_ptr<RldpMetrics> metrics) {
   return td::actor::create_actor<RldpTransferSenderImpl>("sender", transfer_id, local_id, peer_id, std::move(data),
                                                          timeout, rldp, adnl, std::move(metrics));
 }

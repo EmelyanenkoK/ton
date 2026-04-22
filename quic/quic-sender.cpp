@@ -295,12 +295,12 @@ metrics::MetricSet QuicSender::Stats::Entry::dump() const {
   out.push_scalar("conns", "gauge", server_stats.total_conns, "Active QUIC connections in this bucket.");
   out.push_scalar("rx_bytes_total", "counter", s.bytes_rx, "Total wire bytes received by ngtcp2.");
   out.push_scalar("tx_bytes_total", "counter", s.bytes_tx, "Total wire bytes emitted by ngtcp2.");
-  out.push_scalar("lost_bytes_total", "counter", s.bytes_lost, "QUIC packet bytes declared lost by the congestion controller.");
+  out.push_scalar("lost_bytes_total", "counter", s.bytes_lost,
+                  "QUIC packet bytes declared lost by the congestion controller.");
   out.push_scalar("unacked_bytes", "gauge", s.bytes_unacked, "Bytes sent but not yet ACKed.");
   out.push_scalar("unsent_bytes", "gauge", s.bytes_unsent, "Stream bytes buffered but not yet sent.");
   out.push_scalar("open_sids", "gauge", s.open_sids, "Currently open QUIC stream ids.");
-  out.push_scalar("mean_rtt", "gauge", s.mean_rtt,
-                  "Smoothed RTT averaged across active paths (nanoseconds).");
+  out.push_scalar("mean_rtt", "gauge", s.mean_rtt, "Smoothed RTT averaged across active paths (nanoseconds).");
   out.push_scalar("pkt_sent_total", "counter", s.pkt_sent, "ngtcp2 packets sent.");
   out.push_scalar("pkt_recv_total", "counter", s.pkt_recv, "ngtcp2 packets received.");
   out.push_scalar("pkt_lost_total", "counter", s.pkt_lost, "ngtcp2 packets declared lost.");
@@ -363,14 +363,12 @@ void QuicSender::collect(td::Promise<metrics::MetricSet> P) {
   // Snapshot synchronously inside the actor before kicking off the (coroutine-driven) per-server
   // stats collection. After we co_await a server, app_metrics_ could mutate, so capture now.
   metrics::MetricSet app_set;
-  app_set.push_labeled_scalar(
-      "app_send_bytes_total", "counter", "kind",
-      {{"message", app_metrics_.send_message.bytes}, {"query", app_metrics_.send_query.bytes}},
-      "Bytes the application asked QUIC to send (raw payload, by kind).");
-  app_set.push_labeled_scalar(
-      "app_send_messages_total", "counter", "kind",
-      {{"message", app_metrics_.send_message.msgs}, {"query", app_metrics_.send_query.msgs}},
-      "Messages the application asked QUIC to send.");
+  app_set.push_labeled_scalar("app_send_bytes_total", "counter", "kind",
+                              {{"message", app_metrics_.send_message.bytes}, {"query", app_metrics_.send_query.bytes}},
+                              "Bytes the application asked QUIC to send (raw payload, by kind).");
+  app_set.push_labeled_scalar("app_send_messages_total", "counter", "kind",
+                              {{"message", app_metrics_.send_message.msgs}, {"query", app_metrics_.send_query.msgs}},
+                              "Messages the application asked QUIC to send.");
   app_set.push_labeled_scalar("app_deliver_bytes_total", "counter", "kind",
                               {{"message", app_metrics_.deliver_message.bytes},
                                {"query", app_metrics_.deliver_query.bytes},

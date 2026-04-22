@@ -1822,8 +1822,7 @@ TEST(QuicNetworkOverhead, GsoBatchesPacketsOnLargeTraffic) {
 
     td::uint64 packets = stats_after.udp.egress.packets - stats_before.udp.egress.packets;
     td::uint64 syscalls = stats_after.udp.egress.syscalls - stats_before.udp.egress.syscalls;
-    double packets_per_syscall =
-        syscalls > 0 ? static_cast<double>(packets) / static_cast<double>(syscalls) : 0.0;
+    double packets_per_syscall = syscalls > 0 ? static_cast<double>(packets) / static_cast<double>(syscalls) : 0.0;
 
     LOG(INFO) << "GSO large-traffic: udp_egress_packets=" << packets << " udp_egress_syscalls=" << syscalls
               << " packets/syscall=" << packets_per_syscall;
@@ -1873,22 +1872,20 @@ TEST(QuicNetworkOverhead, UdpOverheadLowOnSmallTraffic) {
     double ratio = static_cast<double>(egress_bytes) / static_cast<double>(app_bytes);
     double avg_packet_size =
         egress_packets > 0 ? static_cast<double>(egress_bytes) / static_cast<double>(egress_packets) : 0.0;
-    double tl_overhead = stream_bytes_tx > 0 ? static_cast<double>(stream_bytes_tx - static_cast<td::int64>(app_bytes))
-                                             : 0.0;
+    double tl_overhead =
+        stream_bytes_tx > 0 ? static_cast<double>(stream_bytes_tx - static_cast<td::int64>(app_bytes)) : 0.0;
     double quic_framing = ngtcp2_tx_bytes > 0 ? static_cast<double>(ngtcp2_tx_bytes - stream_bytes_tx) : 0.0;
-    double udp_layer = ngtcp2_tx_bytes > 0 ? static_cast<double>(static_cast<td::int64>(egress_bytes) - ngtcp2_tx_bytes)
-                                           : 0.0;
+    double udp_layer =
+        ngtcp2_tx_bytes > 0 ? static_cast<double>(static_cast<td::int64>(egress_bytes) - ngtcp2_tx_bytes) : 0.0;
 
     LOG(INFO) << "Small-traffic overhead: udp_egress_bytes=" << egress_bytes << " app_bytes=" << app_bytes
               << " udp_egress_packets=" << egress_packets << " avg_packet_size=" << avg_packet_size
               << " ratio=" << ratio;
     LOG(INFO) << "Byte layering (A side): app=" << app_bytes << " stream_tx=" << stream_bytes_tx
-              << " ngtcp2_tx=" << ngtcp2_tx_bytes << " udp_tx=" << egress_bytes
-              << " | tl_overhead=" << tl_overhead << " quic_framing=" << quic_framing
-              << " udp_layer=" << udp_layer;
+              << " ngtcp2_tx=" << ngtcp2_tx_bytes << " udp_tx=" << egress_bytes << " | tl_overhead=" << tl_overhead
+              << " quic_framing=" << quic_framing << " udp_layer=" << udp_layer;
     LOG(INFO) << "Packet layering (A side): quic_pkts_sent=" << quic_pkts_sent << " udp_pkts=" << egress_packets
-              << " (data_pkts_est=" << quic_pkts_sent - (egress_packets - quic_pkts_sent)
-              << " avg_bytes_per_quic_pkt="
+              << " (data_pkts_est=" << quic_pkts_sent - (egress_packets - quic_pkts_sent) << " avg_bytes_per_quic_pkt="
               << (quic_pkts_sent > 0 ? static_cast<double>(ngtcp2_tx_bytes) / static_cast<double>(quic_pkts_sent) : 0.0)
               << ")";
 

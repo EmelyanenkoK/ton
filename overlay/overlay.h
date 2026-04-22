@@ -76,7 +76,7 @@ class Overlay : public td::actor::Actor {
   // Snapshot for the metrics layer: monotonic counters + per-overlay scalars + scope JSON.
   // Returned synchronously into the promise; one round-trip per overlay per scrape.
   struct AccStatsSnapshot {
-    std::string scope;             // raw JSON; the metrics layer extracts the "type" field.
+    std::string scope;  // raw JSON; the metrics layer extracts the "type" field.
     td::uint64 traffic_out_bytes = 0;
     td::uint64 traffic_in_bytes = 0;
     td::uint64 traffic_out_packets = 0;

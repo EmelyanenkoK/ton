@@ -88,8 +88,7 @@ class AdnlPeerTable : public Adnl {
   }
 
   // Register the metrics collector backed by this peer table with the prometheus exporter.
-  static void register_metrics(td::actor::ActorId<Adnl> peer_table,
-                               td::actor::ActorId<PrometheusExporter> exporter);
+  static void register_metrics(td::actor::ActorId<Adnl> peer_table, td::actor::ActorId<PrometheusExporter> exporter);
 
   virtual void answer_query(AdnlNodeIdShort src, AdnlNodeIdShort dst, AdnlQueryId query_id, td::BufferSlice data) = 0;
 

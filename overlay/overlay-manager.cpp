@@ -912,30 +912,31 @@ void OverlayManager::collect(metrics::MetricsPromise P) {
       };
       auto labeled_dir = [&](std::string name, std::string type, std::optional<std::string> help, auto out_getter,
                              auto in_getter) {
-        MetricFamily fam{
-            .name = std::move(name), .type = std::move(type), .help = std::move(help), .metrics = {}};
+        MetricFamily fam{.name = std::move(name), .type = std::move(type), .help = std::move(help), .metrics = {}};
         for (auto &[overlay_type, agg] : by_type_) {
-          for (auto [direction, value] : {std::pair{std::string("out"), out_getter(agg)},
-                                          std::pair{std::string("in"), in_getter(agg)}}) {
+          for (auto [direction, value] :
+               {std::pair{std::string("out"), out_getter(agg)}, std::pair{std::string("in"), in_getter(agg)}}) {
             fam.metrics.push_back(metrics::Metric{
                 .suffix = "",
-                .label_set =
-                    metrics::LabelSet{.labels = {{"type", overlay_type}, {"direction", std::move(direction)}}},
+                .label_set = metrics::LabelSet{.labels = {{"type", overlay_type}, {"direction", std::move(direction)}}},
                 .samples = {metrics::Sample{.label_set = {}, .value = static_cast<double>(value)}},
             });
           }
         }
         set.families.push_back(std::move(fam));
       };
-      labeled_dir("traffic_bytes_total", "counter", "Bytes flowing through overlays (broadcasts + messages).",
-                  [](auto &a) { return a.traffic_out_bytes; }, [](auto &a) { return a.traffic_in_bytes; });
-      labeled_dir("traffic_packets_total", "counter", "Packets flowing through overlays.",
-                  [](auto &a) { return a.traffic_out_packets; }, [](auto &a) { return a.traffic_in_packets; });
-      labeled_dir("responses_bytes_total", "counter", "Bytes flowing through overlays attributable to query responses.",
-                  [](auto &a) { return a.responses_out_bytes; }, [](auto &a) { return a.responses_in_bytes; });
-      labeled_dir("responses_packets_total", "counter", "Packets flowing through overlays attributable to responses.",
-                  [](auto &a) { return a.responses_out_packets; },
-                  [](auto &a) { return a.responses_in_packets; });
+      labeled_dir(
+          "traffic_bytes_total", "counter", "Bytes flowing through overlays (broadcasts + messages).",
+          [](auto &a) { return a.traffic_out_bytes; }, [](auto &a) { return a.traffic_in_bytes; });
+      labeled_dir(
+          "traffic_packets_total", "counter", "Packets flowing through overlays.",
+          [](auto &a) { return a.traffic_out_packets; }, [](auto &a) { return a.traffic_in_packets; });
+      labeled_dir(
+          "responses_bytes_total", "counter", "Bytes flowing through overlays attributable to query responses.",
+          [](auto &a) { return a.responses_out_bytes; }, [](auto &a) { return a.responses_in_bytes; });
+      labeled_dir(
+          "responses_packets_total", "counter", "Packets flowing through overlays attributable to responses.",
+          [](auto &a) { return a.responses_out_packets; }, [](auto &a) { return a.responses_in_packets; });
       labeled("broadcast_errors_total", "counter", "Broadcast validation errors observed in overlays.",
               [](auto &a) { return a.broadcast_errors; });
       labeled("fec_broadcast_errors_total", "counter", "FEC broadcast validation errors observed in overlays.",
@@ -953,18 +954,22 @@ void OverlayManager::collect(metrics::MetricsPromise P) {
           metrics::render_tl_bucket(set, base, overlay_type, getter(agg), bytes_help, messages_help, "type");
         }
       };
-      append_tl("messages_sent", [](auto &a) -> auto & { return a.messages_sent_by_tl; },
-                "Bytes sent via overlay direct messages, by overlay type and inner TL.",
-                "Messages sent via overlay direct messages, by overlay type and inner TL.");
-      append_tl("messages_received", [](auto &a) -> auto & { return a.messages_received_by_tl; },
-                "Bytes received via overlay direct messages, by overlay type and inner TL.",
-                "Messages received via overlay direct messages, by overlay type and inner TL.");
-      append_tl("broadcasts_sent", [](auto &a) -> auto & { return a.broadcasts_sent_by_tl; },
-                "Bytes sent via overlay broadcasts, by overlay type and inner TL.",
-                "Broadcasts sent, by overlay type and inner TL.");
-      append_tl("broadcasts_received", [](auto &a) -> auto & { return a.broadcasts_received_by_tl; },
-                "Bytes received via overlay broadcasts, by overlay type and inner TL.",
-                "Broadcasts received, by overlay type and inner TL.");
+      append_tl(
+          "messages_sent", [](auto &a) -> auto & { return a.messages_sent_by_tl; },
+          "Bytes sent via overlay direct messages, by overlay type and inner TL.",
+          "Messages sent via overlay direct messages, by overlay type and inner TL.");
+      append_tl(
+          "messages_received", [](auto &a) -> auto & { return a.messages_received_by_tl; },
+          "Bytes received via overlay direct messages, by overlay type and inner TL.",
+          "Messages received via overlay direct messages, by overlay type and inner TL.");
+      append_tl(
+          "broadcasts_sent", [](auto &a) -> auto & { return a.broadcasts_sent_by_tl; },
+          "Bytes sent via overlay broadcasts, by overlay type and inner TL.",
+          "Broadcasts sent, by overlay type and inner TL.");
+      append_tl(
+          "broadcasts_received", [](auto &a) -> auto & { return a.broadcasts_received_by_tl; },
+          "Bytes received via overlay broadcasts, by overlay type and inner TL.",
+          "Broadcasts received, by overlay type and inner TL.");
       return set;
     }
   };

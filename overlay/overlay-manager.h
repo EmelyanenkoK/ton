@@ -50,8 +50,7 @@ class OverlayManager : public Overlays, public virtual metrics::AsyncCollector {
                  td::actor::ActorId<dht::Dht> dht, OverlayManagerBufferLimits buffer_limits = {});
 
   void collect(metrics::MetricsPromise P) override;
-  static void register_metrics(td::actor::ActorId<Overlays> overlays,
-                               td::actor::ActorId<PrometheusExporter> exporter);
+  static void register_metrics(td::actor::ActorId<Overlays> overlays, td::actor::ActorId<PrometheusExporter> exporter);
   void start_up() override;
   void save_to_db(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id, std::vector<OverlayNode> nodes);
 

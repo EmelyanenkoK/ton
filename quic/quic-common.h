@@ -92,7 +92,7 @@ struct UdpSideCounters {
   td::uint64 packets = 0;
   td::uint64 syscalls = 0;
 
-  UdpSideCounters &operator+=(const UdpSideCounters &o) {
+  UdpSideCounters& operator+=(const UdpSideCounters& o) {
     bytes += o.bytes;
     packets += o.packets;
     syscalls += o.syscalls;
@@ -104,7 +104,7 @@ struct UdpCounters {
   UdpSideCounters ingress;
   UdpSideCounters egress;
 
-  UdpCounters &operator+=(const UdpCounters &o) {
+  UdpCounters& operator+=(const UdpCounters& o) {
     ingress += o.ingress;
     egress += o.egress;
     return *this;

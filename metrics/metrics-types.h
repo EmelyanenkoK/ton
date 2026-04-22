@@ -87,10 +87,9 @@ struct MetricSet {
   // `set.families.push_back(MetricFamily::make_scalar(name, type, v, help))`.  Any numeric
   // value type flows through — counters are typically uint64/int64/size_t, RTT gauges double.
   template <typename V, typename = std::enable_if_t<std::is_arithmetic_v<V>>>
-  void push_scalar(std::string name, std::string type, V value,
-                   std::optional<std::string> help = std::nullopt) {
-    families.push_back(MetricFamily::make_scalar(std::move(name), std::move(type),
-                                                 static_cast<double>(value), std::move(help)));
+  void push_scalar(std::string name, std::string type, V value, std::optional<std::string> help = std::nullopt) {
+    families.push_back(
+        MetricFamily::make_scalar(std::move(name), std::move(type), static_cast<double>(value), std::move(help)));
   }
   void push_labeled_scalar(std::string name, std::string type, std::string label_key,
                            std::vector<std::pair<std::string, td::uint64>> entries,

@@ -45,7 +45,6 @@ struct TlTrafficBucket {
 // overlay-type partitioning, etc.
 void render_tl_bucket(MetricSet &set, const std::string &base, const std::string &bucket_label_value,
                       const TlTrafficBucket &bucket, std::optional<std::string> bytes_help = std::nullopt,
-                      std::optional<std::string> messages_help = std::nullopt,
-                      std::string bucket_label_key = "kind");
+                      std::optional<std::string> messages_help = std::nullopt, std::string bucket_label_key = "kind");
 
 }  // namespace ton::metrics

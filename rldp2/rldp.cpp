@@ -153,8 +153,8 @@ td::actor::ActorId<RldpConnectionActor> RldpIn::create_connection(adnl::AdnlNode
     VLOG(RLDP_INFO) << "dropping incoming packet " << local_id << " <- " << peer_id << " : peer not allowed";
     return {};
   }
-  auto connection =
-      td::actor::create_actor<RldpConnectionActor>("RldpConnection", actor_id(this), local_id, peer_id, adnl_, metrics_);
+  auto connection = td::actor::create_actor<RldpConnectionActor>("RldpConnection", actor_id(this), local_id, peer_id,
+                                                                 adnl_, metrics_);
   td::actor::send_closure(connection, &RldpConnectionActor::set_default_mtu, mtu);
   auto res = connection.get();
   connections_[std::make_pair(local_id, peer_id)] = std::move(connection);
@@ -333,22 +333,19 @@ void RldpIn::collect(metrics::MetricsPromise P) {
                           "Messages RLDP2 delivered to the application.");
   set.push_scalar("bytes_sent_to_adnl_total", "counter", m.sent_to_adnl.bytes_load(),
                   "RLDP2 serialized bytes handed to ADNL.");
-  set.push_scalar("parts_sent_to_adnl_total", "counter", m.sent_to_adnl.msgs_load(),
-                  "RLDP2 messages handed to ADNL.");
+  set.push_scalar("parts_sent_to_adnl_total", "counter", m.sent_to_adnl.msgs_load(), "RLDP2 messages handed to ADNL.");
   set.push_scalar("bytes_received_from_adnl_total", "counter", m.received_from_adnl.bytes_load(),
                   "RLDP2 serialized bytes received from ADNL.");
   set.push_scalar("parts_received_from_adnl_total", "counter", m.received_from_adnl.msgs_load(),
                   "RLDP2 messages received from ADNL.");
-  set.push_scalar("parse_errors_total", "counter", load(metrics_->parse_errors),
-                  "RLDP2 message TL parse failures.");
+  set.push_scalar("parse_errors_total", "counter", load(metrics_->parse_errors), "RLDP2 message TL parse failures.");
   set.push_labeled_scalar(
       "transfers_received_total", "counter", "result",
       {{"ok", load(metrics_->transfers_received_ok)}, {"error", load(metrics_->transfers_received_err)}},
       "Inbound RLDP2 transfers concluded (success or error).");
-  set.push_labeled_scalar(
-      "transfers_sent_total", "counter", "result",
-      {{"ok", load(metrics_->transfers_sent_ok)}, {"error", load(metrics_->transfers_sent_err)}},
-      "Outbound RLDP2 transfers concluded (success or error).");
+  set.push_labeled_scalar("transfers_sent_total", "counter", "result",
+                          {{"ok", load(metrics_->transfers_sent_ok)}, {"error", load(metrics_->transfers_sent_err)}},
+                          "Outbound RLDP2 transfers concluded (success or error).");
   set.push_scalar("connections_active", "gauge", connections_.size(), "Active RLDP2 connections.");
   set.push_scalar("queries_pending", "gauge", queries_.size(), "Pending RLDP2 queries awaiting answers.");
 
