@@ -40,4 +40,8 @@ struct BlockBroadcast {
   }
 };
 
+enum class BroadcastSource {
+  public_overlay, fast_sync_overlay, custom_overlay
+};
+
 }  // namespace ton::validator
