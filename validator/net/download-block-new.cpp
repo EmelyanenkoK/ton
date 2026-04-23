@@ -37,6 +37,18 @@ namespace validator {
 
 namespace fullnode {
 
+namespace {
+
+std::string block_id_or_none(const BlockIdExt &block_id) {
+  return block_id.is_valid() ? block_id.to_str() : "none";
+}
+
+const char *download_mode(const BlockIdExt &block_id) {
+  return block_id.is_valid() ? "block" : "next";
+}
+
+}  // namespace
+
 DownloadBlockNew::DownloadBlockNew(BlockIdExt block_id, adnl::AdnlNodeIdShort local_id,
                                    overlay::OverlayIdShort overlay_id, adnl::AdnlNodeIdShort download_from,
                                    td::uint32 priority, td::Timestamp timeout,
@@ -421,23 +433,30 @@ DownloadBlockNewParallel::DownloadBlockNewParallel(
 void DownloadBlockNewParallel::start_up() {
   alarm_timestamp() = timeout_;
   if (download_from_.empty()) {
+    LOG(INFO) << "forced block download parallel start mode=" << download_mode(block_id_)
+              << " block=" << block_id_or_none(block_id_) << " prev_block=" << block_id_or_none(prev_id_)
+              << " attempts=0";
     abort_query(td::Status::Error(ErrorCode::notready, "no forced download peers"));
     return;
   }
 
+  LOG(INFO) << "forced block download parallel start mode=" << download_mode(block_id_)
+            << " block=" << block_id_or_none(block_id_) << " prev_block=" << block_id_or_none(prev_id_)
+            << " attempts=" << download_from_.size();
   pending_ = download_from_.size();
   attempts_.reserve(download_from_.size());
   for (size_t i = 0; i < download_from_.size(); ++i) {
-    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<DownloadedBlock> R) mutable {
-      td::actor::send_closure(SelfId, &DownloadBlockNewParallel::got_result, std::move(R));
+    auto peer = download_from_[i];
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), peer](td::Result<DownloadedBlock> R) mutable {
+      td::actor::send_closure(SelfId, &DownloadBlockNewParallel::got_result, peer, std::move(R));
     });
     if (block_id_.is_valid()) {
       attempts_.push_back(td::actor::create_actor<DownloadBlockNew>(
-          PSTRING() << "downloadreq" << i, block_id_, local_id_, overlay_id_, download_from_[i], priority_, timeout_,
+          PSTRING() << "downloadreq" << i, block_id_, local_id_, overlay_id_, peer, priority_, timeout_,
           validator_manager_, rldp_, overlays_, adnl_, client_, std::move(P)));
     } else {
       attempts_.push_back(td::actor::create_actor<DownloadBlockNew>(
-          PSTRING() << "downloadnext" << i, local_id_, overlay_id_, prev_id_, download_from_[i], priority_, timeout_,
+          PSTRING() << "downloadnext" << i, local_id_, overlay_id_, prev_id_, peer, priority_, timeout_,
           validator_manager_, rldp_, overlays_, adnl_, client_, std::move(P)));
     }
   }
@@ -447,23 +466,37 @@ void DownloadBlockNewParallel::alarm() {
   abort_query(td::Status::Error(ErrorCode::timeout, "timeout"));
 }
 
-void DownloadBlockNewParallel::got_result(td::Result<DownloadedBlock> result) {
+void DownloadBlockNewParallel::got_result(adnl::AdnlNodeIdShort peer, td::Result<DownloadedBlock> result) {
   if (finished_) {
     return;
   }
   if (result.is_ok()) {
     finished_ = true;
+    auto block = result.move_as_ok();
+    LOG(INFO) << "forced block download attempt success mode=" << download_mode(block_id_)
+              << " peer=" << peer.bits256_value().to_hex() << " requested_block=" << block_id_or_none(block_id_)
+              << " prev_block=" << block_id_or_none(prev_id_) << " downloaded_block=" << block.block.id.to_str()
+              << " attempts_started=" << download_from_.size() << " failed_attempts=" << failed_attempts_
+              << " cancelled_attempts=" << (pending_ > 0 ? pending_ - 1 : 0)
+              << " elapsed=" << perf_timer_.elapsed() << "s";
     if (promise_) {
-      promise_.set_value(result.move_as_ok());
+      promise_.set_value(std::move(block));
     }
     attempts_.clear();
     stop();
     return;
   }
 
-  last_error_ = result.move_as_error();
+  auto error = result.move_as_error();
   CHECK(pending_ > 0);
   pending_--;
+  failed_attempts_++;
+  LOG(INFO) << "forced block download attempt failed mode=" << download_mode(block_id_)
+            << " peer=" << peer.bits256_value().to_hex() << " requested_block=" << block_id_or_none(block_id_)
+            << " prev_block=" << block_id_or_none(prev_id_) << " failed_attempts=" << failed_attempts_ << "/"
+            << download_from_.size() << " pending_attempts=" << pending_ << " elapsed=" << perf_timer_.elapsed()
+            << "s error=" << error;
+  last_error_ = std::move(error);
   if (pending_ == 0) {
     abort_query(std::move(last_error_));
   }
@@ -475,6 +508,10 @@ void DownloadBlockNewParallel::abort_query(td::Status reason) {
   }
   finished_ = true;
   if (promise_) {
+    LOG(INFO) << "forced block download parallel failed mode=" << download_mode(block_id_)
+              << " requested_block=" << block_id_or_none(block_id_) << " prev_block=" << block_id_or_none(prev_id_)
+              << " attempts_started=" << download_from_.size() << " failed_attempts=" << failed_attempts_
+              << " elapsed=" << perf_timer_.elapsed() << "s error=" << reason;
     promise_.set_error(std::move(reason));
   }
   attempts_.clear();

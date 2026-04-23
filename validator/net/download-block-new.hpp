@@ -23,6 +23,7 @@
 #include "adnl/adnl-ext-client.h"
 #include "overlay/overlays.h"
 #include "rldp/rldp.h"
+#include "td/utils/Timer.h"
 #include "ton/ton-types.h"
 #include "validator/validator.h"
 
@@ -106,7 +107,7 @@ class DownloadBlockNewParallel : public td::actor::Actor {
 
   void start_up() override;
   void alarm() override;
-  void got_result(td::Result<DownloadedBlock> result);
+  void got_result(adnl::AdnlNodeIdShort peer, td::Result<DownloadedBlock> result);
   void abort_query(td::Status reason);
 
  private:
@@ -125,6 +126,8 @@ class DownloadBlockNewParallel : public td::actor::Actor {
   td::Promise<DownloadedBlock> promise_;
   std::vector<td::actor::ActorOwn<DownloadBlockNew>> attempts_;
   size_t pending_ = 0;
+  size_t failed_attempts_ = 0;
+  td::Timer perf_timer_;
   td::Status last_error_ = td::Status::Error(ErrorCode::notready, "no download attempts");
   bool finished_ = false;
 };

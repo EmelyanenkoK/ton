@@ -277,8 +277,7 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
         peers.push_back(peer);
       }
     });
-    VLOG(FULL_NODE_NOTICE) << "loaded " << peers.size() << " force-good-peers from " << url_ << ", skipped "
-                           << skipped;
+    LOG(INFO) << "loaded force-good-peers url=" << url_ << " peers=" << peers.size() << " skipped=" << skipped;
     return peers;
   }
 
@@ -415,12 +414,11 @@ void FullNodeShardImpl::refresh_force_good_peers() {
 void FullNodeShardImpl::got_force_good_peers(td::Result<std::vector<adnl::AdnlNodeIdShort>> peers) {
   force_good_peers_refresh_active_ = false;
   if (peers.is_error()) {
-    VLOG(FULL_NODE_WARNING) << "failed to refresh force-good-peers for " << shard_.to_str() << ": "
-                            << peers.move_as_error();
+    LOG(WARNING) << "failed to refresh force-good-peers shard=" << shard_.to_str() << ": " << peers.move_as_error();
     refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(10.0, 20.0));
   } else {
     force_good_peers_ = peers.move_as_ok();
-    VLOG(FULL_NODE_NOTICE) << "using " << force_good_peers_.size() << " force-good-peers for " << shard_.to_str();
+    LOG(INFO) << "using force-good-peers shard=" << shard_.to_str() << " peers=" << force_good_peers_.size();
     refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(50.0, 70.0));
   }
   alarm_timestamp().relax(refresh_force_good_peers_at_);
@@ -475,6 +473,12 @@ std::vector<adnl::AdnlNodeIdShort> FullNodeShardImpl::choose_force_download_peer
 }
 
 void FullNodeShardImpl::finish_download_block(DownloadedBlock block, td::Promise<ReceivedBlock> promise) {
+  if (block.from_network) {
+    LOG(INFO) << "block download finished block=" << block.block.id.to_str()
+              << " force_download_peers_enabled=" << uses_force_download_peers()
+              << " rebroadcast_downloaded_enabled=" << opts_.force_download_.rebroadcast_downloaded_block_
+              << " is_proof_link=" << block.is_proof_link;
+  }
   if (opts_.force_download_.rebroadcast_downloaded_block_ && block.from_network) {
     td::actor::send_closure(full_node_, &FullNode::process_downloaded_block_for_rebroadcast, block.clone());
   }
@@ -549,8 +553,13 @@ void FullNodeShardImpl::try_get_next_block(td::Timestamp timeout, td::Promise<Re
         }
       });
   if (uses_force_download_peers()) {
+    auto force_peers = choose_force_download_peers();
+    LOG(INFO) << "forced block download start mode=next prev_block=" << handle_->id().to_str()
+              << " selected_peers=" << force_peers.size()
+              << " configured_peers=" << opts_.force_download_.peers_.size()
+              << " attempts_target=" << opts_.force_download_.attempts_num_;
     td::actor::create_actor<DownloadBlockNewParallel>("downloadnext-forced", adnl_id_, overlay_id_, handle_->id(),
-                                                      choose_force_download_peers(), download_next_priority(), timeout,
+                                                      std::move(force_peers), download_next_priority(), timeout,
                                                       validator_manager_, rldp_, overlays_, adnl_, client_,
                                                       std::move(P))
         .release();
@@ -1353,13 +1362,22 @@ void FullNodeShardImpl::send_block_candidate_with_fanout(BlockIdExt block_id, Ca
     return;
   }
   VLOG(FULL_NODE_DEBUG) << "Sending newBlockCandidate: " << block_id.to_str();
+  auto payload = B.move_as_ok();
+  auto payload_size = payload.size();
   if (fanout_override == 0) {
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
-                            overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+                            overlay::Overlays::BroadcastFlagAnySender(), std::move(payload));
   } else {
+    auto force_good_available = force_good_peers_.size();
     auto force_peers = choose_force_good_peers(fanout_override);
+    auto force_good_selected = force_peers.size();
+    auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
+    LOG(INFO) << "public rebroadcast dispatch type=candidate block=" << block_id.to_str()
+              << " shard=" << shard_.to_str() << " fanout_target=" << fanout_override
+              << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
+              << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size;
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
-                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok(),
+                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
                             fanout_override, std::move(force_peers));
   }
 }
@@ -1379,13 +1397,22 @@ void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td:
     VLOG(FULL_NODE_WARNING) << "failed to serialize block broadcast: " << B.move_as_error();
     return;
   }
+  auto payload = B.move_as_ok();
+  auto payload_size = payload.size();
   if (fanout_override == 0) {
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
-                            overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+                            overlay::Overlays::BroadcastFlagAnySender(), std::move(payload));
   } else {
+    auto force_good_available = force_good_peers_.size();
     auto force_peers = choose_force_good_peers(fanout_override);
+    auto force_good_selected = force_peers.size();
+    auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
+    LOG(INFO) << "public rebroadcast dispatch type=block block=" << broadcast.block_id.to_str()
+              << " shard=" << shard_.to_str() << " fanout_target=" << fanout_override
+              << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
+              << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size;
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
-                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok(),
+                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
                             fanout_override, std::move(force_peers));
   }
 }
@@ -1402,8 +1429,13 @@ void FullNodeShardImpl::download_block(BlockIdExt id, td::uint32 priority, td::T
         }
       });
   if (uses_force_download_peers()) {
+    auto force_peers = choose_force_download_peers();
+    LOG(INFO) << "forced block download start mode=block block=" << id.to_str()
+              << " selected_peers=" << force_peers.size()
+              << " configured_peers=" << opts_.force_download_.peers_.size()
+              << " attempts_target=" << opts_.force_download_.attempts_num_;
     td::actor::create_actor<DownloadBlockNewParallel>("downloadreq-forced", id, adnl_id_, overlay_id_,
-                                                      choose_force_download_peers(), priority, timeout,
+                                                      std::move(force_peers), priority, timeout,
                                                       validator_manager_, rldp_, overlays_, adnl_, client_,
                                                       std::move(P))
         .release();

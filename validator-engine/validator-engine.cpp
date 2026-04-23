@@ -116,6 +116,7 @@ static td::Result<std::vector<ton::adnl::AdnlNodeIdShort>> parse_force_download_
   if (peers.empty()) {
     return td::Status::Error("force-download-peers file has no peers");
   }
+  LOG(INFO) << "loaded force-download-peers file=" << path << " peers=" << peers.size();
   return peers;
 }
 

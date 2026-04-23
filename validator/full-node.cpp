@@ -549,19 +549,24 @@ bool FullNodeImpl::should_rebroadcast_downloaded(WorkchainId workchain) const {
 void FullNodeImpl::rebroadcast_block_to_public(const BlockBroadcast &broadcast, bool apply_candidate_dedup,
                                                td::Slice source_name) {
   if (apply_candidate_dedup && custom_to_public_sent_candidates_.contains(broadcast.block_id)) {
-    VLOG(FULL_NODE_DEBUG) << "Skipping " << source_name << " block rebroadcast after candidate: "
-                          << broadcast.block_id.to_str();
+    LOG(INFO) << "public rebroadcast skipped source=" << source_name << " type=block reason=candidate-dedup block="
+              << broadcast.block_id.to_str();
     return;
   }
   if (custom_to_public_sent_blocks_.contains(broadcast.block_id)) {
+    LOG(INFO) << "public rebroadcast skipped source=" << source_name << " type=block reason=duplicate block="
+              << broadcast.block_id.to_str();
     return;
   }
   auto shard = get_shard(broadcast.block_id.shard_full());
   if (shard.empty()) {
-    VLOG(FULL_NODE_WARNING) << "dropping " << source_name << " block rebroadcast to unknown shard";
+    LOG(WARNING) << "public rebroadcast skipped source=" << source_name
+                 << " type=block reason=unknown-shard block=" << broadcast.block_id.to_str();
     return;
   }
   custom_to_public_sent_blocks_.put(broadcast.block_id, {});
+  LOG(INFO) << "public rebroadcast scheduled source=" << source_name << " type=block block="
+            << broadcast.block_id.to_str() << " fanout_target=" << opts_.rebroadcast_from_custom_.peer_target_;
   td::actor::send_closure(shard, &FullNodeShard::send_broadcast_with_fanout, broadcast.clone(),
                           opts_.rebroadcast_from_custom_.peer_target_);
 }
@@ -570,14 +575,20 @@ void FullNodeImpl::rebroadcast_block_candidate_to_public(const BlockIdExt &block
                                                          td::uint32 validator_set_hash, const td::BufferSlice &data,
                                                          td::Slice source_name) {
   if (custom_to_public_sent_candidates_.contains(block_id)) {
+    LOG(INFO) << "public rebroadcast skipped source=" << source_name << " type=candidate reason=duplicate block="
+              << block_id.to_str();
     return;
   }
   auto shard = get_shard(ShardIdFull{masterchainId, shardIdAll});
   if (shard.empty()) {
-    VLOG(FULL_NODE_WARNING) << "dropping " << source_name << " block candidate rebroadcast to unknown shard";
+    LOG(WARNING) << "public rebroadcast skipped source=" << source_name
+                 << " type=candidate reason=unknown-shard block=" << block_id.to_str();
     return;
   }
   custom_to_public_sent_candidates_.put(block_id, {});
+  LOG(INFO) << "public rebroadcast scheduled source=" << source_name << " type=candidate block=" << block_id.to_str()
+            << " cc_seqno=" << cc_seqno << " validator_set_hash=" << validator_set_hash
+            << " fanout_target=" << opts_.rebroadcast_from_custom_.peer_target_;
   td::actor::send_closure(shard, &FullNodeShard::send_block_candidate_with_fanout, block_id, cc_seqno,
                           validator_set_hash, data.clone(), opts_.rebroadcast_from_custom_.peer_target_);
 }
@@ -690,14 +701,24 @@ void FullNodeImpl::process_block_broadcast(BlockBroadcast broadcast, bool signat
 }
 
 void FullNodeImpl::process_downloaded_block_for_rebroadcast(DownloadedBlock block) {
-  if (!block.from_network || !should_rebroadcast_downloaded(block.block.id.shard_full().workchain)) {
+  if (!block.from_network) {
+    return;
+  }
+  if (!opts_.force_download_.rebroadcast_downloaded_block_) {
+    return;
+  }
+  if (!should_rebroadcast_downloaded(block.block.id.shard_full().workchain)) {
+    LOG(INFO) << "public rebroadcast skipped source=downloaded-to-public reason=workchain-disabled block="
+              << block.block.id.to_str() << " workchain=" << block.block.id.shard_full().workchain;
     return;
   }
 
   if (block.block.id.is_masterchain()) {
     if (block.is_proof_link || block.proof.empty() || block.sig_set.is_null()) {
-      VLOG(FULL_NODE_WARNING) << "skipping downloaded block rebroadcast without full proof/signatures: "
-                              << block.block.id.to_str();
+      LOG(WARNING) << "public rebroadcast skipped source=downloaded-to-public type=block "
+                      "reason=missing-full-proof-or-signatures block="
+                   << block.block.id.to_str() << " is_proof_link=" << block.is_proof_link
+                   << " proof_empty=" << block.proof.empty() << " sig_set_empty=" << block.sig_set.is_null();
       return;
     }
     BlockBroadcast broadcast{block.block.id, block.sig_set, block.block.data.clone(), block.proof.clone()};

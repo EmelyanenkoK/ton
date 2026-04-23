@@ -261,14 +261,21 @@ td::Status BroadcastFec::distribute_part(OverlayImpl *overlay, td::uint32 seqno)
   auto manager = overlay->overlay_manager();
 
   auto &limiter = overlay->get_broadcasts_limiter(src_.compute_short_id(), certificate_.get());
+  size_t sent_peers = 0;
+  size_t sent_short = 0;
+  size_t sent_full = 0;
+  size_t skipped_completed = 0;
   for (auto &n : nodes) {
     if (neighbour_completed(n)) {
+      skipped_completed++;
       continue;
     }
     if (neighbour_received(n)) {
       td::actor::send_closure(manager, &OverlayManager::send_message, n, overlay->local_id(), overlay->overlay_id(),
                               data_short.clone());
       limiter.register_out_traffic(data_short.size());
+      sent_peers++;
+      sent_short++;
     } else {
       if (hash_.count_leading_zeroes() >= 12) {
         VLOG(OVERLAY_INFO) << "broadcast " << hash_ << ": sending part " << seqno << " to " << n;
@@ -276,7 +283,15 @@ td::Status BroadcastFec::distribute_part(OverlayImpl *overlay, td::uint32 seqno)
       td::actor::send_closure(manager, &OverlayManager::send_message, n, overlay->local_id(), overlay->overlay_id(),
                               data.clone());
       limiter.register_out_traffic(data.size());
+      sent_peers++;
+      sent_full++;
     }
+  }
+  if (fanout_override_ != 0) {
+    LOG(INFO) << "public rebroadcast fec part sent hash=" << hash_ << " data_hash=" << data_hash_
+              << " part=" << seqno << " fanout_target=" << fanout << " selected_peers=" << nodes.size()
+              << " sent_peers=" << sent_peers << " sent_full=" << sent_full << " sent_short=" << sent_short
+              << " force_good_selected=" << force_peers_.size() << " skipped_completed=" << skipped_completed;
   }
   return td::Status::OK();
 }
