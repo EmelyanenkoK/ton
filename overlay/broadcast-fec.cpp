@@ -291,7 +291,11 @@ td::Status BroadcastFec::distribute_part(OverlayImpl *overlay, td::uint32 seqno)
     LOG(INFO) << "public rebroadcast fec part sent hash=" << hash_ << " data_hash=" << data_hash_
               << " part=" << seqno << " fanout_target=" << fanout << " selected_peers=" << nodes.size()
               << " sent_peers=" << sent_peers << " sent_full=" << sent_full << " sent_short=" << sent_short
-              << " force_good_selected=" << force_peers_.size() << " skipped_completed=" << skipped_completed;
+              << " force_good_selected=" << force_peers_.size() << " skipped_completed=" << skipped_completed
+              << " cert_attached=" << (certificate_ != nullptr)
+              << " cert_issuer=" << (certificate_ ? certificate_->issuer_hash() : PublicKeyHash::zero())
+              << " cert_expire_at=" << (certificate_ ? certificate_->expire_at() : 0)
+              << " cert_flags=" << (certificate_ ? certificate_->flags() : 0);
   }
   return td::Status::OK();
 }
@@ -548,6 +552,16 @@ void BroadcastsFec::signed_(OverlayImpl *overlay, std::unique_ptr<BroadcastFecPa
   part->source_ = std::move(V.second);
   part->signature_ = std::move(V.first);
   part->cert_ = overlay->get_certificate(part->source_.compute_short_id());
+  if (part->fanout_override_ != 0 && part->seqno_ == 0) {
+    LOG(INFO) << "public rebroadcast fec signed hash=" << part->broadcast_hash_
+              << " source=" << part->source_.compute_short_id()
+              << " fanout_target=" << part->fanout_override_
+              << " force_good_selected=" << part->force_peers_.size()
+              << " cert_attached=" << (part->cert_ != nullptr)
+              << " cert_issuer=" << (part->cert_ ? part->cert_->issuer_hash() : PublicKeyHash::zero())
+              << " cert_expire_at=" << (part->cert_ ? part->cert_->expire_at() : 0)
+              << " cert_flags=" << (part->cert_ ? part->cert_->flags() : 0);
+  }
   td::Status S = process(overlay, *part);
   if (S.is_error() && S.code() != ErrorCode::notready) {
     LOG(WARNING) << "failed to process fec broadcast: " << S;

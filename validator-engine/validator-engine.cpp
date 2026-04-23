@@ -120,6 +120,18 @@ static td::Result<std::vector<ton::adnl::AdnlNodeIdShort>> parse_force_download_
   return peers;
 }
 
+static td::Result<ton::adnl::AdnlNodeIdShort> parse_adnl_id_hex(td::Slice value) {
+  TRY_RESULT_PREFIX(decoded_id, td::hex_decode(value), "bad ADNL hex: ");
+  if (decoded_id.size() != 32) {
+    return td::Status::Error("bad ADNL id size: expected 32 bytes");
+  }
+  ton::adnl::AdnlNodeIdShort id{td::Slice(decoded_id)};
+  if (id.is_zero()) {
+    return td::Status::Error("zero ADNL id");
+  }
+  return id;
+}
+
 Config::Config() {
   out_port = 3278;
   full_node = ton::PublicKeyHash::zero();
@@ -1627,6 +1639,10 @@ void ValidatorEngine::alarm() {
         issue_fast_sync_overlay_certificates_at_ = td::Timestamp::in(60.0);
         issue_fast_sync_overlay_certificates();
       }
+      if (issue_shard_overlay_certificates_at_.is_in_past()) {
+        issue_shard_overlay_certificates_at_ = td::Timestamp::in(60.0);
+        issue_shard_overlay_certificates();
+      }
     }
     for (auto &x : config_.gc) {
       if (running_gc_.count(x) == 0) {
@@ -2451,7 +2467,11 @@ void ValidatorEngine::start_full_node() {
     full_node_id_ = ton::adnl::AdnlNodeIdShort{config_.full_node};
     auto pk = ton::PrivateKey{ton::privkeys::Ed25519::random()};
     auto short_id = pk.compute_short_id();
-    td::actor::send_closure(keyring_, &ton::keyring::Keyring::add_key, std::move(pk), true, [](td::Result<>) {});
+    if (full_node_options_.use_adnl_id_as_broadcast_source_ && !full_node_id_.is_zero()) {
+      short_id = full_node_id_.pubkey_hash();
+    } else {
+      td::actor::send_closure(keyring_, &ton::keyring::Keyring::add_key, std::move(pk), true, [](td::Result<>) {});
+    }
     if (config_.full_node_slaves.size() > 0) {
       std::vector<std::pair<ton::adnl::AdnlNodeIdFull, td::IPAddress>> vec;
       for (auto &x : config_.full_node_slaves) {
@@ -2496,6 +2516,7 @@ void ValidatorEngine::start_full_node() {
     }
     load_custom_overlays_config();
     register_fast_sync_certificate_callback();
+    register_shard_overlay_certificate_callback();
   } else {
     started_full_node();
   }
@@ -2738,10 +2759,14 @@ void ValidatorEngine::try_add_full_node_adnl_addr(ton::PublicKeyHash id, td::Pro
   if (!full_node_.empty() && id != full_node_id_.pubkey_hash()) {
     td::actor::send_closure(adnl_.get(), &ton::adnl::Adnl::unsubscribe, full_node_id_,
                             ton::adnl::Adnl::int_to_bytestring(ton::ton_api::tonNode_newFastSyncMemberCertificate::ID));
+    td::actor::send_closure(
+        adnl_.get(), &ton::adnl::Adnl::unsubscribe, full_node_id_,
+        ton::adnl::Adnl::int_to_bytestring(ton::ton_api::engine_validator_importShardOverlayCertificate::ID));
     full_node_id_ = ton::adnl::AdnlNodeIdShort{id};
     td::actor::send_closure(full_node_, &ton::validator::fullnode::FullNode::update_adnl_id, full_node_id_,
                             [](td::Result<>) {});
     register_fast_sync_certificate_callback();
+    register_shard_overlay_certificate_callback();
   }
 
   write_config(std::move(promise));
@@ -3068,6 +3093,69 @@ void ValidatorEngine::register_fast_sync_certificate_callback() {
                           std::make_unique<Callback>(actor_id(this)));
 }
 
+void ValidatorEngine::register_shard_overlay_certificate_callback() {
+  if (full_node_id_.is_zero()) {
+    return;
+  }
+  class Callback : public ton::adnl::Adnl::Callback {
+   public:
+    explicit Callback(td::actor::ActorId<ValidatorEngine> validator_engine)
+        : validator_engine_(std::move(validator_engine)) {
+    }
+    void receive_message(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst,
+                         td::BufferSlice data) override {
+      auto R = ton::fetch_tl_object<ton::ton_api::engine_validator_importShardOverlayCertificate>(std::move(data), true);
+      if (R.is_error()) {
+        LOG(WARNING) << "public rebroadcast cert receive failed from=" << src << " dst=" << dst
+                     << " error=" << R.move_as_error();
+        return;
+      }
+      auto res = R.move_as_ok();
+      auto cert_r = ton::overlay::Certificate::create(res->cert_);
+      if (cert_r.is_error()) {
+        LOG(WARNING) << "public rebroadcast cert receive failed from=" << src << " dst=" << dst
+                     << " shard=" << res->workchain_ << ":" << res->shard_
+                     << " error=" << cert_r.move_as_error_prefix("invalid certificate: ");
+        return;
+      }
+      auto cert = cert_r.move_as_ok();
+      if (!cert) {
+        LOG(WARNING) << "public rebroadcast cert receive ignored empty certificate from=" << src << " dst=" << dst
+                     << " shard=" << res->workchain_ << ":" << res->shard_;
+        return;
+      }
+      ton::ShardIdFull shard{ton::WorkchainId{res->workchain_}, static_cast<ton::ShardId>(res->shard_)};
+      ton::PublicKeyHash signed_key{res->signed_key_->key_hash_};
+      LOG(INFO) << "public rebroadcast cert received from=" << src << " dst=" << dst << " shard=" << shard.to_str()
+                << " signed_key=" << signed_key << " issuer=" << cert->issuer_hash()
+                << " expire_at=" << cert->expire_at() << " max_size=" << cert->max_size()
+                << " flags=" << cert->flags();
+      td::actor::send_closure(
+          validator_engine_, &ValidatorEngine::try_import_shard_overlay_certificate, src, shard, signed_key,
+          std::move(cert), td::PromiseCreator::lambda([src, dst, shard, signed_key](td::Result<> R) {
+            if (R.is_error()) {
+              LOG(WARNING) << "public rebroadcast cert import failed from=" << src << " dst=" << dst
+                           << " shard=" << shard.to_str() << " signed_key=" << signed_key
+                           << " error=" << R.move_as_error();
+            } else {
+              LOG(INFO) << "public rebroadcast cert imported from=" << src << " dst=" << dst
+                        << " shard=" << shard.to_str() << " signed_key=" << signed_key;
+            }
+          }));
+    }
+    void receive_query(ton::adnl::AdnlNodeIdShort src, ton::adnl::AdnlNodeIdShort dst, td::BufferSlice data,
+                       td::Promise<td::BufferSlice> promise) override {
+    }
+
+   private:
+    td::actor::ActorId<ValidatorEngine> validator_engine_;
+  };
+  td::actor::send_closure(
+      adnl_.get(), &ton::adnl::Adnl::subscribe, full_node_id_,
+      ton::adnl::Adnl::int_to_bytestring(ton::ton_api::engine_validator_importShardOverlayCertificate::ID),
+      std::make_unique<Callback>(actor_id(this)));
+}
+
 void ValidatorEngine::try_import_fast_sync_member_certificate(ton::adnl::AdnlNodeIdShort id,
                                                               ton::overlay::OverlayMemberCertificate certificate,
                                                               td::Promise<> promise) {
@@ -3141,6 +3229,35 @@ void ValidatorEngine::try_import_fast_sync_member_certificate(ton::adnl::AdnlNod
   write_config(std::move(promise));
 }
 
+void ValidatorEngine::try_import_shard_overlay_certificate(ton::adnl::AdnlNodeIdShort src, ton::ShardIdFull shard,
+                                                           ton::PublicKeyHash signed_key,
+                                                           std::shared_ptr<ton::overlay::Certificate> certificate,
+                                                           td::Promise<> promise) {
+  if (!started_ || full_node_.empty()) {
+    return promise.set_error(td::Status::Error("full node is not started"));
+  }
+  if (full_node_id_.is_zero()) {
+    return promise.set_error(td::Status::Error("full node ADNL is not configured"));
+  }
+  auto expected_key = full_node_id_.pubkey_hash();
+  if (signed_key != expected_key) {
+    return promise.set_error(td::Status::Error(PSTRING() << "certificate is for unexpected key " << signed_key
+                                                         << ", expected " << expected_key));
+  }
+  if (!certificate) {
+    return promise.set_error(td::Status::Error("empty certificate"));
+  }
+  if (certificate->expire_at() < td::Clocks::system() + 60) {
+    return promise.set_error(td::Status::Error("certificate expires too soon"));
+  }
+  LOG(INFO) << "public rebroadcast cert import scheduled from=" << src << " shard=" << shard.to_str()
+            << " signed_key=" << signed_key << " issuer=" << certificate->issuer_hash()
+            << " expire_at=" << certificate->expire_at() << " max_size=" << certificate->max_size()
+            << " flags=" << certificate->flags();
+  td::actor::send_closure(full_node_, &ton::validator::fullnode::FullNode::import_shard_overlay_certificate, shard,
+                          signed_key, std::move(certificate), std::move(promise));
+}
+
 void ValidatorEngine::issue_fast_sync_overlay_certificates() {
   if (state_.is_null() || config_.fast_sync_overlay_clients.empty() || full_node_id_.is_zero()) {
     return;
@@ -3192,6 +3309,94 @@ void ValidatorEngine::issue_fast_sync_overlay_certificate(ton::PublicKeyHash iss
                                                                         std::move(res.first));
                             promise.set_value(std::move(cert));
                           });
+}
+
+std::vector<ton::ShardIdFull> ValidatorEngine::get_shards_for_overlay_certificates() {
+  std::vector<ton::ShardIdFull> res;
+  if (state_.is_null()) {
+    return res;
+  }
+  std::set<ton::ShardIdFull> all_shards;
+  all_shards.insert(ton::ShardIdFull{ton::masterchainId});
+  std::set<ton::WorkchainId> workchains;
+  int wc_monitor_min_split = state_->monitor_min_split_depth(ton::basechainId);
+  auto cut_shard = [&](ton::ShardIdFull shard) -> ton::ShardIdFull {
+    return wc_monitor_min_split < shard.pfx_len() ? shard_prefix(shard, wc_monitor_min_split) : shard;
+  };
+  for (auto &info : state_->get_shards()) {
+    workchains.insert(info->shard().workchain);
+    auto shard = cut_shard(info->shard());
+    while (true) {
+      all_shards.insert(shard);
+      if (shard.pfx_len() == 0) {
+        break;
+      }
+      shard = shard_parent(shard);
+    }
+  }
+  for (const auto &[wc, winfo] : state_->get_workchain_list()) {
+    if (!workchains.contains(wc) && winfo->active && winfo->enabled_since <= state_->get_unix_time()) {
+      all_shards.insert(ton::ShardIdFull(wc));
+    }
+  }
+  res.assign(all_shards.begin(), all_shards.end());
+  return res;
+}
+
+void ValidatorEngine::issue_shard_overlay_certificates() {
+  if (state_.is_null() || auto_sign_adnls_.empty() || full_node_.empty() || full_node_id_.is_zero()) {
+    return;
+  }
+  auto issue_by = find_local_validator_for_cert_issuing();
+  if (issue_by.is_zero()) {
+    LOG(INFO) << "public rebroadcast cert issue skipped reason=no-local-validator targets=" << auto_sign_adnls_.size();
+    return;
+  }
+  auto shards = get_shards_for_overlay_certificates();
+  if (shards.empty()) {
+    LOG(INFO) << "public rebroadcast cert issue skipped reason=no-shards targets=" << auto_sign_adnls_.size();
+    return;
+  }
+  auto src = full_node_id_;
+  auto expire_at = static_cast<td::uint32>(td::Clocks::system() + 3600);
+  auto max_size = ton::overlay::Overlays::max_fec_broadcast_size();
+  LOG(INFO) << "public rebroadcast cert issue scan issuer=" << issue_by << " targets=" << auto_sign_adnls_.size()
+            << " shards=" << shards.size() << " expire_at=" << expire_at << " max_size=" << max_size;
+  for (auto target : auto_sign_adnls_) {
+    auto signed_key = target.pubkey_hash();
+    for (auto shard : shards) {
+      td::actor::send_closure(
+          full_node_, &ton::validator::fullnode::FullNode::sign_shard_overlay_certificate, shard, signed_key, expire_at,
+          max_size,
+          [src, target, shard, signed_key, issue_by, expire_at, max_size,
+           adnl = adnl_.get()](td::Result<td::BufferSlice> R) mutable {
+            if (R.is_error()) {
+              LOG(WARNING) << "public rebroadcast cert issue failed target=" << target
+                           << " signed_key=" << signed_key << " shard=" << shard.to_str()
+                           << " issuer=" << issue_by << " error=" << R.move_as_error();
+              return;
+            }
+            auto data = R.move_as_ok();
+            auto cert_r = ton::fetch_tl_object<ton::ton_api::overlay_Certificate>(std::move(data), true);
+            if (cert_r.is_error()) {
+              LOG(WARNING) << "public rebroadcast cert issue failed target=" << target
+                           << " signed_key=" << signed_key << " shard=" << shard.to_str()
+                           << " issuer=" << issue_by
+                           << " error=" << cert_r.move_as_error_prefix("failed to parse signed certificate: ");
+              return;
+            }
+            LOG(INFO) << "public rebroadcast cert issued target=" << target << " signed_key=" << signed_key
+                      << " shard=" << shard.to_str() << " issuer=" << issue_by << " expire_at=" << expire_at
+                      << " max_size=" << max_size;
+            td::actor::send_closure(
+                adnl, &ton::adnl::Adnl::send_message, src, target,
+                ton::create_serialize_tl_object<ton::ton_api::engine_validator_importShardOverlayCertificate>(
+                    shard.workchain, static_cast<td::int64>(shard.shard),
+                    ton::create_tl_object<ton::ton_api::engine_validator_keyHash>(signed_key.bits256_value()),
+                    cert_r.move_as_ok()));
+          });
+    }
+  }
 }
 
 ton::PublicKeyHash ValidatorEngine::find_local_validator_for_cert_issuing() {
@@ -6016,6 +6221,15 @@ int main(int argc, char *argv[]) {
                "rebroadcast blocks received via network download into public overlays", [&]() {
                  acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::enable_rebroadcast_downloaded_block); });
                });
+  p.add_checked_option('\0', "auto-sign",
+                       "validator-side: ADNL id (hex) to receive public shard overlay broadcast certificates",
+                       [&](td::Slice s) -> td::Status {
+                         TRY_RESULT(id, parse_adnl_id_hex(s));
+                         acts.push_back([&x, id]() {
+                           td::actor::send_closure(x, &ValidatorEngine::add_auto_sign_adnl, id);
+                         });
+                         return td::Status::OK();
+                       });
   p.add_checked_option('\0', "rebroadcast-workchains",
                        "comma-separated workchains for public rebroadcast (-1 for masterchain, 0 for basechain)",
                        [&](td::Slice s) -> td::Status {

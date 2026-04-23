@@ -779,7 +779,11 @@ void FullNodeImpl::update_validator_telemetry_collector() {
 }
 
 void FullNodeImpl::start_up() {
-  update_shard_actor(ShardIdFull{masterchainId}, true);
+  if (opts_.use_adnl_id_as_broadcast_source_ && !adnl_id_.is_zero()) {
+    local_id_ = adnl_id_.pubkey_hash();
+    LOG(INFO) << "using full node ADNL as public broadcast source local_id=" << local_id_
+              << " adnl_id=" << adnl_id_;
+  }
   if (local_id_.is_zero()) {
     if (adnl_id_.is_zero()) {
       auto pk = ton::PrivateKey{ton::privkeys::Ed25519::random()};
@@ -790,6 +794,7 @@ void FullNodeImpl::start_up() {
       local_id_ = adnl_id_.pubkey_hash();
     }
   }
+  update_shard_actor(ShardIdFull{masterchainId}, true);
   class Callback : public ValidatorManagerInterface::Callback {
    public:
     void initial_read_complete(BlockHandle handle) override {

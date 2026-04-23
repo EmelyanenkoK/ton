@@ -84,6 +84,7 @@ struct FullNodeOptions {
   double initial_sync_delay_ = 60.0;
   double ratelimit_window_size_ = 1.0;
   size_t ratelimit_global_ = 96, ratelimit_heavy_ = 64, ratelimit_medium_ = 72;
+  bool use_adnl_id_as_broadcast_source_ = false;
   RebroadcastFromCustomOptions rebroadcast_from_custom_;
   ForceDownloadOptions force_download_;
 };

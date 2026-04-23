@@ -175,6 +175,15 @@ class Certificate {
   const PublicKey &issuer() const;
   const PublicKeyHash issuer_hash() const;
   const td::SharedSlice &signature() const;
+  td::int32 expire_at() const {
+    return expire_at_;
+  }
+  td::uint32 max_size() const {
+    return max_size_;
+  }
+  td::uint32 flags() const {
+    return flags_;
+  }
 
   static td::Result<std::shared_ptr<Certificate>> create(const tl_object_ptr<ton_api::overlay_Certificate> &cert);
   static tl_object_ptr<ton_api::overlay_Certificate> empty_tl();

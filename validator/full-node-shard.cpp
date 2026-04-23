@@ -48,6 +48,7 @@
 #include "overlays.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace ton {
 
@@ -1395,10 +1396,18 @@ void FullNodeShardImpl::send_block_candidate_with_fanout(BlockIdExt block_id, Ca
     auto force_peers = choose_force_good_peers(fanout_override);
     auto force_good_selected = force_peers.size();
     auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
+    bool cert_attached = cert_ && payload_size <= std::numeric_limits<td::uint32>::max() &&
+                         cert_->check(local_id_, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
+                                      static_cast<td::uint32>(payload_size), true,
+                                      /* skip_check_signature = */ true) != overlay::BroadcastCheckResult::Forbidden;
     LOG(INFO) << "public rebroadcast dispatch type=candidate block=" << block_id.to_str()
               << " shard=" << shard_.to_str() << " fanout_target=" << fanout_override
               << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
-              << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size;
+              << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size
+              << " cert_attached=" << cert_attached
+              << " cert_issuer=" << (cert_ ? cert_->issuer_hash() : PublicKeyHash::zero())
+              << " cert_expire_at=" << (cert_ ? cert_->expire_at() : 0)
+              << " cert_flags=" << (cert_ ? cert_->flags() : 0);
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
                             local_id_, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
                             fanout_override, std::move(force_peers));
@@ -1430,10 +1439,18 @@ void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td:
     auto force_peers = choose_force_good_peers(fanout_override);
     auto force_good_selected = force_peers.size();
     auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
+    bool cert_attached = cert_ && payload_size <= std::numeric_limits<td::uint32>::max() &&
+                         cert_->check(local_id_, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
+                                      static_cast<td::uint32>(payload_size), true,
+                                      /* skip_check_signature = */ true) != overlay::BroadcastCheckResult::Forbidden;
     LOG(INFO) << "public rebroadcast dispatch type=block block=" << broadcast.block_id.to_str()
               << " shard=" << shard_.to_str() << " fanout_target=" << fanout_override
               << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
-              << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size;
+              << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size
+              << " cert_attached=" << cert_attached
+              << " cert_issuer=" << (cert_ ? cert_->issuer_hash() : PublicKeyHash::zero())
+              << " cert_expire_at=" << (cert_ ? cert_->expire_at() : 0)
+              << " cert_flags=" << (cert_ ? cert_->flags() : 0);
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
                             local_id_, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
                             fanout_override, std::move(force_peers));
@@ -1717,6 +1734,23 @@ void FullNodeShardImpl::sign_overlay_certificate(PublicKeyHash signed_key, td::u
 void FullNodeShardImpl::import_overlay_certificate(PublicKeyHash signed_key,
                                                    std::shared_ptr<ton::overlay::Certificate> cert,
                                                    td::Promise<td::Unit> promise) {
+  if (!cert) {
+    promise.set_error(td::Status::Error("empty certificate"));
+    return;
+  }
+  auto check = cert->check(signed_key, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
+                           overlay::Overlays::max_fec_broadcast_size(), true);
+  if (check == overlay::BroadcastCheckResult::Forbidden) {
+    promise.set_error(td::Status::Error("certificate is not valid for this shard overlay"));
+    return;
+  }
+  LOG(INFO) << "public rebroadcast cert accepted shard=" << shard_.to_str() << " signed_key=" << signed_key
+            << " local_id=" << local_id_ << " issuer=" << cert->issuer_hash() << " expire_at=" << cert->expire_at()
+            << " max_size=" << cert->max_size() << " flags=" << cert->flags()
+            << " usable_for_local_source=" << (signed_key == local_id_);
+  if (signed_key == local_id_) {
+    cert_ = cert;
+  }
   td::actor::send_closure(overlays_, &ton::overlay::Overlays::update_certificate, adnl_id_, overlay_id_, signed_key,
                           cert);
   promise.set_value(td::Unit());

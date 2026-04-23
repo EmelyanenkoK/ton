@@ -540,6 +540,15 @@ void OverlayImpl::send_broadcast_fec_with_fanout(PublicKeyHash send_as, td::uint
     return;
   }
   if (!has_valid_broadcast_certificate(send_as, data.size(), true)) {
+    if (fanout_override != 0) {
+      auto cert = get_certificate(send_as);
+      LOG(WARNING) << "public rebroadcast fec blocked reason=invalid-broadcast-certificate source=" << send_as
+                   << " fanout_target=" << fanout_override << " payload_bytes=" << data.size()
+                   << " cert_attached=" << (cert != nullptr)
+                   << " cert_issuer=" << (cert ? cert->issuer_hash() : PublicKeyHash::zero())
+                   << " cert_expire_at=" << (cert ? cert->expire_at() : 0)
+                   << " cert_flags=" << (cert ? cert->flags() : 0);
+    }
     VLOG(OVERLAY_WARNING) << "broadcast source certificate is invalid";
     return;
   }
