@@ -133,7 +133,7 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
         });
     td::actor::send_closure(client_, &http::HttpClient::send_request, std::move(request),
                             std::make_shared<http::HttpPayload>(http::HttpPayload::PayloadType::pt_empty),
-                            td::Timestamp::in(10.0), std::move(promise));
+                            td::Timestamp::in(60.0), std::move(promise));
   }
 
   void got_response(
