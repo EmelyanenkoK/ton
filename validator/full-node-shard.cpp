@@ -400,10 +400,33 @@ bool FullNodeShardImpl::uses_force_good_peers() const {
          (opts_.rebroadcast_from_custom_.candidates_enabled_ || downloaded_enabled);
 }
 
+std::string FullNodeShardImpl::rebroadcast_workchains_to_string() const {
+  std::string result;
+  for (auto workchain : opts_.rebroadcast_from_custom_.allowed_workchains_) {
+    if (!result.empty()) {
+      result += ",";
+    }
+    result += td::to_string(workchain);
+  }
+  return result;
+}
+
 void FullNodeShardImpl::refresh_force_good_peers() {
-  if (!uses_force_good_peers() || force_good_peers_refresh_active_) {
+  if (!uses_force_good_peers()) {
+    LOG(INFO) << "force-good-peers refresh skipped shard=" << shard_.to_str() << " reason=disabled url_empty="
+              << opts_.rebroadcast_from_custom_.force_good_peers_url_.empty()
+              << " custom_enabled=" << opts_.rebroadcast_from_custom_.enabled_
+              << " candidates_enabled=" << opts_.rebroadcast_from_custom_.candidates_enabled_
+              << " downloaded_enabled=" << opts_.force_download_.rebroadcast_downloaded_block_
+              << " allowed_workchains=" << rebroadcast_workchains_to_string();
     return;
   }
+  if (force_good_peers_refresh_active_) {
+    LOG(INFO) << "force-good-peers refresh skipped shard=" << shard_.to_str() << " reason=already-active";
+    return;
+  }
+  LOG(INFO) << "force-good-peers refresh start shard=" << shard_.to_str()
+            << " url=" << opts_.rebroadcast_from_custom_.force_good_peers_url_;
   force_good_peers_refresh_active_ = true;
   refresh_force_good_peers_at_ = td::Timestamp::never();
   td::actor::create_actor<ForceGoodPeersFetcher>("forcegoodpeers", opts_.rebroadcast_from_custom_.force_good_peers_url_,
@@ -1609,7 +1632,14 @@ void FullNodeShardImpl::start_up() {
     reload_neighbours_at_ = td::Timestamp::now();
     ping_neighbours_at_ = td::Timestamp::now();
     cleanup_processed_ext_msg_at_ = td::Timestamp::now();
-    if (uses_force_good_peers()) {
+    auto force_good_enabled = uses_force_good_peers();
+    LOG(INFO) << "force-good-peers startup shard=" << shard_.to_str() << " enabled=" << force_good_enabled
+              << " url_empty=" << opts_.rebroadcast_from_custom_.force_good_peers_url_.empty()
+              << " custom_enabled=" << opts_.rebroadcast_from_custom_.enabled_
+              << " candidates_enabled=" << opts_.rebroadcast_from_custom_.candidates_enabled_
+              << " downloaded_enabled=" << opts_.force_download_.rebroadcast_downloaded_block_
+              << " allowed_workchains=" << rebroadcast_workchains_to_string();
+    if (force_good_enabled) {
       refresh_force_good_peers_at_ = td::Timestamp::now();
     }
     alarm_timestamp().relax(td::Timestamp::now());

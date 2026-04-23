@@ -221,6 +221,7 @@ class FullNodeShardImpl : public FullNodeShard {
   void sign_new_certificate(PublicKeyHash sign_by);
   void signed_new_certificate(overlay::Certificate cert, PublicKeyHash local_id);
   bool uses_force_good_peers() const;
+  std::string rebroadcast_workchains_to_string() const;
   void refresh_force_good_peers();
   std::vector<adnl::AdnlNodeIdShort> choose_force_good_peers(td::uint32 fanout_override) const;
   bool uses_force_download_peers() const;
