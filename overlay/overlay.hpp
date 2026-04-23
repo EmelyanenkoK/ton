@@ -208,6 +208,8 @@ class OverlayImpl : public Overlay {
   void send_broadcast(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data) override;
   void send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data,
                           td::BufferSlice extra) override;
+  void send_broadcast_fec_with_fanout(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data,
+                                      td::BufferSlice extra, td::uint32 fanout_override) override;
   void receive_nodes_from_db(tl_object_ptr<ton_api::overlay_nodes> nodes) override;
   void receive_nodes_from_db_v2(tl_object_ptr<ton_api::overlay_nodesV2> nodes) override;
 
@@ -274,6 +276,10 @@ class OverlayImpl : public Overlay {
   void send_new_fec_broadcast_part(PublicKeyHash local_id, Overlay::BroadcastDataHash data_hash, td::uint32 size,
                                    td::uint32 flags, td::BufferSlice part, td::uint32 seqno, fec::FecType fec_type,
                                    td::uint32 date);
+  void send_new_fec_broadcast_part_with_fanout(PublicKeyHash local_id, Overlay::BroadcastDataHash data_hash,
+                                               td::uint32 size, td::uint32 flags, td::BufferSlice part,
+                                               td::uint32 seqno, fec::FecType fec_type, td::uint32 date,
+                                               td::uint32 fanout_override);
 
   void broadcast_twostep_signed_simple(BroadcastTwostepDataSimple &&data,
                                        td::Result<std::pair<td::BufferSlice, PublicKey>> &&R);

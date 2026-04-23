@@ -42,6 +42,8 @@
 #include "full-node-shard.hpp"
 #include "overlays.h"
 
+#include <algorithm>
+
 namespace ton {
 
 namespace validator {
@@ -131,6 +133,18 @@ void FullNodeShardImpl::create_overlay() {
   opts.name_ = "shard" + shard_.to_str();
   opts.announce_self_ = active_;
   opts.broadcast_speed_multiplier_ = opts_.public_broadcast_speed_multiplier_;
+  bool enlarge_neighbour_pool = opts_.rebroadcast_from_custom_.allows_workchain(shard_.workchain);
+  if (!enlarge_neighbour_pool && shard_.is_masterchain() && opts_.rebroadcast_from_custom_.enabled_ &&
+      opts_.rebroadcast_from_custom_.candidates_enabled_ &&
+      !opts_.rebroadcast_from_custom_.allowed_workchains_.empty()) {
+    // Public candidate broadcasts are sent through the masterchain overlay even for basechain blocks.
+    enlarge_neighbour_pool = true;
+  }
+  if (enlarge_neighbour_pool) {
+    opts.max_neighbours_ = opts_.rebroadcast_from_custom_.peer_target_;
+    opts.max_peers_ = std::max<td::uint32>(20, opts_.rebroadcast_from_custom_.peer_target_ * 4);
+    opts.nodes_to_send_ = std::max<td::uint32>(4, std::min<td::uint32>(32, opts_.rebroadcast_from_custom_.peer_target_));
+  }
   td::actor::send_closure(overlays_, &overlay::Overlays::create_public_overlay_ex, adnl_id_, overlay_id_full_.clone(),
                           std::make_unique<Callback>(actor_id(this)), rules_,
                           PSTRING() << "{ \"type\": \"shard\", \"shard_id\": " << get_shard()
@@ -981,6 +995,12 @@ void FullNodeShardImpl::send_shard_block_info(BlockIdExt block_id, CatchainSeqno
 
 void FullNodeShardImpl::send_block_candidate(BlockIdExt block_id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                              td::BufferSlice data) {
+  send_block_candidate_with_fanout(block_id, cc_seqno, validator_set_hash, std::move(data), 0);
+}
+
+void FullNodeShardImpl::send_block_candidate_with_fanout(BlockIdExt block_id, CatchainSeqno cc_seqno,
+                                                         td::uint32 validator_set_hash, td::BufferSlice data,
+                                                         td::uint32 fanout_override) {
   if (!client_.empty()) {
     UNREACHABLE();
     return;
@@ -992,11 +1012,21 @@ void FullNodeShardImpl::send_block_candidate(BlockIdExt block_id, CatchainSeqno 
     return;
   }
   VLOG(FULL_NODE_DEBUG) << "Sending newBlockCandidate: " << block_id.to_str();
-  td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
-                          overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+  if (fanout_override == 0) {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
+                            overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+  } else {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
+                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok(),
+                            fanout_override);
+  }
 }
 
 void FullNodeShardImpl::send_broadcast(BlockBroadcast broadcast) {
+  send_broadcast_with_fanout(std::move(broadcast), 0);
+}
+
+void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td::uint32 fanout_override) {
   if (!client_.empty()) {
     UNREACHABLE();
     return;
@@ -1007,8 +1037,14 @@ void FullNodeShardImpl::send_broadcast(BlockBroadcast broadcast) {
     VLOG(FULL_NODE_WARNING) << "failed to serialize block broadcast: " << B.move_as_error();
     return;
   }
-  td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
-                          overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+  if (fanout_override == 0) {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
+                            overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
+  } else {
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
+                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok(),
+                            fanout_override);
+  }
 }
 
 void FullNodeShardImpl::download_block(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,

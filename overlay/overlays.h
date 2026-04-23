@@ -403,6 +403,9 @@ class Overlays : public td::actor::Actor {
   virtual void send_broadcast_fec(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id, td::BufferSlice object) = 0;
   virtual void send_broadcast_fec_ex(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id, PublicKeyHash send_as,
                                      td::uint32 flags, td::BufferSlice object) = 0;
+  virtual void send_broadcast_fec_ex_with_fanout(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id,
+                                                 PublicKeyHash send_as, td::uint32 flags, td::BufferSlice object,
+                                                 td::uint32 fanout_override) = 0;
   virtual void send_broadcast_fec_with_extra(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id,
                                              PublicKeyHash send_as, td::uint32 flags, td::BufferSlice object,
                                              td::BufferSlice extra) = 0;

@@ -268,11 +268,13 @@ class ValidatorEngine : public td::actor::Actor {
   bool shard_block_retainer_adnl_id_fullnode_ = false;
   bool parallel_validation_ = false;
   std::string db_event_fifo_path_;
+  bool rebroadcast_from_custom_peer_target_explicit_ = false;
   ton::validator::fullnode::FullNodeOptions full_node_options_ = {.config_ = {},
                                                                   .public_broadcast_speed_multiplier_ = 3.33,
                                                                   .private_broadcast_speed_multiplier_ = 3.33,
                                                                   .fast_sync_broadcast_speed_multiplier_ = 3.33,
-                                                                  .initial_sync_delay_ = 60.0};
+                                                                  .initial_sync_delay_ = 60.0,
+                                                                  .rebroadcast_from_custom_ = {}};
 
   std::set<ton::CatchainSeqno> unsafe_catchains_;
   std::map<ton::BlockSeqno, std::pair<ton::CatchainSeqno, td::uint32>> unsafe_catchain_rotations_;
@@ -425,9 +427,26 @@ class ValidatorEngine : public td::actor::Actor {
   void set_ratelimit_medium(size_t count) {
     full_node_options_.ratelimit_medium_ = count;
   }
+  void enable_rebroadcast_from_custom() {
+    full_node_options_.rebroadcast_from_custom_.enabled_ = true;
+  }
+  void enable_rebroadcast_candidates_from_custom() {
+    full_node_options_.rebroadcast_from_custom_.candidates_enabled_ = true;
+  }
+  void enable_rebroadcast_candidate_block_dedup() {
+    full_node_options_.rebroadcast_from_custom_.candidate_block_dedup_enabled_ = true;
+  }
+  void set_rebroadcast_from_custom_peer_target(td::uint32 count) {
+    rebroadcast_from_custom_peer_target_explicit_ = true;
+    full_node_options_.rebroadcast_from_custom_.peer_target_ = count;
+  }
+  void add_rebroadcast_from_custom_workchain(ton::WorkchainId workchain) {
+    full_node_options_.rebroadcast_from_custom_.allowed_workchains_.insert(workchain);
+  }
   void set_quic_options(ton::quic::QuicServer::Options options) {
     quic_options_ = std::move(options);
   }
+  td::Status validate_rebroadcast_from_custom_options() const;
 
   void start_up() override;
   ValidatorEngine() {

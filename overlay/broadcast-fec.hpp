@@ -40,9 +40,10 @@ class BroadcastsFec {
   BroadcastsFec();
   ~BroadcastsFec();
   void send(OverlayImpl *overlay, PublicKeyHash send_as, td::BufferSlice data, td::uint32 flags,
-            double speed_multiplier);
+            double speed_multiplier, td::uint32 fanout_override);
   void send_part(OverlayImpl *overlay, PublicKeyHash send_as, Overlay::BroadcastDataHash data_hash, td::uint32 size,
-                 td::uint32 flags, td::BufferSlice part, td::uint32 seqno, fec::FecType fec_type, td::uint32 date);
+                 td::uint32 flags, td::BufferSlice part, td::uint32 seqno, fec::FecType fec_type, td::uint32 date,
+                 td::uint32 fanout_override);
   void signed_(OverlayImpl *overlay, std::unique_ptr<BroadcastFecPart> &&part,
                td::Result<std::pair<td::BufferSlice, PublicKey>> &&R);
   td::Status process_broadcast(OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id,

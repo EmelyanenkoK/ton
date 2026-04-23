@@ -48,6 +48,7 @@
 #include "td/utils/TsFileLog.h"
 #include "td/utils/buffer.h"
 #include "td/utils/filesystem.h"
+#include "td/utils/misc.h"
 #include "td/utils/overloaded.h"
 #include "td/utils/port/path.h"
 #include "td/utils/port/rlimit.h"
@@ -1432,6 +1433,41 @@ void ValidatorEngine::set_global_config(std::string str) {
 }
 void ValidatorEngine::set_db_root(std::string db_root) {
   db_root_ = db_root;
+}
+td::Status ValidatorEngine::validate_rebroadcast_from_custom_options() const {
+  const auto &opts = full_node_options_.rebroadcast_from_custom_;
+  if (!opts.enabled_) {
+    if (opts.candidates_enabled_) {
+      return td::Status::Error("--rebroadcast-candidates-from-custom requires --rebroadcast-from-custom");
+    }
+    if (opts.candidate_block_dedup_enabled_) {
+      return td::Status::Error("--broadcast-candidate-block-dedup requires --rebroadcast-from-custom");
+    }
+    if (!opts.allowed_workchains_.empty()) {
+      return td::Status::Error("--rebroadcast-workchains requires --rebroadcast-from-custom");
+    }
+    if (rebroadcast_from_custom_peer_target_explicit_) {
+      return td::Status::Error("--rebroadcast-peers requires --rebroadcast-from-custom");
+    }
+    return td::Status::OK();
+  }
+
+  if (opts.allowed_workchains_.empty()) {
+    return td::Status::Error("--rebroadcast-from-custom requires --rebroadcast-workchains");
+  }
+  if (opts.candidate_block_dedup_enabled_ && !opts.candidates_enabled_) {
+    return td::Status::Error("--broadcast-candidate-block-dedup requires --rebroadcast-candidates-from-custom");
+  }
+  if (opts.peer_target_ == 0) {
+    return td::Status::Error("--rebroadcast-peers should be positive");
+  }
+  for (auto workchain : opts.allowed_workchains_) {
+    if (workchain != ton::masterchainId && workchain != ton::basechainId) {
+      return td::Status::Error(PSTRING() << "unsupported rebroadcast workchain " << workchain
+                                         << ", only -1 and 0 are supported");
+    }
+  }
+  return td::Status::OK();
 }
 void ValidatorEngine::schedule_shutdown(double at) {
   td::Timestamp ts = td::Timestamp::at_unix(at);
@@ -5359,6 +5395,12 @@ void ValidatorEngine::process_control_query(td::uint16 port, ton::adnl::AdnlNode
 }
 
 void ValidatorEngine::run() {
+  auto rebroadcast_options_status = validate_rebroadcast_from_custom_options();
+  if (rebroadcast_options_status.is_error()) {
+    LOG(ERROR) << "invalid custom rebroadcast options: " << rebroadcast_options_status.move_as_error();
+    std::_Exit(2);
+  }
+
   td::mkdir(db_root_).ensure();
   ton::errorlog::ErrorLog::create(db_root_);
 
@@ -5856,6 +5898,57 @@ int main(int argc, char *argv[]) {
         acts.push_back([&x, v]() { td::actor::send_closure(x, &ValidatorEngine::set_ratelimit_medium, v); });
         return td::Status::OK();
       });
+  p.add_option('\0', "rebroadcast-from-custom",
+               "rebroadcast block broadcasts received from custom overlays into public overlays", [&]() {
+                 acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::enable_rebroadcast_from_custom); });
+               });
+  p.add_option('\0', "rebroadcast-candidates-from-custom",
+               "also rebroadcast block candidates received from custom overlays into public overlays", [&]() {
+                 acts.push_back([&x]() {
+                   td::actor::send_closure(x, &ValidatorEngine::enable_rebroadcast_candidates_from_custom);
+                 });
+               });
+  p.add_option('\0', "broadcast-candidate-block-dedup",
+               "suppress public block rebroadcast if the same block candidate was already rebroadcast from custom",
+               [&]() {
+                 acts.push_back([&x]() {
+                   td::actor::send_closure(x, &ValidatorEngine::enable_rebroadcast_candidate_block_dedup);
+                 });
+               });
+  p.add_checked_option('\0', "rebroadcast-peers",
+                       "fanout target for rebroadcasts from custom overlays into public overlays (default: 100)",
+                       [&](td::Slice s) -> td::Status {
+                         TRY_RESULT(v, td::to_integer_safe<td::uint32>(s));
+                         if (v == 0) {
+                           return td::Status::Error("rebroadcast-peers should be positive");
+                         }
+                         acts.push_back([&x, v]() {
+                           td::actor::send_closure(x, &ValidatorEngine::set_rebroadcast_from_custom_peer_target, v);
+                         });
+                         return td::Status::OK();
+                       });
+  p.add_checked_option('\0', "rebroadcast-workchains",
+                       "comma-separated workchains to rebroadcast from custom overlays (-1 for masterchain, 0 for basechain)",
+                       [&](td::Slice s) -> td::Status {
+                         auto workchains = td::full_split(s, ',');
+                         if (workchains.empty()) {
+                           return td::Status::Error("rebroadcast-workchains should not be empty");
+                         }
+                         for (auto workchain_slice : workchains) {
+                           if (workchain_slice.empty()) {
+                             return td::Status::Error("rebroadcast-workchains contains an empty workchain id");
+                           }
+                           TRY_RESULT(workchain, td::to_integer_safe<ton::WorkchainId>(workchain_slice));
+                           if (workchain != ton::masterchainId && workchain != ton::basechainId) {
+                             return td::Status::Error("rebroadcast-workchains supports only -1 and 0");
+                           }
+                           acts.push_back([&x, workchain]() {
+                             td::actor::send_closure(x, &ValidatorEngine::add_rebroadcast_from_custom_workchain,
+                                                     workchain);
+                           });
+                         }
+                         return td::Status::OK();
+                       });
   p.add_checked_option(
       '\0', "sync-shards-upto", "stop syncing shards on this masterchain seqno", [&](td::Slice s) -> td::Status {
         TRY_RESULT(v, td::to_integer_safe<ton::BlockSeqno>(s));
