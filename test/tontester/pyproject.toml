@@ -4,10 +4,16 @@ version = "0.1.0"
 requires-python = ">=3.14"
 dependencies = [
     "dash",
+    "fastapi",
     "plotly",
+    "pydantic>=2",
     "pytoniq-core",
-    "watchfiles",
+    "pyyaml",
+    "types-pyyaml",
+    "uvicorn",
+    "watchfiles>=1.1.1",
 ]
 
 [project.scripts]
 consensus_explorer = "consensus_explorer.explorer:_main"
+daemon = "daemon.cli:main"

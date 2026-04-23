@@ -125,11 +125,12 @@ class FullNode : public td::actor::Actor {
   virtual void add_custom_overlay(CustomOverlayParams params, td::Promise<td::Unit> promise) = 0;
   virtual void del_custom_overlay(std::string name, td::Promise<td::Unit> promise) = 0;
 
-  virtual void process_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) = 0;
+  virtual void process_block_broadcast(BlockBroadcast broadcast, bool signatures_checked, BroadcastSource source) = 0;
   virtual void process_custom_overlay_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) = 0;
   virtual void process_downloaded_block_for_rebroadcast(DownloadedBlock block) = 0;
   virtual void process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
-                                                 td::uint32 validator_set_hash, td::BufferSlice data) = 0;
+                                                 td::uint32 validator_set_hash, td::BufferSlice data,
+                                                 BroadcastSource source) = 0;
   virtual void process_custom_overlay_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                                 td::uint32 validator_set_hash,
                                                                 td::BufferSlice data) = 0;

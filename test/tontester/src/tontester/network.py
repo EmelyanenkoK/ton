@@ -5,6 +5,7 @@ import shlex
 import signal
 import subprocess
 import types
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import IntEnum, auto
@@ -12,6 +13,8 @@ from ipaddress import IPv4Address
 from pathlib import Path
 from typing import Literal, final, override
 
+from daemon.ipc import IPCClient, RegisterResponse
+from daemon.storage import NodeTarget, TestMetadata
 from tonapi import ton_api
 
 from tl import TLObject
@@ -237,6 +240,11 @@ class Network:
         install: Install,
         directory: Path,
         event_loop: asyncio.AbstractEventLoop | None = None,
+        *,
+        enable_dashboard: bool = False,
+        dashboard_socket: Path | None = None,
+        description: str = "",
+        run_id: str | None = None,
     ):
         self._install = install
         self._directory = directory.absolute()
@@ -251,6 +259,16 @@ class Network:
         self.__full_nodes: list[FullNode] = []
         self.__network_config: NetworkConfig = NetworkConfig()
         self.__zerostate: Zerostate | None = None
+
+        self._enable_dashboard: bool = enable_dashboard
+        self._dashboard_socket: Path = (
+            dashboard_socket
+            or Path(__file__).resolve().parents[3] / "integration/.dashboard/daemon.sock"
+        )
+        self._dashboard_description: str = description
+        self._dashboard_run_id: str = run_id or uuid.uuid4().hex[:12]
+        self._dashboard_client: IPCClient | None = None
+        self._dashboard_response: RegisterResponse | None = None
 
     @property
     def zerostate(self) -> Zerostate:
@@ -314,12 +332,77 @@ class Network:
     async def __aenter__(self):
         return self
 
+    async def _git_metadata(self) -> tuple[str, str]:
+        async def run(args: list[str]) -> str:
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                cwd=self._directory,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await process.communicate()
+            if process.returncode != 0:
+                return ""
+            return stdout.decode().strip()
+
+        branch = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        commit = await run(["git", "rev-parse", "HEAD"])
+        return branch, commit
+
+    async def register_with_dashboard(self) -> RegisterResponse | None:
+        """Register the currently-started full nodes with the tontester daemon.
+
+        Safe to call once after all nodes are launched. Returns the daemon response (with Grafana
+        and Prometheus URLs) or ``None`` if the daemon is not reachable.
+        """
+        if not self._enable_dashboard:
+            return None
+        if self._dashboard_client is not None:
+            return self._dashboard_response
+        if not self._dashboard_socket.exists():
+            l.warning(
+                (
+                    f"Dashboard enabled but no daemon socket at {self._dashboard_socket}; "
+                    "skipping registration"
+                )
+            )
+            return None
+
+        branch, commit = await self._git_metadata()
+        metadata = TestMetadata(
+            description=self._dashboard_description,
+            git_branch=branch,
+            git_commit_id=commit,
+            nodes=[
+                NodeTarget(name=node.name, address=node.metrics_address_for_scraping)
+                for node in self.__full_nodes
+            ],
+        )
+
+        client = IPCClient(self._dashboard_socket)
+        response = await client.connect_and_register(self._dashboard_run_id, metadata)
+        self._dashboard_client = client
+        self._dashboard_response = response
+        l.info(
+            (
+                f"Registered run {response.run_id} with tontester daemon "
+                f"(prometheus={response.prometheus_url}, grafana={response.grafana_url})"
+            )
+        )
+        return response
+
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: types.TracebackType | None,
     ) -> bool | None:
+        if self._dashboard_client is not None:
+            try:
+                await self._dashboard_client.disconnect()
+            except Exception:
+                pass
+            self._dashboard_client = None
         await asyncio.shield(self.aclose())
 
     async def wait_mc_block(self, seqno: int):
@@ -446,6 +529,11 @@ class FullNode(Network.Node):
         self._addr = self._new_network_address()
         self._liteserver_addr = self._new_network_address()
         self._engine_console_addr = self._new_network_address()
+        # Bind exporter on all interfaces so prometheus running in a container can reach it via
+        # host.containers.internal.
+        self._exporter_addr = _IPv4AddressAndPort(
+            IPv4Address("0.0.0.0"), self._new_network_address().port
+        )
 
         self._fullnode_key, _ = self._new_key()
         self._validator_key, _ = self._new_key()
@@ -526,6 +614,15 @@ class FullNode(Network.Node):
         return self._is_initial_validator
 
     @property
+    def metrics_port(self) -> int:
+        return self._exporter_addr.port
+
+    @property
+    def metrics_address_for_scraping(self) -> str:
+        """Reachable from a prometheus container via podman's host-gateway alias."""
+        return f"host.containers.internal:{self._exporter_addr.port}"
+
+    @property
     def validator_key(self):
         return self._validator_key
 
@@ -551,6 +648,8 @@ class FullNode(Network.Node):
                 str(self.session_log_path),
                 "--quic-flood-control",
                 "-1",
+                "--exporter-address",
+                self._exporter_addr.address,
             ],
             debug=debug,
         )
