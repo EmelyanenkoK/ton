@@ -528,11 +528,12 @@ void OverlayImpl::send_broadcast(PublicKeyHash send_as, td::uint32 flags, td::Bu
 
 void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data,
                                      td::BufferSlice extra) {
-  send_broadcast_fec_with_fanout(send_as, flags, std::move(data), std::move(extra), 0);
+  send_broadcast_fec_with_fanout(send_as, flags, std::move(data), std::move(extra), 0, {});
 }
 
 void OverlayImpl::send_broadcast_fec_with_fanout(PublicKeyHash send_as, td::uint32 flags, td::BufferSlice data,
-                                                 td::BufferSlice extra, td::uint32 fanout_override) {
+                                                 td::BufferSlice extra, td::uint32 fanout_override,
+                                                 std::vector<adnl::AdnlNodeIdShort> force_peers) {
   if (!has_valid_membership_certificate()) {
     VLOG(OVERLAY_WARNING) << "member certificate is invalid, valid_until="
                           << peer_list_.local_cert_is_valid_until_.at_unix();
@@ -544,13 +545,14 @@ void OverlayImpl::send_broadcast_fec_with_fanout(PublicKeyHash send_as, td::uint
   }
   bool no_twostep = flags & Overlays::BroadcastFlagNoTwostep();
   flags &= ~Overlays::BroadcastFlagNoTwostep();
-  if (opts_.send_twostep_broadcast_ && !no_twostep && fanout_override == 0) {
+  if (opts_.send_twostep_broadcast_ && !no_twostep && fanout_override == 0 && force_peers.empty()) {
     broadcasts_twostep_.send(this, send_as, std::move(data), std::move(extra), flags);
   } else {
     if (!extra.empty()) {
       LOG(WARNING) << "Broadcast extra for old fec broadcast is not supported";
     }
-    broadcasts_fec_.send(this, send_as, std::move(data), flags, opts_.broadcast_speed_multiplier_, fanout_override);
+    broadcasts_fec_.send(this, send_as, std::move(data), flags, opts_.broadcast_speed_multiplier_, fanout_override,
+                         std::move(force_peers));
   }
 }
 
@@ -643,15 +645,16 @@ void OverlayImpl::send_new_fec_broadcast_part(PublicKeyHash local_id, Overlay::B
                                               td::uint32 size, td::uint32 flags, td::BufferSlice part, td::uint32 seqno,
                                               fec::FecType fec_type, td::uint32 date) {
   send_new_fec_broadcast_part_with_fanout(local_id, data_hash, size, flags, std::move(part), seqno,
-                                          std::move(fec_type), date, 0);
+                                          std::move(fec_type), date, 0, {});
 }
 
 void OverlayImpl::send_new_fec_broadcast_part_with_fanout(PublicKeyHash local_id, Overlay::BroadcastDataHash data_hash,
                                                           td::uint32 size, td::uint32 flags, td::BufferSlice part,
                                                           td::uint32 seqno, fec::FecType fec_type, td::uint32 date,
-                                                          td::uint32 fanout_override) {
+                                                          td::uint32 fanout_override,
+                                                          std::vector<adnl::AdnlNodeIdShort> force_peers) {
   broadcasts_fec_.send_part(this, local_id, data_hash, size, flags, std::move(part), seqno, std::move(fec_type), date,
-                            fanout_override);
+                            fanout_override, std::move(force_peers));
 }
 
 void OverlayImpl::broadcast_twostep_signed_simple(BroadcastTwostepDataSimple &&data,

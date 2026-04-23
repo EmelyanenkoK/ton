@@ -440,6 +440,9 @@ class ValidatorEngine : public td::actor::Actor {
     rebroadcast_from_custom_peer_target_explicit_ = true;
     full_node_options_.rebroadcast_from_custom_.peer_target_ = count;
   }
+  void set_force_good_peers_url(std::string url) {
+    full_node_options_.rebroadcast_from_custom_.force_good_peers_url_ = std::move(url);
+  }
   void add_rebroadcast_from_custom_workchain(ton::WorkchainId workchain) {
     full_node_options_.rebroadcast_from_custom_.allowed_workchains_.insert(workchain);
   }

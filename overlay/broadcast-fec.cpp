@@ -47,7 +47,7 @@ class BroadcastFec : public td::ListNode {
  public:
   BroadcastFec(Overlay::BroadcastHash hash, Overlay::BroadcastDataHash data_hash, td::uint32 flags, td::uint32 date,
                PublicKey src, std::shared_ptr<Certificate> certificate, fec::FecType fec_type,
-               td::uint32 fanout_override)
+               td::uint32 fanout_override, std::vector<adnl::AdnlNodeIdShort> force_peers)
       : hash_(hash)
       , data_hash_(data_hash)
       , flags_(flags)
@@ -55,7 +55,8 @@ class BroadcastFec : public td::ListNode {
       , src_(std::move(src))
       , certificate_(std::move(certificate))
       , fec_type_(std::move(fec_type))
-      , fanout_override_(fanout_override) {
+      , fanout_override_(fanout_override)
+      , force_peers_(std::move(force_peers)) {
   }
 
   td::Status is_eligible_sender(PublicKey src) {
@@ -197,6 +198,7 @@ class BroadcastFec : public td::ListNode {
   adnl::AdnlNodeIdShort src_peer_id_ = adnl::AdnlNodeIdShort::zero();
   td::BufferSlice data_;
   td::uint32 fanout_override_ = 0;
+  std::vector<adnl::AdnlNodeIdShort> force_peers_;
 };
 
 td::Status BroadcastFec::run_checks() {
@@ -232,7 +234,30 @@ td::Status BroadcastFec::distribute_part(OverlayImpl *overlay, td::uint32 seqno)
   td::BufferSlice data_short = std::move(tls.first);
   td::BufferSlice data = std::move(tls.second);
 
-  auto nodes = overlay->get_neighbours(fanout_override_ != 0 ? fanout_override_ : overlay->propagate_broadcast_to());
+  auto fanout = fanout_override_ != 0 ? fanout_override_ : overlay->propagate_broadcast_to();
+  std::vector<adnl::AdnlNodeIdShort> nodes;
+  std::set<adnl::AdnlNodeIdShort> selected;
+  for (auto &peer : force_peers_) {
+    if (nodes.size() >= fanout) {
+      break;
+    }
+    if (peer == overlay->local_id()) {
+      continue;
+    }
+    if (selected.insert(peer).second) {
+      nodes.push_back(peer);
+    }
+  }
+  if (nodes.size() < fanout) {
+    for (auto &peer : overlay->get_neighbours(fanout)) {
+      if (nodes.size() >= fanout) {
+        break;
+      }
+      if (selected.insert(peer).second) {
+        nodes.push_back(peer);
+      }
+    }
+  }
   auto manager = overlay->overlay_manager();
 
   auto &limiter = overlay->get_broadcasts_limiter(src_.compute_short_id(), certificate_.get());
@@ -264,7 +289,8 @@ class BroadcastFecPart {
                    std::shared_ptr<Certificate> cert, Overlay::BroadcastDataHash data_hash, td::uint32 data_size,
                    td::uint32 flags, Overlay::BroadcastDataHash part_data_hash, td::BufferSlice data, td::uint32 seqno,
                    fec::FecType fec_type, td::uint32 date, td::BufferSlice signature, bool is_short,
-                   adnl::AdnlNodeIdShort src_peer_id, td::uint32 fanout_override)
+                   adnl::AdnlNodeIdShort src_peer_id, td::uint32 fanout_override,
+                   std::vector<adnl::AdnlNodeIdShort> force_peers)
       : broadcast_hash_(broadcast_hash)
       , part_hash_(part_hash)
       , source_(std::move(source))
@@ -280,7 +306,8 @@ class BroadcastFecPart {
       , signature_(std::move(signature))
       , is_short_(is_short)
       , src_peer_id_(src_peer_id)
-      , fanout_override_(fanout_override) {
+      , fanout_override_(fanout_override)
+      , force_peers_(std::move(force_peers)) {
   }
 
   td::BufferSlice to_sign();
@@ -309,6 +336,7 @@ class BroadcastFecPart {
 
   adnl::AdnlNodeIdShort src_peer_id_ = adnl::AdnlNodeIdShort::zero();
   td::uint32 fanout_override_ = 0;
+  std::vector<adnl::AdnlNodeIdShort> force_peers_;
 };
 
 td::Status BroadcastFecPart::run_checks(OverlayImpl *overlay, BroadcastFec *bcast) {
@@ -379,7 +407,8 @@ td::BufferSlice BroadcastFecPart::to_sign() {
 class BroadcastFecActor : public td::actor::Actor {
  public:
   BroadcastFecActor(td::BufferSlice data, td::uint32 flags, td::actor::ActorId<OverlayImpl> overlay,
-                    PublicKeyHash local_id, double speed_multiplier = 1.0, td::uint32 fanout_override = 0);
+                    PublicKeyHash local_id, double speed_multiplier = 1.0, td::uint32 fanout_override = 0,
+                    std::vector<adnl::AdnlNodeIdShort> force_peers = {});
 
   void start_up() override;
   void alarm() override;
@@ -397,11 +426,13 @@ class BroadcastFecActor : public td::actor::Actor {
   td::actor::ActorId<OverlayImpl> overlay_;
   fec::FecType fec_type_;
   td::uint32 fanout_override_ = 0;
+  std::vector<adnl::AdnlNodeIdShort> force_peers_;
 };
 
 BroadcastFecActor::BroadcastFecActor(td::BufferSlice data, td::uint32 flags, td::actor::ActorId<OverlayImpl> overlay,
-                                     PublicKeyHash local_id, double speed_multiplier, td::uint32 fanout_override)
-    : flags_(flags), fanout_override_(fanout_override) {
+                                     PublicKeyHash local_id, double speed_multiplier, td::uint32 fanout_override,
+                                     std::vector<adnl::AdnlNodeIdShort> force_peers)
+    : flags_(flags), fanout_override_(fanout_override), force_peers_(std::move(force_peers)) {
   delay_ /= speed_multiplier;
   CHECK(data.size() <= (1 << 27));
   local_id_ = local_id;
@@ -428,7 +459,7 @@ void BroadcastFecActor::alarm() {
     CHECK(X.data.size() <= 1000);
     td::actor::send_closure(overlay_, &OverlayImpl::send_new_fec_broadcast_part_with_fanout, local_id_, data_hash_,
                             fec_type_.size(), flags_, std::move(X.data), X.id, fec_type_, date_,
-                            fanout_override_);
+                            fanout_override_, force_peers_);
   }
 
   alarm_timestamp() = td::Timestamp::in(delay_);
@@ -443,22 +474,25 @@ BroadcastsFec::BroadcastsFec() = default;
 BroadcastsFec::~BroadcastsFec() = default;
 
 void BroadcastsFec::send(OverlayImpl *overlay, PublicKeyHash send_as, td::BufferSlice data, td::uint32 flags,
-                         double speed_multiplier, td::uint32 fanout_override) {
+                         double speed_multiplier, td::uint32 fanout_override,
+                         std::vector<adnl::AdnlNodeIdShort> force_peers) {
   td::actor::create_actor<BroadcastFecActor>(td::actor::ActorOptions().with_name("bcast"), std::move(data), flags,
-                                             actor_id(overlay), send_as, speed_multiplier, fanout_override)
+                                             actor_id(overlay), send_as, speed_multiplier, fanout_override,
+                                             std::move(force_peers))
       .release();
 }
 
 void BroadcastsFec::send_part(OverlayImpl *overlay, PublicKeyHash send_as, Overlay::BroadcastDataHash data_hash,
                               td::uint32 size, td::uint32 flags, td::BufferSlice part, td::uint32 seqno,
-                              fec::FecType fec_type, td::uint32 date, td::uint32 fanout_override) {
+                              fec::FecType fec_type, td::uint32 date, td::uint32 fanout_override,
+                              std::vector<adnl::AdnlNodeIdShort> force_peers) {
   auto broadcast_hash = compute_broadcast_id(send_as, fec_type, data_hash, size, flags);
   auto part_data_hash = sha256_bits256(part.as_slice());
   auto part_hash = compute_broadcast_part_id(broadcast_hash, part_data_hash, seqno);
   auto part_obj = std::make_unique<BroadcastFecPart>(
       broadcast_hash, part_hash, PublicKey{}, overlay->get_certificate(send_as), data_hash, size, flags, part_data_hash,
       std::move(part), seqno, std::move(fec_type), date, td::BufferSlice{}, false, adnl::AdnlNodeIdShort::zero(),
-      fanout_override);
+      fanout_override, std::move(force_peers));
   auto to_sign = part_obj->to_sign();
   auto P = td::PromiseCreator::lambda([overlay = actor_id(overlay), part = std::move(part_obj)](
                                           td::Result<std::pair<td::BufferSlice, PublicKey>> R) mutable {
@@ -509,7 +543,7 @@ td::Status BroadcastsFec::process_broadcast(OverlayImpl *overlay, adnl::AdnlNode
                         static_cast<td::uint32>(broadcast->data_size_), static_cast<td::uint32>(broadcast->flags_),
                         part_data_hash, std::move(broadcast->data_), static_cast<td::uint32>(broadcast->seqno_),
                         std::move(fec_type), static_cast<td::uint32>(broadcast->date_),
-                        std::move(broadcast->signature_), false, src_peer_id, 0);
+                        std::move(broadcast->signature_), false, src_peer_id, 0, {});
   TRY_STATUS(process(overlay, part));
   return td::Status::OK();
 }
@@ -538,7 +572,7 @@ td::Status BroadcastsFec::process_broadcast(OverlayImpl *overlay, adnl::AdnlNode
   }
   BroadcastFecPart part(broadcast_hash, part_hash, source, std::move(cert), bcast.data_hash_, bcast.fec_type_.size(),
                         bcast.flags_, part_data_hash, std::move(part_data), seqno, bcast.fec_type_, bcast.date_,
-                        std::move(broadcast->signature_), true, src_peer_id, 0);
+                        std::move(broadcast->signature_), true, src_peer_id, 0, {});
   TRY_STATUS(part.run_checks(overlay, &bcast));
   TRY_STATUS(part.run(overlay, bcast));
   return td::Status::OK();
@@ -574,7 +608,7 @@ td::Status BroadcastsFec::process(OverlayImpl *overlay, BroadcastFecPart &part) 
     TRY_STATUS(part.run_checks(overlay, nullptr));
     auto bcast = std::make_unique<BroadcastFec>(part.broadcast_hash_, part.broadcast_data_hash_, part.flags_,
                                                 part.date_, part.source_, part.cert_, part.fec_type_,
-                                                part.fanout_override_);
+                                                part.fanout_override_, part.force_peers_);
     overlay->get_broadcasts_limiter(part.source_.compute_short_id(), part.cert_.get())
         .register_broadcast(part.broadcast_size_);
     TRY_STATUS(bcast->run_checks());

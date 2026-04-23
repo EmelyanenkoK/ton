@@ -453,19 +453,20 @@ void OverlayManager::send_broadcast_fec(adnl::AdnlNodeIdShort local_id, OverlayI
 
 void OverlayManager::send_broadcast_fec_ex(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id,
                                            PublicKeyHash send_as, td::uint32 flags, td::BufferSlice object) {
-  send_broadcast_fec_ex_with_fanout(local_id, overlay_id, send_as, flags, std::move(object), 0);
+  send_broadcast_fec_ex_with_fanout(local_id, overlay_id, send_as, flags, std::move(object), 0, {});
 }
 
 void OverlayManager::send_broadcast_fec_ex_with_fanout(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id,
                                                        PublicKeyHash send_as, td::uint32 flags,
-                                                       td::BufferSlice object, td::uint32 fanout_override) {
+                                                       td::BufferSlice object, td::uint32 fanout_override,
+                                                       std::vector<adnl::AdnlNodeIdShort> force_peers) {
   CHECK(object.size() <= Overlays::max_fec_broadcast_size());
   auto it = overlays_.find(local_id);
   if (it != overlays_.end()) {
     auto it2 = it->second.find(overlay_id);
     if (it2 != it->second.end()) {
       td::actor::send_closure(it2->second.overlay, &Overlay::send_broadcast_fec_with_fanout, send_as, flags,
-                              std::move(object), td::BufferSlice{}, fanout_override);
+                              std::move(object), td::BufferSlice{}, fanout_override, std::move(force_peers));
     }
   }
 }
@@ -479,7 +480,7 @@ void OverlayManager::send_broadcast_fec_with_extra(adnl::AdnlNodeIdShort local_i
     auto it2 = it->second.find(overlay_id);
     if (it2 != it->second.end()) {
       td::actor::send_closure(it2->second.overlay, &Overlay::send_broadcast_fec_with_fanout, send_as, flags,
-                              std::move(object), std::move(extra), 0);
+                              std::move(object), std::move(extra), 0, std::vector<adnl::AdnlNodeIdShort>{});
     }
   }
 }

@@ -17,9 +17,11 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #include "adnl/utils.hpp"
+#include "adnl/adnl-address-list.h"
 #include "auto/tl/ton_api.h"
 #include "auto/tl/ton_api_json.h"
 #include "common/delay.h"
+#include "http/http-client.h"
 #include "impl/out-msg-queue-proof.hpp"
 #include "net/download-archive-slice.hpp"
 #include "net/download-block-new.hpp"
@@ -27,9 +29,12 @@
 #include "net/download-state.hpp"
 #include "net/get-next-key-blocks.hpp"
 #include "td/utils/JsonBuilder.h"
+#include "td/utils/HttpUrl.h"
 #include "td/utils/Random.h"
 #include "td/utils/SharedSlice.h"
+#include "td/utils/base64.h"
 #include "td/utils/buffer.h"
+#include "td/utils/misc.h"
 #include "td/utils/overloaded.h"
 #include "tl/tl_json.h"
 #include "ton/ton-io.hpp"
@@ -76,6 +81,228 @@ size_t request_cost_for_limiter(ton_api::Function &function) {
                     [&](const auto &) {}));
   return cost;
 }
+
+class ForceGoodPeersFetcher : public td::actor::Actor {
+ public:
+  ForceGoodPeersFetcher(std::string url, adnl::AdnlNodeIdShort local_id, td::actor::ActorId<adnl::Adnl> adnl,
+                        td::actor::ActorId<FullNodeShardImpl> parent)
+      : url_(std::move(url)), local_id_(local_id), adnl_(adnl), parent_(parent) {
+  }
+
+  void start_up() override {
+    auto r_url = td::parse_url(url_);
+    if (r_url.is_error()) {
+      finish(r_url.move_as_error_prefix("bad force-good-peers URL: "));
+      return;
+    }
+    url_info_ = r_url.move_as_ok();
+    if (url_info_.protocol_ != td::HttpUrl::Protocol::Http) {
+      finish(td::Status::Error("force-good-peers supports only http URLs"));
+      return;
+    }
+
+    auto domain = url_info_.host_ + ":" + std::to_string(url_info_.port_);
+    class Cb : public http::HttpClient::Callback {
+     public:
+      void on_ready() override {
+      }
+      void on_stop_ready() override {
+      }
+    };
+    client_ = http::HttpClient::create_multi(domain, td::IPAddress(), 1, 1, std::make_shared<Cb>());
+
+    auto r_request = http::HttpRequest::create("GET", url_info_.query_, "HTTP/1.1");
+    if (r_request.is_error()) {
+      finish(r_request.move_as_error_prefix("failed to create force-good-peers request: "));
+      return;
+    }
+    auto request = r_request.move_as_ok();
+    request->set_keep_alive(false);
+    auto S = request->add_header(http::HttpHeader{"Host", domain});
+    if (S.is_error()) {
+      finish(S.move_as_error_prefix("failed to create force-good-peers request: "));
+      return;
+    }
+    request->add_header(http::HttpHeader{"Accept", "application/json"}).ignore();
+    request->add_header(http::HttpHeader{"User-Agent", "ton-validator-force-good-peers"}).ignore();
+
+    auto promise = td::PromiseCreator::lambda(
+        [SelfId = actor_id(this)](
+            td::Result<std::pair<std::unique_ptr<http::HttpResponse>, std::shared_ptr<http::HttpPayload>>> R) mutable {
+          td::actor::send_closure(SelfId, &ForceGoodPeersFetcher::got_response, std::move(R));
+        });
+    td::actor::send_closure(client_, &http::HttpClient::send_request, std::move(request),
+                            std::make_shared<http::HttpPayload>(http::HttpPayload::PayloadType::pt_empty),
+                            td::Timestamp::in(10.0), std::move(promise));
+  }
+
+  void got_response(
+      td::Result<std::pair<std::unique_ptr<http::HttpResponse>, std::shared_ptr<http::HttpPayload>>> R) {
+    if (R.is_error()) {
+      finish(R.move_as_error_prefix("failed to fetch force-good-peers: "));
+      return;
+    }
+    auto response = R.move_as_ok();
+    if (response.first->code() != http::HttpStatusCode::status_ok) {
+      finish(td::Status::Error(PSTRING() << "force-good-peers HTTP status " << response.first->code()));
+      return;
+    }
+
+    auto payload = std::move(response.second);
+    if (payload->parse_completed()) {
+      got_payload(std::move(payload));
+      return;
+    }
+
+    class PayloadCallback : public http::HttpPayload::Callback {
+     public:
+      PayloadCallback(td::actor::ActorId<ForceGoodPeersFetcher> fetcher, std::shared_ptr<http::HttpPayload> payload)
+          : fetcher_(fetcher), payload_(std::move(payload)) {
+      }
+      void run(size_t ready_bytes) override {
+      }
+      void completed() override {
+        td::actor::send_closure(fetcher_, &ForceGoodPeersFetcher::got_payload, payload_);
+      }
+
+     private:
+      td::actor::ActorId<ForceGoodPeersFetcher> fetcher_;
+      std::shared_ptr<http::HttpPayload> payload_;
+    };
+    auto raw_payload = payload;
+    payload->add_callback(std::make_unique<PayloadCallback>(actor_id(this), std::move(payload)));
+    if (raw_payload->parse_completed()) {
+      got_payload(std::move(raw_payload));
+    }
+  }
+
+  void got_payload(std::shared_ptr<http::HttpPayload> payload) {
+    if (finished_) {
+      return;
+    }
+    auto R = parse_payload(std::move(payload));
+    finish(std::move(R));
+  }
+
+ private:
+  td::Result<std::string> read_payload(http::HttpPayload &payload) {
+    static constexpr size_t max_body_size = 1 << 20;
+    std::string body;
+    while (true) {
+      auto chunk = payload.get_slice(max_body_size);
+      if (chunk.empty()) {
+        break;
+      }
+      if (body.size() + chunk.size() > max_body_size) {
+        return td::Status::Error("force-good-peers response is too large");
+      }
+      auto slice = chunk.as_slice();
+      body.append(slice.begin(), slice.size());
+    }
+    return body;
+  }
+
+  td::Result<adnl::AdnlNodeIdShort> parse_peer(td::Slice declared_name, const td::JsonValue &value) {
+    if (value.type() != td::JsonValue::Type::Object) {
+      return td::Status::Error("peer entry is not an object");
+    }
+
+    TRY_RESULT(decoded_id, td::hex_decode(declared_name));
+    if (decoded_id.size() != 32) {
+      return td::Status::Error("peer key is not a 32-byte ADNL id");
+    }
+    adnl::AdnlNodeIdShort declared_id{td::Slice(decoded_id)};
+
+    const auto &obj = value.get_object();
+    TRY_RESULT(host, obj.get_required_string_field("host"));
+    TRY_RESULT(port, obj.get_required_int_field("port"));
+    TRY_RESULT(pub_key_b64, obj.get_required_string_field("pub_key"));
+    if (port <= 0 || port > 65535) {
+      return td::Status::Error("bad peer port");
+    }
+
+    TRY_RESULT(pub_key_raw, td::base64_decode(pub_key_b64));
+    if (pub_key_raw.size() != 32) {
+      return td::Status::Error("bad peer public key size");
+    }
+    td::Bits256 pub_key_bits;
+    pub_key_bits.as_slice().copy_from(td::Slice(pub_key_raw));
+    auto full_id = adnl::AdnlNodeIdFull{PublicKey{pubkeys::Ed25519{pub_key_bits}}};
+    auto short_id = full_id.compute_short_id();
+    if (short_id != declared_id) {
+      return td::Status::Error("peer public key does not match declared ADNL id");
+    }
+    if (short_id == local_id_) {
+      return td::Status::Error("peer is local ADNL id");
+    }
+
+    td::IPAddress addr;
+    TRY_STATUS(addr.init_host_port(host, port));
+    if (!addr.is_ipv4()) {
+      return td::Status::Error("only IPv4 force-good-peers addresses are supported");
+    }
+
+    adnl::AdnlAddressList addr_list;
+    TRY_STATUS(addr_list.add_udp_adnl_address(addr));
+    auto now = static_cast<td::uint32>(td::Clocks::system());
+    addr_list.set_version(now);
+    addr_list.set_reinit_date(adnl::Adnl::adnl_start_time());
+    td::actor::send_closure(adnl_, &adnl::Adnl::add_peer, local_id_, std::move(full_id), std::move(addr_list));
+    return short_id;
+  }
+
+  td::Result<std::vector<adnl::AdnlNodeIdShort>> parse_payload(std::shared_ptr<http::HttpPayload> payload) {
+    TRY_RESULT(body, read_payload(*payload));
+    auto json = td::json_decode(td::MutableSlice(body.data(), body.size()));
+    if (json.is_error()) {
+      return json.move_as_error_prefix("failed to parse force-good-peers JSON: ");
+    }
+    auto root = json.move_as_ok();
+    if (root.type() != td::JsonValue::Type::Object) {
+      return td::Status::Error("force-good-peers JSON root must be an object");
+    }
+
+    std::vector<adnl::AdnlNodeIdShort> peers;
+    std::set<adnl::AdnlNodeIdShort> seen;
+    size_t skipped = 0;
+    root.get_object().foreach([&](td::Slice name, const td::JsonValue &value) {
+      auto r_peer = parse_peer(name, value);
+      if (r_peer.is_error()) {
+        skipped++;
+        VLOG(FULL_NODE_DEBUG) << "skipping force-good-peers entry " << name << ": " << r_peer.move_as_error();
+        return;
+      }
+      auto peer = r_peer.move_as_ok();
+      if (seen.insert(peer).second) {
+        peers.push_back(peer);
+      }
+    });
+    VLOG(FULL_NODE_NOTICE) << "loaded " << peers.size() << " force-good-peers from " << url_ << ", skipped "
+                           << skipped;
+    return peers;
+  }
+
+  void finish(td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
+    if (finished_) {
+      return;
+    }
+    finished_ = true;
+    td::actor::send_closure(parent_, &FullNodeShardImpl::got_force_good_peers, std::move(R));
+    stop();
+  }
+
+  void finish(td::Status S) {
+    finish(td::Result<std::vector<adnl::AdnlNodeIdShort>>(std::move(S)));
+  }
+
+  std::string url_;
+  td::HttpUrl url_info_{td::HttpUrl::Protocol::Http, "", "", false, 0, 0, "/"};
+  adnl::AdnlNodeIdShort local_id_;
+  td::actor::ActorId<adnl::Adnl> adnl_;
+  td::actor::ActorId<FullNodeShardImpl> parent_;
+  td::actor::ActorOwn<http::HttpClient> client_;
+  bool finished_ = false;
+};
 
 }  // namespace
 
@@ -156,6 +383,62 @@ void FullNodeShardImpl::create_overlay() {
   if (cert_) {
     td::actor::send_closure(overlays_, &overlay::Overlays::update_certificate, adnl_id_, overlay_id_, local_id_, cert_);
   }
+}
+
+bool FullNodeShardImpl::uses_force_good_peers() const {
+  if (opts_.rebroadcast_from_custom_.force_good_peers_url_.empty() || !opts_.rebroadcast_from_custom_.enabled_) {
+    return false;
+  }
+  if (opts_.rebroadcast_from_custom_.allows_workchain(shard_.workchain)) {
+    return true;
+  }
+  return shard_.is_masterchain() && opts_.rebroadcast_from_custom_.candidates_enabled_ &&
+         !opts_.rebroadcast_from_custom_.allowed_workchains_.empty();
+}
+
+void FullNodeShardImpl::refresh_force_good_peers() {
+  if (!uses_force_good_peers() || force_good_peers_refresh_active_) {
+    return;
+  }
+  force_good_peers_refresh_active_ = true;
+  refresh_force_good_peers_at_ = td::Timestamp::never();
+  td::actor::create_actor<ForceGoodPeersFetcher>("forcegoodpeers", opts_.rebroadcast_from_custom_.force_good_peers_url_,
+                                                 adnl_id_, adnl_, actor_id(this))
+      .release();
+}
+
+void FullNodeShardImpl::got_force_good_peers(td::Result<std::vector<adnl::AdnlNodeIdShort>> peers) {
+  force_good_peers_refresh_active_ = false;
+  if (peers.is_error()) {
+    VLOG(FULL_NODE_WARNING) << "failed to refresh force-good-peers for " << shard_.to_str() << ": "
+                            << peers.move_as_error();
+    refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(10.0, 20.0));
+  } else {
+    force_good_peers_ = peers.move_as_ok();
+    VLOG(FULL_NODE_NOTICE) << "using " << force_good_peers_.size() << " force-good-peers for " << shard_.to_str();
+    refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(50.0, 70.0));
+  }
+  alarm_timestamp().relax(refresh_force_good_peers_at_);
+}
+
+std::vector<adnl::AdnlNodeIdShort> FullNodeShardImpl::choose_force_good_peers(td::uint32 fanout_override) const {
+  if (fanout_override == 0 || force_good_peers_.empty()) {
+    return {};
+  }
+  if (force_good_peers_.size() <= fanout_override) {
+    return force_good_peers_;
+  }
+
+  auto pool = force_good_peers_;
+  std::vector<adnl::AdnlNodeIdShort> result;
+  result.reserve(fanout_override);
+  while (result.size() < fanout_override && !pool.empty()) {
+    auto pos = static_cast<size_t>(td::Random::fast(0, static_cast<int>(pool.size() - 1)));
+    result.push_back(pool[pos]);
+    pool[pos] = pool.back();
+    pool.pop_back();
+  }
+  return result;
 }
 
 void FullNodeShardImpl::check_broadcast(PublicKeyHash src, td::BufferSlice broadcast, td::Promise<td::Unit> promise) {
@@ -1016,9 +1299,10 @@ void FullNodeShardImpl::send_block_candidate_with_fanout(BlockIdExt block_id, Ca
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
                             overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
   } else {
+    auto force_peers = choose_force_good_peers(fanout_override);
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
                             local_id_, overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok(),
-                            fanout_override);
+                            fanout_override, std::move(force_peers));
   }
 }
 
@@ -1041,9 +1325,10 @@ void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td:
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
                             overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok());
   } else {
+    auto force_peers = choose_force_good_peers(fanout_override);
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
                             local_id_, overlay::Overlays::BroadcastFlagAnySender(), B.move_as_ok(),
-                            fanout_override);
+                            fanout_override, std::move(force_peers));
   }
 }
 
@@ -1190,11 +1475,15 @@ void FullNodeShardImpl::alarm() {
     my_ext_msg_broadcasts_.clear();
     cleanup_processed_ext_msg_at_ = td::Timestamp::in(60.0);
   }
+  if (refresh_force_good_peers_at_ && refresh_force_good_peers_at_.is_in_past()) {
+    refresh_force_good_peers();
+  }
   alarm_timestamp().relax(sync_completed_at_);
   alarm_timestamp().relax(update_certificate_at_);
   alarm_timestamp().relax(reload_neighbours_at_);
   alarm_timestamp().relax(ping_neighbours_at_);
   alarm_timestamp().relax(cleanup_processed_ext_msg_at_);
+  alarm_timestamp().relax(refresh_force_good_peers_at_);
 }
 
 void FullNodeShardImpl::start_up() {
@@ -1212,6 +1501,9 @@ void FullNodeShardImpl::start_up() {
     reload_neighbours_at_ = td::Timestamp::now();
     ping_neighbours_at_ = td::Timestamp::now();
     cleanup_processed_ext_msg_at_ = td::Timestamp::now();
+    if (uses_force_good_peers()) {
+      refresh_force_good_peers_at_ = td::Timestamp::now();
+    }
     alarm_timestamp().relax(td::Timestamp::now());
   }
 }

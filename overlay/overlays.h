@@ -19,6 +19,7 @@
 #pragma once
 
 #include <map>
+#include <vector>
 
 #include "adnl/adnl-node-id.hpp"
 #include "adnl/adnl-sender-ex.h"
@@ -405,7 +406,8 @@ class Overlays : public td::actor::Actor {
                                      td::uint32 flags, td::BufferSlice object) = 0;
   virtual void send_broadcast_fec_ex_with_fanout(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id,
                                                  PublicKeyHash send_as, td::uint32 flags, td::BufferSlice object,
-                                                 td::uint32 fanout_override) = 0;
+                                                 td::uint32 fanout_override,
+                                                 std::vector<adnl::AdnlNodeIdShort> force_peers) = 0;
   virtual void send_broadcast_fec_with_extra(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id,
                                              PublicKeyHash send_as, td::uint32 flags, td::BufferSlice object,
                                              td::BufferSlice extra) = 0;

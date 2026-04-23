@@ -63,6 +63,7 @@ struct FullNodeOptions {
     bool candidates_enabled_ = false;
     bool candidate_block_dedup_enabled_ = false;
     td::uint32 peer_target_ = 100;
+    std::string force_good_peers_url_;
     std::set<WorkchainId> allowed_workchains_;
 
     bool allows_workchain(WorkchainId workchain) const {

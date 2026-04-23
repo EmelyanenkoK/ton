@@ -209,6 +209,7 @@ class FullNodeShardImpl : public FullNodeShard {
   void start_up() override;
   void tear_down() override;
   void alarm() override;
+  void got_force_good_peers(td::Result<std::vector<adnl::AdnlNodeIdShort>> peers);
 
   void update_validators(std::vector<PublicKeyHash> public_key_hashes, PublicKeyHash local_hash) override;
 
@@ -219,6 +220,9 @@ class FullNodeShardImpl : public FullNodeShard {
 
   void sign_new_certificate(PublicKeyHash sign_by);
   void signed_new_certificate(overlay::Certificate cert, PublicKeyHash local_id);
+  bool uses_force_good_peers() const;
+  void refresh_force_good_peers();
+  std::vector<adnl::AdnlNodeIdShort> choose_force_good_peers(td::uint32 fanout_override) const;
 
   void ping_neighbours();
   void reload_neighbours();
@@ -286,6 +290,9 @@ class FullNodeShardImpl : public FullNodeShard {
   td::Timestamp reload_neighbours_at_;
   td::Timestamp ping_neighbours_at_;
   adnl::AdnlNodeIdShort last_pinged_neighbour_ = adnl::AdnlNodeIdShort::zero();
+  std::vector<adnl::AdnlNodeIdShort> force_good_peers_;
+  td::Timestamp refresh_force_good_peers_at_;
+  bool force_good_peers_refresh_active_ = false;
 
   bool active_;
 

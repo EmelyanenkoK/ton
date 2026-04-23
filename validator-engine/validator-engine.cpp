@@ -46,6 +46,7 @@
 #include "td/utils/ThreadSafeCounter.h"
 #include "td/utils/Time.h"
 #include "td/utils/TsFileLog.h"
+#include "td/utils/HttpUrl.h"
 #include "td/utils/buffer.h"
 #include "td/utils/filesystem.h"
 #include "td/utils/misc.h"
@@ -1449,9 +1450,18 @@ td::Status ValidatorEngine::validate_rebroadcast_from_custom_options() const {
     if (rebroadcast_from_custom_peer_target_explicit_) {
       return td::Status::Error("--rebroadcast-peers requires --rebroadcast-from-custom");
     }
+    if (!opts.force_good_peers_url_.empty()) {
+      return td::Status::Error("--force-good-peers requires --rebroadcast-from-custom");
+    }
     return td::Status::OK();
   }
 
+  if (!opts.force_good_peers_url_.empty()) {
+    TRY_RESULT(url, td::parse_url(opts.force_good_peers_url_));
+    if (url.protocol_ != td::HttpUrl::Protocol::Http) {
+      return td::Status::Error("--force-good-peers supports only http URLs");
+    }
+  }
   if (opts.allowed_workchains_.empty()) {
     return td::Status::Error("--rebroadcast-from-custom requires --rebroadcast-workchains");
   }
@@ -5924,6 +5934,19 @@ int main(int argc, char *argv[]) {
                          }
                          acts.push_back([&x, v]() {
                            td::actor::send_closure(x, &ValidatorEngine::set_rebroadcast_from_custom_peer_target, v);
+                         });
+                         return td::Status::OK();
+                       });
+  p.add_checked_option('\0', "force-good-peers",
+                       "HTTP URL with ADNL peers to include in custom-to-public rebroadcast fanout",
+                       [&](td::Slice s) -> td::Status {
+                         TRY_RESULT(url, td::parse_url(s));
+                         if (url.protocol_ != td::HttpUrl::Protocol::Http) {
+                           return td::Status::Error("force-good-peers supports only http URLs");
+                         }
+                         auto value = s.str();
+                         acts.push_back([&x, value = std::move(value)]() mutable {
+                           td::actor::send_closure(x, &ValidatorEngine::set_force_good_peers_url, std::move(value));
                          });
                          return td::Status::OK();
                        });
