@@ -71,6 +71,12 @@ struct FullNodeOptions {
     }
   };
 
+  struct ForceDownloadOptions {
+    std::vector<adnl::AdnlNodeIdShort> peers_;
+    td::uint32 attempts_num_ = 1;
+    bool rebroadcast_downloaded_block_ = false;
+  };
+
   FullNodeConfig config_;
   double public_broadcast_speed_multiplier_ = 1.0;
   double private_broadcast_speed_multiplier_ = 1.0;
@@ -79,6 +85,7 @@ struct FullNodeOptions {
   double ratelimit_window_size_ = 1.0;
   size_t ratelimit_global_ = 96, ratelimit_heavy_ = 64, ratelimit_medium_ = 72;
   RebroadcastFromCustomOptions rebroadcast_from_custom_;
+  ForceDownloadOptions force_download_;
 };
 
 struct CustomOverlayParams {
@@ -119,6 +126,7 @@ class FullNode : public td::actor::Actor {
 
   virtual void process_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) = 0;
   virtual void process_custom_overlay_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) = 0;
+  virtual void process_downloaded_block_for_rebroadcast(DownloadedBlock block) = 0;
   virtual void process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                  td::uint32 validator_set_hash, td::BufferSlice data) = 0;
   virtual void process_custom_overlay_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,

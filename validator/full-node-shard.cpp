@@ -386,14 +386,19 @@ void FullNodeShardImpl::create_overlay() {
 }
 
 bool FullNodeShardImpl::uses_force_good_peers() const {
-  if (opts_.rebroadcast_from_custom_.force_good_peers_url_.empty() || !opts_.rebroadcast_from_custom_.enabled_) {
+  if (opts_.rebroadcast_from_custom_.force_good_peers_url_.empty()) {
     return false;
   }
-  if (opts_.rebroadcast_from_custom_.allows_workchain(shard_.workchain)) {
+  const bool custom_enabled = opts_.rebroadcast_from_custom_.enabled_;
+  const bool downloaded_enabled = opts_.force_download_.rebroadcast_downloaded_block_;
+  if (!custom_enabled && !downloaded_enabled) {
+    return false;
+  }
+  if (opts_.rebroadcast_from_custom_.allowed_workchains_.count(shard_.workchain) > 0) {
     return true;
   }
-  return shard_.is_masterchain() && opts_.rebroadcast_from_custom_.candidates_enabled_ &&
-         !opts_.rebroadcast_from_custom_.allowed_workchains_.empty();
+  return shard_.is_masterchain() && !opts_.rebroadcast_from_custom_.allowed_workchains_.empty() &&
+         (opts_.rebroadcast_from_custom_.candidates_enabled_ || downloaded_enabled);
 }
 
 void FullNodeShardImpl::refresh_force_good_peers() {
@@ -439,6 +444,41 @@ std::vector<adnl::AdnlNodeIdShort> FullNodeShardImpl::choose_force_good_peers(td
     pool.pop_back();
   }
   return result;
+}
+
+bool FullNodeShardImpl::uses_force_download_peers() const {
+  return client_.empty() && !opts_.force_download_.peers_.empty();
+}
+
+std::vector<adnl::AdnlNodeIdShort> FullNodeShardImpl::choose_force_download_peers() const {
+  std::vector<adnl::AdnlNodeIdShort> pool;
+  pool.reserve(opts_.force_download_.peers_.size());
+  for (const auto &peer : opts_.force_download_.peers_) {
+    if (!peer.is_zero() && peer != adnl_id_) {
+      pool.push_back(peer);
+    }
+  }
+  if (pool.empty()) {
+    return {};
+  }
+
+  size_t limit = std::min<size_t>(opts_.force_download_.attempts_num_, pool.size());
+  std::vector<adnl::AdnlNodeIdShort> result;
+  result.reserve(limit);
+  while (result.size() < limit && !pool.empty()) {
+    auto pos = static_cast<size_t>(td::Random::fast(0, static_cast<int>(pool.size() - 1)));
+    result.push_back(pool[pos]);
+    pool[pos] = pool.back();
+    pool.pop_back();
+  }
+  return result;
+}
+
+void FullNodeShardImpl::finish_download_block(DownloadedBlock block, td::Promise<ReceivedBlock> promise) {
+  if (opts_.force_download_.rebroadcast_downloaded_block_ && block.from_network) {
+    td::actor::send_closure(full_node_, &FullNode::process_downloaded_block_for_rebroadcast, block.clone());
+  }
+  promise.set_value(std::move(block.block));
 }
 
 void FullNodeShardImpl::check_broadcast(PublicKeyHash src, td::BufferSlice broadcast, td::Promise<td::Unit> promise) {
@@ -499,10 +539,28 @@ void FullNodeShardImpl::try_get_next_block(td::Timestamp timeout, td::Promise<Re
     return;
   }
 
+  td::Promise<DownloadedBlock> P = td::PromiseCreator::lambda(
+      [SelfId = actor_id(this), promise = std::move(promise)](td::Result<DownloadedBlock> R) mutable {
+        if (R.is_error()) {
+          promise.set_error(R.move_as_error());
+        } else {
+          td::actor::send_closure(SelfId, &FullNodeShardImpl::finish_download_block, R.move_as_ok(),
+                                  std::move(promise));
+        }
+      });
+  if (uses_force_download_peers()) {
+    td::actor::create_actor<DownloadBlockNewParallel>("downloadnext-forced", adnl_id_, overlay_id_, handle_->id(),
+                                                      choose_force_download_peers(), download_next_priority(), timeout,
+                                                      validator_manager_, rldp_, overlays_, adnl_, client_,
+                                                      std::move(P))
+        .release();
+    return;
+  }
+
   auto &b = choose_neighbour();
   td::actor::create_actor<DownloadBlockNew>("downloadnext", adnl_id_, overlay_id_, handle_->id(), b.adnl_id,
                                             download_next_priority(), timeout, validator_manager_, rldp_, overlays_,
-                                            adnl_, client_, create_neighbour_promise(b, std::move(promise)))
+                                            adnl_, client_, create_neighbour_promise(b, std::move(P)))
       .release();
 }
 
@@ -1334,10 +1392,28 @@ void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td:
 
 void FullNodeShardImpl::download_block(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,
                                        td::Promise<ReceivedBlock> promise) {
+  td::Promise<DownloadedBlock> P = td::PromiseCreator::lambda(
+      [SelfId = actor_id(this), promise = std::move(promise)](td::Result<DownloadedBlock> R) mutable {
+        if (R.is_error()) {
+          promise.set_error(R.move_as_error());
+        } else {
+          td::actor::send_closure(SelfId, &FullNodeShardImpl::finish_download_block, R.move_as_ok(),
+                                  std::move(promise));
+        }
+      });
+  if (uses_force_download_peers()) {
+    td::actor::create_actor<DownloadBlockNewParallel>("downloadreq-forced", id, adnl_id_, overlay_id_,
+                                                      choose_force_download_peers(), priority, timeout,
+                                                      validator_manager_, rldp_, overlays_, adnl_, client_,
+                                                      std::move(P))
+        .release();
+    return;
+  }
+
   auto &b = choose_neighbour();
   td::actor::create_actor<DownloadBlockNew>("downloadreq", id, adnl_id_, overlay_id_, b.adnl_id, priority, timeout,
                                             validator_manager_, rldp_, overlays_, adnl_, client_,
-                                            create_neighbour_promise(b, std::move(promise)))
+                                            create_neighbour_promise(b, std::move(P)))
       .release();
 }
 

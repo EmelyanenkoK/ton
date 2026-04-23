@@ -90,6 +90,35 @@
 #include <jemalloc/jemalloc.h>
 #endif
 
+static td::Result<std::vector<ton::adnl::AdnlNodeIdShort>> parse_force_download_peers_file(td::Slice path) {
+  TRY_RESULT(data, td::read_file_str(path.str()));
+  std::vector<ton::adnl::AdnlNodeIdShort> peers;
+  std::set<ton::adnl::AdnlNodeIdShort> seen;
+
+  auto lines = td::full_split(td::Slice(data), '\n');
+  for (size_t i = 0; i < lines.size(); ++i) {
+    auto line = td::trim(lines[i]);
+    if (line.empty() || line[0] == '#') {
+      continue;
+    }
+    TRY_RESULT_PREFIX(decoded_id, td::hex_decode(line), PSTRING() << "bad ADNL hex on line " << i + 1 << ": ");
+    if (decoded_id.size() != 32) {
+      return td::Status::Error(PSTRING() << "bad ADNL id size on line " << i + 1 << ": expected 32 bytes");
+    }
+    ton::adnl::AdnlNodeIdShort peer{td::Slice(decoded_id)};
+    if (peer.is_zero()) {
+      return td::Status::Error(PSTRING() << "zero ADNL id on line " << i + 1);
+    }
+    if (seen.insert(peer).second) {
+      peers.push_back(peer);
+    }
+  }
+  if (peers.empty()) {
+    return td::Status::Error("force-download-peers file has no peers");
+  }
+  return peers;
+}
+
 Config::Config() {
   out_port = 3278;
   full_node = ton::PublicKeyHash::zero();
@@ -1437,23 +1466,28 @@ void ValidatorEngine::set_db_root(std::string db_root) {
 }
 td::Status ValidatorEngine::validate_rebroadcast_from_custom_options() const {
   const auto &opts = full_node_options_.rebroadcast_from_custom_;
-  if (!opts.enabled_) {
-    if (opts.candidates_enabled_) {
-      return td::Status::Error("--rebroadcast-candidates-from-custom requires --rebroadcast-from-custom");
-    }
-    if (opts.candidate_block_dedup_enabled_) {
-      return td::Status::Error("--broadcast-candidate-block-dedup requires --rebroadcast-from-custom");
-    }
+  const auto &download_opts = full_node_options_.force_download_;
+  const bool public_rebroadcast_enabled = opts.enabled_ || download_opts.rebroadcast_downloaded_block_;
+
+  if (!opts.enabled_ && opts.candidates_enabled_) {
+    return td::Status::Error("--rebroadcast-candidates-from-custom requires --rebroadcast-from-custom");
+  }
+  if (!opts.enabled_ && opts.candidate_block_dedup_enabled_) {
+    return td::Status::Error("--broadcast-candidate-block-dedup requires --rebroadcast-from-custom");
+  }
+  if (!public_rebroadcast_enabled) {
     if (!opts.allowed_workchains_.empty()) {
-      return td::Status::Error("--rebroadcast-workchains requires --rebroadcast-from-custom");
+      return td::Status::Error("--rebroadcast-workchains requires --rebroadcast-from-custom or "
+                               "--rebroadcast-downloaded-block");
     }
     if (rebroadcast_from_custom_peer_target_explicit_) {
-      return td::Status::Error("--rebroadcast-peers requires --rebroadcast-from-custom");
+      return td::Status::Error("--rebroadcast-peers requires --rebroadcast-from-custom or "
+                               "--rebroadcast-downloaded-block");
     }
     if (!opts.force_good_peers_url_.empty()) {
-      return td::Status::Error("--force-good-peers requires --rebroadcast-from-custom");
+      return td::Status::Error("--force-good-peers requires --rebroadcast-from-custom or "
+                               "--rebroadcast-downloaded-block");
     }
-    return td::Status::OK();
   }
 
   if (!opts.force_good_peers_url_.empty()) {
@@ -1462,8 +1496,8 @@ td::Status ValidatorEngine::validate_rebroadcast_from_custom_options() const {
       return td::Status::Error("--force-good-peers supports only http URLs");
     }
   }
-  if (opts.allowed_workchains_.empty()) {
-    return td::Status::Error("--rebroadcast-from-custom requires --rebroadcast-workchains");
+  if (public_rebroadcast_enabled && opts.allowed_workchains_.empty()) {
+    return td::Status::Error("public rebroadcast requires --rebroadcast-workchains");
   }
   if (opts.candidate_block_dedup_enabled_ && !opts.candidates_enabled_) {
     return td::Status::Error("--broadcast-candidate-block-dedup requires --rebroadcast-candidates-from-custom");
@@ -1476,6 +1510,12 @@ td::Status ValidatorEngine::validate_rebroadcast_from_custom_options() const {
       return td::Status::Error(PSTRING() << "unsupported rebroadcast workchain " << workchain
                                          << ", only -1 and 0 are supported");
     }
+  }
+  if (download_opts.attempts_num_ == 0) {
+    return td::Status::Error("--download-attempts-num should be positive");
+  }
+  if (download_attempts_num_explicit_ && download_opts.peers_.empty()) {
+    return td::Status::Error("--download-attempts-num requires --force-download-peers");
   }
   return td::Status::OK();
 }
@@ -5407,7 +5447,7 @@ void ValidatorEngine::process_control_query(td::uint16 port, ton::adnl::AdnlNode
 void ValidatorEngine::run() {
   auto rebroadcast_options_status = validate_rebroadcast_from_custom_options();
   if (rebroadcast_options_status.is_error()) {
-    LOG(ERROR) << "invalid custom rebroadcast options: " << rebroadcast_options_status.move_as_error();
+    LOG(ERROR) << "invalid public rebroadcast/download options: " << rebroadcast_options_status.move_as_error();
     std::_Exit(2);
   }
 
@@ -5950,8 +5990,33 @@ int main(int argc, char *argv[]) {
                          });
                          return td::Status::OK();
                        });
+  p.add_checked_option('\0', "force-download-peers",
+                       "file with hex ADNL ids to use for missing block downloads, one ADNL per line",
+                       [&](td::Slice s) -> td::Status {
+                         TRY_RESULT(peers, parse_force_download_peers_file(s));
+                         acts.push_back([&x, peers = std::move(peers)]() mutable {
+                           td::actor::send_closure(x, &ValidatorEngine::set_force_download_peers, std::move(peers));
+                         });
+                         return td::Status::OK();
+                       });
+  p.add_checked_option('\0', "download-attempts-num",
+                       "number of forced download peers to query in parallel for each missing block (default: 1)",
+                       [&](td::Slice s) -> td::Status {
+                         TRY_RESULT(v, td::to_integer_safe<td::uint32>(s));
+                         if (v == 0) {
+                           return td::Status::Error("download-attempts-num should be positive");
+                         }
+                         acts.push_back([&x, v]() {
+                           td::actor::send_closure(x, &ValidatorEngine::set_download_attempts_num, v);
+                         });
+                         return td::Status::OK();
+                       });
+  p.add_option('\0', "rebroadcast-downloaded-block",
+               "rebroadcast blocks received via network download into public overlays", [&]() {
+                 acts.push_back([&x]() { td::actor::send_closure(x, &ValidatorEngine::enable_rebroadcast_downloaded_block); });
+               });
   p.add_checked_option('\0', "rebroadcast-workchains",
-                       "comma-separated workchains to rebroadcast from custom overlays (-1 for masterchain, 0 for basechain)",
+                       "comma-separated workchains for public rebroadcast (-1 for masterchain, 0 for basechain)",
                        [&](td::Slice s) -> td::Status {
                          auto workchains = td::full_split(s, ',');
                          if (workchains.empty()) {

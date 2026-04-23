@@ -541,13 +541,15 @@ bool FullNodeImpl::should_rebroadcast_from_custom(WorkchainId workchain) const {
   return opts_.rebroadcast_from_custom_.allows_workchain(workchain);
 }
 
-void FullNodeImpl::rebroadcast_block_from_custom_overlay(const BlockBroadcast &broadcast) {
-  if (!should_rebroadcast_from_custom(broadcast.block_id.shard_full().workchain)) {
-    return;
-  }
-  if (opts_.rebroadcast_from_custom_.candidate_block_dedup_enabled_ &&
-      custom_to_public_sent_candidates_.contains(broadcast.block_id)) {
-    VLOG(FULL_NODE_DEBUG) << "Skipping custom-to-public block rebroadcast after candidate: "
+bool FullNodeImpl::should_rebroadcast_downloaded(WorkchainId workchain) const {
+  return opts_.force_download_.rebroadcast_downloaded_block_ &&
+         opts_.rebroadcast_from_custom_.allowed_workchains_.count(workchain) > 0;
+}
+
+void FullNodeImpl::rebroadcast_block_to_public(const BlockBroadcast &broadcast, bool apply_candidate_dedup,
+                                               td::Slice source_name) {
+  if (apply_candidate_dedup && custom_to_public_sent_candidates_.contains(broadcast.block_id)) {
+    VLOG(FULL_NODE_DEBUG) << "Skipping " << source_name << " block rebroadcast after candidate: "
                           << broadcast.block_id.to_str();
     return;
   }
@@ -556,12 +558,36 @@ void FullNodeImpl::rebroadcast_block_from_custom_overlay(const BlockBroadcast &b
   }
   auto shard = get_shard(broadcast.block_id.shard_full());
   if (shard.empty()) {
-    VLOG(FULL_NODE_WARNING) << "dropping custom-to-public block rebroadcast to unknown shard";
+    VLOG(FULL_NODE_WARNING) << "dropping " << source_name << " block rebroadcast to unknown shard";
     return;
   }
   custom_to_public_sent_blocks_.put(broadcast.block_id, {});
   td::actor::send_closure(shard, &FullNodeShard::send_broadcast_with_fanout, broadcast.clone(),
                           opts_.rebroadcast_from_custom_.peer_target_);
+}
+
+void FullNodeImpl::rebroadcast_block_candidate_to_public(const BlockIdExt &block_id, CatchainSeqno cc_seqno,
+                                                         td::uint32 validator_set_hash, const td::BufferSlice &data,
+                                                         td::Slice source_name) {
+  if (custom_to_public_sent_candidates_.contains(block_id)) {
+    return;
+  }
+  auto shard = get_shard(ShardIdFull{masterchainId, shardIdAll});
+  if (shard.empty()) {
+    VLOG(FULL_NODE_WARNING) << "dropping " << source_name << " block candidate rebroadcast to unknown shard";
+    return;
+  }
+  custom_to_public_sent_candidates_.put(block_id, {});
+  td::actor::send_closure(shard, &FullNodeShard::send_block_candidate_with_fanout, block_id, cc_seqno,
+                          validator_set_hash, data.clone(), opts_.rebroadcast_from_custom_.peer_target_);
+}
+
+void FullNodeImpl::rebroadcast_block_from_custom_overlay(const BlockBroadcast &broadcast) {
+  if (!should_rebroadcast_from_custom(broadcast.block_id.shard_full().workchain)) {
+    return;
+  }
+  rebroadcast_block_to_public(broadcast, opts_.rebroadcast_from_custom_.candidate_block_dedup_enabled_,
+                              "custom-to-public");
 }
 
 void FullNodeImpl::rebroadcast_block_candidate_from_custom_overlay(const BlockIdExt &block_id, CatchainSeqno cc_seqno,
@@ -571,17 +597,7 @@ void FullNodeImpl::rebroadcast_block_candidate_from_custom_overlay(const BlockId
       !should_rebroadcast_from_custom(block_id.shard_full().workchain)) {
     return;
   }
-  if (custom_to_public_sent_candidates_.contains(block_id)) {
-    return;
-  }
-  auto shard = get_shard(ShardIdFull{masterchainId, shardIdAll});
-  if (shard.empty()) {
-    VLOG(FULL_NODE_WARNING) << "dropping custom-to-public block candidate rebroadcast to unknown shard";
-    return;
-  }
-  custom_to_public_sent_candidates_.put(block_id, {});
-  td::actor::send_closure(shard, &FullNodeShard::send_block_candidate_with_fanout, block_id, cc_seqno,
-                          validator_set_hash, data.clone(), opts_.rebroadcast_from_custom_.peer_target_);
+  rebroadcast_block_candidate_to_public(block_id, cc_seqno, validator_set_hash, data, "custom-to-public");
 }
 
 void FullNodeImpl::got_key_block_config(td::Ref<ConfigHolder> config) {
@@ -671,6 +687,26 @@ void FullNodeImpl::process_block_broadcast(BlockBroadcast broadcast, bool signat
                               }
                             }
                           });
+}
+
+void FullNodeImpl::process_downloaded_block_for_rebroadcast(DownloadedBlock block) {
+  if (!block.from_network || !should_rebroadcast_downloaded(block.block.id.shard_full().workchain)) {
+    return;
+  }
+
+  if (block.block.id.is_masterchain()) {
+    if (block.is_proof_link || block.proof.empty() || block.sig_set.is_null()) {
+      VLOG(FULL_NODE_WARNING) << "skipping downloaded block rebroadcast without full proof/signatures: "
+                              << block.block.id.to_str();
+      return;
+    }
+    BlockBroadcast broadcast{block.block.id, block.sig_set, block.block.data.clone(), block.proof.clone()};
+    rebroadcast_block_to_public(broadcast, false, "downloaded-to-public");
+    return;
+  }
+
+  rebroadcast_block_candidate_to_public(block.block.id, block.cc_seqno, block.validator_set_hash, block.block.data,
+                                        "downloaded-to-public");
 }
 
 void FullNodeImpl::process_custom_overlay_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,

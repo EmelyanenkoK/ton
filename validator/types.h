@@ -29,6 +29,20 @@ struct ReceivedBlock {
   }
 };
 
+struct DownloadedBlock {
+  ReceivedBlock block;
+  td::BufferSlice proof;
+  bool is_proof_link = false;
+  td::Ref<block::BlockSignatureSet> sig_set;
+  CatchainSeqno cc_seqno = 0;
+  td::uint32 validator_set_hash = 0;
+  bool from_network = false;
+
+  DownloadedBlock clone() const {
+    return {block.clone(), proof.clone(), is_proof_link, sig_set, cc_seqno, validator_set_hash, from_network};
+  }
+};
+
 struct BlockBroadcast {
   BlockIdExt block_id;
   td::Ref<block::BlockSignatureSet> sig_set;

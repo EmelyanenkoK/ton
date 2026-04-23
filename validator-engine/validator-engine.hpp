@@ -269,12 +269,14 @@ class ValidatorEngine : public td::actor::Actor {
   bool parallel_validation_ = false;
   std::string db_event_fifo_path_;
   bool rebroadcast_from_custom_peer_target_explicit_ = false;
+  bool download_attempts_num_explicit_ = false;
   ton::validator::fullnode::FullNodeOptions full_node_options_ = {.config_ = {},
                                                                   .public_broadcast_speed_multiplier_ = 3.33,
                                                                   .private_broadcast_speed_multiplier_ = 3.33,
                                                                   .fast_sync_broadcast_speed_multiplier_ = 3.33,
                                                                   .initial_sync_delay_ = 60.0,
-                                                                  .rebroadcast_from_custom_ = {}};
+                                                                  .rebroadcast_from_custom_ = {},
+                                                                  .force_download_ = {}};
 
   std::set<ton::CatchainSeqno> unsafe_catchains_;
   std::map<ton::BlockSeqno, std::pair<ton::CatchainSeqno, td::uint32>> unsafe_catchain_rotations_;
@@ -442,6 +444,16 @@ class ValidatorEngine : public td::actor::Actor {
   }
   void set_force_good_peers_url(std::string url) {
     full_node_options_.rebroadcast_from_custom_.force_good_peers_url_ = std::move(url);
+  }
+  void set_force_download_peers(std::vector<ton::adnl::AdnlNodeIdShort> peers) {
+    full_node_options_.force_download_.peers_ = std::move(peers);
+  }
+  void set_download_attempts_num(td::uint32 count) {
+    download_attempts_num_explicit_ = true;
+    full_node_options_.force_download_.attempts_num_ = count;
+  }
+  void enable_rebroadcast_downloaded_block() {
+    full_node_options_.force_download_.rebroadcast_downloaded_block_ = true;
   }
   void add_rebroadcast_from_custom_workchain(ton::WorkchainId workchain) {
     full_node_options_.rebroadcast_from_custom_.allowed_workchains_.insert(workchain);

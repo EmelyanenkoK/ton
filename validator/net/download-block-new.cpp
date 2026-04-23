@@ -17,11 +17,16 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #include "adnl/utils.hpp"
+#include "block/block-auto.h"
+#include "block/block-parse.h"
+#include "block/signature-set.h"
 #include "td/utils/overloaded.h"
 #include "ton/ton-io.hpp"
 #include "ton/ton-shard.h"
 #include "ton/ton-tl.hpp"
 #include "validator/full-node.h"
+#include "vm/boc.h"
+#include "vm/cells/MerkleProof.h"
 
 #include "download-block-new.hpp"
 #include "full-node-serializer.hpp"
@@ -38,7 +43,7 @@ DownloadBlockNew::DownloadBlockNew(BlockIdExt block_id, adnl::AdnlNodeIdShort lo
                                    td::actor::ActorId<ValidatorManagerInterface> validator_manager,
                                    td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<overlay::Overlays> overlays,
                                    td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<adnl::AdnlExtClient> client,
-                                   td::Promise<ReceivedBlock> promise)
+                                   td::Promise<DownloadedBlock> promise)
     : block_id_(block_id)
     , local_id_(local_id)
     , overlay_id_(overlay_id)
@@ -51,8 +56,8 @@ DownloadBlockNew::DownloadBlockNew(BlockIdExt block_id, adnl::AdnlNodeIdShort lo
     , adnl_(adnl)
     , client_(client)
     , promise_(std::move(promise))
-    , block_{block_id_, td::BufferSlice()}
     , allow_partial_proof_{!block_id_.is_masterchain()} {
+  block_.block.id = block_id_;
 }
 
 DownloadBlockNew::DownloadBlockNew(adnl::AdnlNodeIdShort local_id, overlay::OverlayIdShort overlay_id,
@@ -61,7 +66,7 @@ DownloadBlockNew::DownloadBlockNew(adnl::AdnlNodeIdShort local_id, overlay::Over
                                    td::actor::ActorId<ValidatorManagerInterface> validator_manager,
                                    td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<overlay::Overlays> overlays,
                                    td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<adnl::AdnlExtClient> client,
-                                   td::Promise<ReceivedBlock> promise)
+                                   td::Promise<DownloadedBlock> promise)
     : local_id_(local_id)
     , overlay_id_(overlay_id)
     , prev_id_(prev_id)
@@ -73,8 +78,7 @@ DownloadBlockNew::DownloadBlockNew(adnl::AdnlNodeIdShort local_id, overlay::Over
     , overlays_(overlays)
     , adnl_(adnl)
     , client_(client)
-    , promise_(std::move(promise))
-    , block_{BlockIdExt{}, td::BufferSlice()} {
+    , promise_(std::move(promise)) {
 }
 
 void DownloadBlockNew::abort_query(td::Status reason) {
@@ -120,7 +124,7 @@ void DownloadBlockNew::got_block_handle(BlockHandle handle) {
     CHECK(prev_id_.is_valid());
     if (handle_->inited_next_left()) {
       block_id_ = handle_->one_next(true);
-      block_.id = block_id_;
+      block_.block.id = block_id_;
       handle_ = nullptr;
       start_up();
       return;
@@ -130,7 +134,7 @@ void DownloadBlockNew::got_block_handle(BlockHandle handle) {
   if (block_id_.is_valid() &&
       (handle_->inited_proof() || (handle_->inited_proof_link() && allow_partial_proof_) || skip_proof_) &&
       handle_->received()) {
-    CHECK(block_.id == block_id_);
+    CHECK(block_.block.id == block_id_);
     CHECK(handle_->id() == block_id_);
     auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<td::Ref<BlockData>> R) {
       if (R.is_error()) {
@@ -293,10 +297,16 @@ void DownloadBlockNew::got_ready_to_deserialize(tl_object_ptr<ton_api::tonNode_D
     abort_query(td::Status::Error(ErrorCode::notready, "received data for wrong block"));
     return;
   }
-  block_.id = id;
-  block_.data = std::move(block_data);
-  if (td::sha256_bits256(block_.data.as_slice()) != id.file_hash) {
+  block_.block.id = id;
+  block_.block.data = std::move(block_data);
+  if (td::sha256_bits256(block_.block.data.as_slice()) != id.file_hash) {
     abort_query(td::Status::Error(ErrorCode::notready, "received data with bad hash"));
+    return;
+  }
+
+  S = fill_block_metadata(proof.as_slice(), is_link);
+  if (S.is_error()) {
+    abort_query(S.move_as_error_prefix("received bad proof metadata: "));
     return;
   }
 
@@ -322,13 +332,153 @@ void DownloadBlockNew::got_ready_to_deserialize(tl_object_ptr<ton_api::tonNode_D
   }
 }
 
+td::Status DownloadBlockNew::fill_block_metadata(td::Slice proof, bool is_proof_link) {
+  TRY_RESULT(proof_root, vm::std_boc_deserialize(proof));
+  block::gen::BlockProof::Record proof_rec;
+  BlockIdExt proof_blk_id;
+  if (!(tlb::unpack_cell(proof_root, proof_rec) &&
+        block::tlb::t_BlockIdExt.unpack(proof_rec.proof_for.write(), proof_blk_id))) {
+    return td::Status::Error("cannot unpack block proof");
+  }
+  if (proof_blk_id != block_.block.id) {
+    return td::Status::Error("block proof is for another block");
+  }
+
+  TRY_RESULT(header_root, vm::MerkleProof::virtualize(proof_rec.root));
+  block::gen::Block::Record blk;
+  block::gen::BlockInfo::Record info;
+  if (!(tlb::unpack_cell(std::move(header_root), blk) && tlb::unpack_cell(blk.info, info) && !info.version)) {
+    return td::Status::Error("cannot unpack block header in proof");
+  }
+
+  block_.proof = td::BufferSlice(proof);
+  block_.is_proof_link = is_proof_link;
+  block_.cc_seqno = info.gen_catchain_seqno;
+  block_.validator_set_hash = info.gen_validator_list_hash_short;
+  block_.from_network = true;
+
+  if (!is_proof_link) {
+    td::Ref<vm::Cell> sig_root = proof_rec.signatures->prefetch_ref();
+    if (sig_root.is_null()) {
+      return td::Status::Error("block proof has no signatures");
+    }
+    ValidatorWeight sig_weight = 0;
+    TRY_RESULT(sig_set, block::BlockSignatureSet::fetch(std::move(sig_root), sig_weight));
+    block_.sig_set = std::move(sig_set);
+  }
+  return td::Status::OK();
+}
+
 void DownloadBlockNew::got_data_from_db(td::BufferSlice data) {
-  block_.data = std::move(data);
+  block_.block.data = std::move(data);
   finish_query();
 }
 
 void DownloadBlockNew::checked_block_proof() {
   finish_query();
+}
+
+DownloadBlockNewParallel::DownloadBlockNewParallel(
+    BlockIdExt block_id, adnl::AdnlNodeIdShort local_id, overlay::OverlayIdShort overlay_id,
+    std::vector<adnl::AdnlNodeIdShort> download_from, td::uint32 priority, td::Timestamp timeout,
+    td::actor::ActorId<ValidatorManagerInterface> validator_manager, td::actor::ActorId<rldp::Rldp> rldp,
+    td::actor::ActorId<overlay::Overlays> overlays, td::actor::ActorId<adnl::Adnl> adnl,
+    td::actor::ActorId<adnl::AdnlExtClient> client, td::Promise<DownloadedBlock> promise)
+    : block_id_(block_id)
+    , local_id_(local_id)
+    , overlay_id_(overlay_id)
+    , download_from_(std::move(download_from))
+    , priority_(priority)
+    , timeout_(timeout)
+    , validator_manager_(validator_manager)
+    , rldp_(rldp)
+    , overlays_(overlays)
+    , adnl_(adnl)
+    , client_(client)
+    , promise_(std::move(promise)) {
+}
+
+DownloadBlockNewParallel::DownloadBlockNewParallel(
+    adnl::AdnlNodeIdShort local_id, overlay::OverlayIdShort overlay_id, BlockIdExt prev_id,
+    std::vector<adnl::AdnlNodeIdShort> download_from, td::uint32 priority, td::Timestamp timeout,
+    td::actor::ActorId<ValidatorManagerInterface> validator_manager, td::actor::ActorId<rldp::Rldp> rldp,
+    td::actor::ActorId<overlay::Overlays> overlays, td::actor::ActorId<adnl::Adnl> adnl,
+    td::actor::ActorId<adnl::AdnlExtClient> client, td::Promise<DownloadedBlock> promise)
+    : prev_id_(prev_id)
+    , local_id_(local_id)
+    , overlay_id_(overlay_id)
+    , download_from_(std::move(download_from))
+    , priority_(priority)
+    , timeout_(timeout)
+    , validator_manager_(validator_manager)
+    , rldp_(rldp)
+    , overlays_(overlays)
+    , adnl_(adnl)
+    , client_(client)
+    , promise_(std::move(promise)) {
+}
+
+void DownloadBlockNewParallel::start_up() {
+  alarm_timestamp() = timeout_;
+  if (download_from_.empty()) {
+    abort_query(td::Status::Error(ErrorCode::notready, "no forced download peers"));
+    return;
+  }
+
+  pending_ = download_from_.size();
+  attempts_.reserve(download_from_.size());
+  for (size_t i = 0; i < download_from_.size(); ++i) {
+    auto P = td::PromiseCreator::lambda([SelfId = actor_id(this)](td::Result<DownloadedBlock> R) mutable {
+      td::actor::send_closure(SelfId, &DownloadBlockNewParallel::got_result, std::move(R));
+    });
+    if (block_id_.is_valid()) {
+      attempts_.push_back(td::actor::create_actor<DownloadBlockNew>(
+          PSTRING() << "downloadreq" << i, block_id_, local_id_, overlay_id_, download_from_[i], priority_, timeout_,
+          validator_manager_, rldp_, overlays_, adnl_, client_, std::move(P)));
+    } else {
+      attempts_.push_back(td::actor::create_actor<DownloadBlockNew>(
+          PSTRING() << "downloadnext" << i, local_id_, overlay_id_, prev_id_, download_from_[i], priority_, timeout_,
+          validator_manager_, rldp_, overlays_, adnl_, client_, std::move(P)));
+    }
+  }
+}
+
+void DownloadBlockNewParallel::alarm() {
+  abort_query(td::Status::Error(ErrorCode::timeout, "timeout"));
+}
+
+void DownloadBlockNewParallel::got_result(td::Result<DownloadedBlock> result) {
+  if (finished_) {
+    return;
+  }
+  if (result.is_ok()) {
+    finished_ = true;
+    if (promise_) {
+      promise_.set_value(result.move_as_ok());
+    }
+    attempts_.clear();
+    stop();
+    return;
+  }
+
+  last_error_ = result.move_as_error();
+  CHECK(pending_ > 0);
+  pending_--;
+  if (pending_ == 0) {
+    abort_query(std::move(last_error_));
+  }
+}
+
+void DownloadBlockNewParallel::abort_query(td::Status reason) {
+  if (finished_) {
+    return;
+  }
+  finished_ = true;
+  if (promise_) {
+    promise_.set_error(std::move(reason));
+  }
+  attempts_.clear();
+  stop();
 }
 
 }  // namespace fullnode

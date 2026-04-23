@@ -96,6 +96,7 @@ class FullNodeImpl : public FullNode {
 
   void process_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) override;
   void process_custom_overlay_block_broadcast(BlockBroadcast broadcast, bool signatures_checked = false) override;
+  void process_downloaded_block_for_rebroadcast(DownloadedBlock block) override;
   void process_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                          td::BufferSlice data) override;
   void process_custom_overlay_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
@@ -185,6 +186,12 @@ class FullNodeImpl : public FullNode {
   void send_shard_block_info_to_custom_overlays(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                                 const td::BufferSlice& data);
   bool should_rebroadcast_from_custom(WorkchainId workchain) const;
+  bool should_rebroadcast_downloaded(WorkchainId workchain) const;
+  void rebroadcast_block_to_public(const BlockBroadcast& broadcast, bool apply_candidate_dedup,
+                                   td::Slice source_name);
+  void rebroadcast_block_candidate_to_public(const BlockIdExt& block_id, CatchainSeqno cc_seqno,
+                                             td::uint32 validator_set_hash, const td::BufferSlice& data,
+                                             td::Slice source_name);
   void rebroadcast_block_from_custom_overlay(const BlockBroadcast& broadcast);
   void rebroadcast_block_candidate_from_custom_overlay(const BlockIdExt& block_id, CatchainSeqno cc_seqno,
                                                        td::uint32 validator_set_hash, const td::BufferSlice& data);

@@ -223,6 +223,9 @@ class FullNodeShardImpl : public FullNodeShard {
   bool uses_force_good_peers() const;
   void refresh_force_good_peers();
   std::vector<adnl::AdnlNodeIdShort> choose_force_good_peers(td::uint32 fanout_override) const;
+  bool uses_force_download_peers() const;
+  std::vector<adnl::AdnlNodeIdShort> choose_force_download_peers() const;
+  void finish_download_block(DownloadedBlock block, td::Promise<ReceivedBlock> promise);
 
   void ping_neighbours();
   void reload_neighbours();
