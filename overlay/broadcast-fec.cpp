@@ -329,6 +329,7 @@ class BroadcastFecPart {
 
   td::Status run_checks(OverlayImpl *overlay, BroadcastFec *bcast);
   td::Status run(OverlayImpl *overlay, BroadcastFec &bcast);
+  bool is_trusted_outbound_rebroadcast() const;
 
  private:
   Overlay::BroadcastHash broadcast_hash_;
@@ -354,6 +355,10 @@ class BroadcastFecPart {
   std::vector<adnl::AdnlNodeIdShort> force_peers_;
 };
 
+bool BroadcastFecPart::is_trusted_outbound_rebroadcast() const {
+  return fanout_override_ != 0 && src_peer_id_ == adnl::AdnlNodeIdShort::zero();
+}
+
 td::Status BroadcastFecPart::run_checks(OverlayImpl *overlay, BroadcastFec *bcast) {
   if (bcast && bcast->received_part(seqno_)) {
     return td::Status::Error(ErrorCode::notready, "duplicate part");
@@ -364,7 +369,18 @@ td::Status BroadcastFecPart::run_checks(OverlayImpl *overlay, BroadcastFec *bcas
   }
 
   if (r == BroadcastCheckResult::NeedCheck) {
-    untrusted_ = true;
+    if (is_trusted_outbound_rebroadcast()) {
+      if (seqno_ == 0) {
+        LOG(INFO) << "public rebroadcast fec trusted outbound hash=" << broadcast_hash_
+                  << " data_hash=" << broadcast_data_hash_ << " fanout_target=" << fanout_override_
+                  << " force_good_selected=" << force_peers_.size();
+      }
+      if (bcast) {
+        TRY_STATUS(bcast->is_eligible_sender(source_));
+      }
+    } else {
+      untrusted_ = true;
+    }
   } else if (bcast) {
     TRY_STATUS(bcast->is_eligible_sender(source_));
   }
