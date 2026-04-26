@@ -53,6 +53,9 @@ static constexpr td::uint32 SPLIT_MAX_QUEUE_SIZE = 100000;
 static constexpr td::uint32 MERGE_MAX_QUEUE_SIZE = 2047;
 static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
+static constexpr double COLLATION_TIME_OVERLOAD_FACTOR = 0.6;
+static constexpr double COLLATION_TIME_MERGE_PREVENT_FACTOR = COLLATION_TIME_OVERLOAD_FACTOR * 0.5;
+static constexpr double COLLATION_TIME_WAIT_EXTERNALS_FACTOR = 0.2;
 
 static constexpr int MAX_ATTEMPTS = 5;
 
@@ -5522,13 +5525,15 @@ bool Collator::check_block_overload() {
   block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
 
   bool too_long_collation = false;
+  bool collation_time_prevents_merge = false;
   if (params_.wait_externals_until) {
     double do_collate_time = td::Timestamp::now() - do_collate_started_at_;
     double total_time = td::Timestamp::now() - collator_started_at_;
     LOG(INFO) << "Check block overload timers: wait_externals=" << wait_externals_total_time_
               << " do_collate=" << do_collate_time << " total=" << total_time;
-    if (total_time > 0.1 && wait_externals_total_time_ < total_time * 0.2 && do_collate_time > total_time * 0.6) {
-      too_long_collation = true;
+    if (total_time > 0.1 && wait_externals_total_time_ < total_time * COLLATION_TIME_WAIT_EXTERNALS_FACTOR) {
+      collation_time_prevents_merge = do_collate_time > total_time * COLLATION_TIME_MERGE_PREVENT_FACTOR;
+      too_long_collation = do_collate_time > total_time * COLLATION_TIME_OVERLOAD_FACTOR;
     }
   }
 
@@ -5553,6 +5558,9 @@ bool Collator::check_block_overload() {
       LOG(INFO)
           << "block is underloaded, but don't set underload history because out_msg_queue size is too big to merge ("
           << out_msg_queue_size_ << " > " << MERGE_MAX_QUEUE_SIZE << ")";
+    } else if (collation_time_prevents_merge) {
+      LOG(INFO) << "block is underloaded, but don't set underload history because collation reached half of split "
+                   "time budget";
     } else {
       underload_history_ |= 1;
       LOG(INFO) << "block is underloaded";
