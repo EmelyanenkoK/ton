@@ -278,7 +278,7 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
         peers.push_back(peer);
       }
     });
-    LOG(INFO) << "loaded force-good-peers url=" << url_ << " peers=" << peers.size() << " skipped=" << skipped;
+    LOG(WARNING) << "loaded force-good-peers url=" << url_ << " peers=" << peers.size() << " skipped=" << skipped;
     return peers;
   }
 

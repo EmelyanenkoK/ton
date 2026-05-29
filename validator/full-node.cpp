@@ -565,8 +565,8 @@ void FullNodeImpl::rebroadcast_block_to_public(const BlockBroadcast &broadcast, 
     return;
   }
   custom_to_public_sent_blocks_.put(broadcast.block_id, {});
-  LOG(INFO) << "public rebroadcast scheduled source=" << source_name << " type=block block="
-            << broadcast.block_id.to_str() << " fanout_target=" << opts_.rebroadcast_from_custom_.peer_target_;
+  LOG(WARNING) << "public rebroadcast scheduled source=" << source_name << " type=block block="
+               << broadcast.block_id.to_str() << " fanout_target=" << opts_.rebroadcast_from_custom_.peer_target_;
   td::actor::send_closure(shard, &FullNodeShard::send_broadcast_with_fanout, broadcast.clone(),
                           opts_.rebroadcast_from_custom_.peer_target_);
 }
@@ -586,9 +586,9 @@ void FullNodeImpl::rebroadcast_block_candidate_to_public(const BlockIdExt &block
     return;
   }
   custom_to_public_sent_candidates_.put(block_id, {});
-  LOG(INFO) << "public rebroadcast scheduled source=" << source_name << " type=candidate block=" << block_id.to_str()
-            << " cc_seqno=" << cc_seqno << " validator_set_hash=" << validator_set_hash
-            << " fanout_target=" << opts_.rebroadcast_from_custom_.peer_target_;
+  LOG(WARNING) << "public rebroadcast scheduled source=" << source_name << " type=candidate block=" << block_id.to_str()
+               << " cc_seqno=" << cc_seqno << " validator_set_hash=" << validator_set_hash
+               << " fanout_target=" << opts_.rebroadcast_from_custom_.peer_target_;
   td::actor::send_closure(shard, &FullNodeShard::send_block_candidate_with_fanout, block_id, cc_seqno,
                           validator_set_hash, data.clone(), opts_.rebroadcast_from_custom_.peer_target_);
 }
