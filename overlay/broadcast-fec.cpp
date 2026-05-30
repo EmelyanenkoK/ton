@@ -553,14 +553,14 @@ void BroadcastsFec::signed_(OverlayImpl *overlay, std::unique_ptr<BroadcastFecPa
   part->signature_ = std::move(V.first);
   part->cert_ = overlay->get_certificate(part->source_.compute_short_id());
   if (part->fanout_override_ != 0 && part->seqno_ == 0) {
-    LOG(INFO) << "public rebroadcast fec signed hash=" << part->broadcast_hash_
-              << " source=" << part->source_.compute_short_id()
-              << " fanout_target=" << part->fanout_override_
-              << " force_good_selected=" << part->force_peers_.size()
-              << " cert_attached=" << (part->cert_ != nullptr)
-              << " cert_issuer=" << (part->cert_ ? part->cert_->issuer_hash() : PublicKeyHash::zero())
-              << " cert_expire_at=" << (part->cert_ ? part->cert_->expire_at() : 0)
-              << " cert_flags=" << (part->cert_ ? part->cert_->flags() : 0);
+    LOG(WARNING) << "public rebroadcast fec signed hash=" << part->broadcast_hash_
+                 << " source=" << part->source_.compute_short_id()
+                 << " fanout_target=" << part->fanout_override_
+                 << " force_good_selected=" << part->force_peers_.size()
+                 << " cert_attached=" << (part->cert_ != nullptr)
+                 << " cert_issuer=" << (part->cert_ ? part->cert_->issuer_hash() : PublicKeyHash::zero())
+                 << " cert_expire_at=" << (part->cert_ ? part->cert_->expire_at() : 0)
+                 << " cert_flags=" << (part->cert_ ? part->cert_->flags() : 0);
   }
   td::Status S = process(overlay, *part);
   if (S.is_error() && S.code() != ErrorCode::notready) {

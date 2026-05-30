@@ -446,7 +446,7 @@ class ValidatorEngine : public td::actor::Actor {
     full_node_options_.rebroadcast_from_custom_.peer_target_ = count;
   }
   void set_force_good_peers_url(std::string url) {
-    LOG(INFO) << "configured force-good-peers url=" << url;
+    LOG(WARNING) << "configured force-good-peers url=" << url;
     full_node_options_.rebroadcast_from_custom_.force_good_peers_url_ = std::move(url);
   }
   void set_force_download_peers(std::vector<ton::adnl::AdnlNodeIdShort> peers) {

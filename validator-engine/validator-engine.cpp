@@ -3131,10 +3131,10 @@ void ValidatorEngine::register_shard_overlay_certificate_callback() {
       }
       ton::ShardIdFull shard{ton::WorkchainId{res->workchain_}, static_cast<ton::ShardId>(res->shard_)};
       ton::PublicKeyHash signed_key{res->signed_key_->key_hash_};
-      LOG(INFO) << "public rebroadcast cert received from=" << src << " dst=" << dst << " shard=" << shard.to_str()
-                << " signed_key=" << signed_key << " issuer=" << cert->issuer_hash()
-                << " expire_at=" << cert->expire_at() << " max_size=" << cert->max_size()
-                << " flags=" << cert->flags();
+      LOG(WARNING) << "public rebroadcast cert received from=" << src << " dst=" << dst << " shard=" << shard.to_str()
+                   << " signed_key=" << signed_key << " issuer=" << cert->issuer_hash()
+                   << " expire_at=" << cert->expire_at() << " max_size=" << cert->max_size()
+                   << " flags=" << cert->flags();
       td::actor::send_closure(
           validator_engine_, &ValidatorEngine::try_import_shard_overlay_certificate, src, shard, signed_key,
           std::move(cert), td::PromiseCreator::lambda([src, dst, shard, signed_key](td::Result<> R) {
@@ -3143,8 +3143,8 @@ void ValidatorEngine::register_shard_overlay_certificate_callback() {
                            << " shard=" << shard.to_str() << " signed_key=" << signed_key
                            << " error=" << R.move_as_error();
             } else {
-              LOG(INFO) << "public rebroadcast cert imported from=" << src << " dst=" << dst
-                        << " shard=" << shard.to_str() << " signed_key=" << signed_key;
+              LOG(WARNING) << "public rebroadcast cert imported from=" << src << " dst=" << dst
+                            << " shard=" << shard.to_str() << " signed_key=" << signed_key;
             }
           }));
     }
@@ -3255,10 +3255,10 @@ void ValidatorEngine::try_import_shard_overlay_certificate(ton::adnl::AdnlNodeId
   if (certificate->expire_at() < td::Clocks::system() + 60) {
     return promise.set_error(td::Status::Error("certificate expires too soon"));
   }
-  LOG(INFO) << "public rebroadcast cert import scheduled from=" << src << " shard=" << shard.to_str()
-            << " signed_key=" << signed_key << " issuer=" << certificate->issuer_hash()
-            << " expire_at=" << certificate->expire_at() << " max_size=" << certificate->max_size()
-            << " flags=" << certificate->flags();
+  LOG(WARNING) << "public rebroadcast cert import scheduled from=" << src << " shard=" << shard.to_str()
+               << " signed_key=" << signed_key << " issuer=" << certificate->issuer_hash()
+               << " expire_at=" << certificate->expire_at() << " max_size=" << certificate->max_size()
+               << " flags=" << certificate->flags();
   td::actor::send_closure(full_node_, &ton::validator::fullnode::FullNode::import_shard_overlay_certificate, shard,
                           signed_key, std::move(certificate), std::move(promise));
 }
