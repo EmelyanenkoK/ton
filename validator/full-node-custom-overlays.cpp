@@ -86,8 +86,7 @@ void FullNodeCustomOverlay::process_block_broadcast(PublicKeyHash src, ton_api::
   }
   VLOG(FULL_NODE_DEBUG) << "Received block broadcast " << (B.ok().sig_set->is_final() ? "" : "(approve signatures) ")
                         << "in custom overlay \"" << name_ << "\" from " << src << ": " << B.ok().block_id;
-  td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), false,
-                          BroadcastSource::custom_overlay);
+  td::actor::send_closure(full_node_, &FullNode::process_custom_overlay_block_broadcast, B.move_as_ok(), false);
 }
 
 void FullNodeCustomOverlay::obtain_state_for_decompression(PublicKeyHash src,
@@ -124,8 +123,7 @@ void FullNodeCustomOverlay::process_block_broadcast_with_state(PublicKeyHash src
   }
   VLOG(FULL_NODE_DEBUG) << "Received block broadcast in custom overlay \"" << name_ << "\" from " << src << ": "
                         << B.ok().block_id;
-  td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), true,
-                          BroadcastSource::custom_overlay);
+  td::actor::send_closure(full_node_, &FullNode::process_custom_overlay_block_broadcast, B.move_as_ok(), true);
 }
 
 void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src, ton_api::tonNode_externalMessageBroadcast &query) {
@@ -182,8 +180,8 @@ void FullNodeCustomOverlay::process_block_candidate_broadcast(PublicKeyHash src,
   }
   VLOG(FULL_NODE_DEBUG) << "Received newBlockCandidate in custom overlay \"" << name_ << "\" from " << src << ": "
                         << block_id;
-  td::actor::send_closure(full_node_, &FullNode::process_block_candidate_broadcast, block_id, cc_seqno,
-                          validator_set_hash, std::move(data), BroadcastSource::custom_overlay);
+  td::actor::send_closure(full_node_, &FullNode::process_custom_overlay_block_candidate_broadcast, block_id, cc_seqno,
+                          validator_set_hash, std::move(data));
 }
 
 void FullNodeCustomOverlay::process_broadcast(PublicKeyHash src, ton_api::tonNode_newShardBlockBroadcast &query) {
