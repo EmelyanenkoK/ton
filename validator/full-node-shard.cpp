@@ -61,6 +61,8 @@ namespace {
 constexpr const char *k_called_from_public = "public";
 constexpr td::uint32 k_heavy_request_cost_unit = 1 << 21;
 constexpr size_t k_ed25519_signature_size = 64;
+constexpr double k_force_good_peers_fetch_timeout = 60.0;
+constexpr double k_force_good_peers_active_retry_delay = 5.0;
 
 size_t heavy_request_cost(td::uint64 requested_max_size) {
   size_t cost = static_cast<size_t>((requested_max_size + k_heavy_request_cost_unit - 1) / k_heavy_request_cost_unit);
@@ -133,9 +135,15 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
             td::Result<std::pair<std::unique_ptr<http::HttpResponse>, std::shared_ptr<http::HttpPayload>>> R) mutable {
           td::actor::send_closure(SelfId, &ForceGoodPeersFetcher::got_response, std::move(R));
         });
+    alarm_timestamp() = td::Timestamp::in(k_force_good_peers_fetch_timeout);
     td::actor::send_closure(client_, &http::HttpClient::send_request, std::move(request),
                             std::make_shared<http::HttpPayload>(http::HttpPayload::PayloadType::pt_empty),
-                            td::Timestamp::in(60.0), std::move(promise));
+                            td::Timestamp::in(k_force_good_peers_fetch_timeout), std::move(promise));
+  }
+
+  void alarm() override {
+    finish(td::Status::Error(PSTRING() << "force-good-peers request timed out after "
+                                       << k_force_good_peers_fetch_timeout << "s"));
   }
 
   void got_response(
@@ -430,12 +438,14 @@ void FullNodeShardImpl::refresh_force_good_peers() {
     return;
   }
   if (force_good_peers_refresh_active_) {
-    LOG(WARNING) << "force-good-peers refresh skipped shard=" << shard_.to_str() << " reason=already-active";
+    VLOG(FULL_NODE_DEBUG) << "force-good-peers refresh skipped shard=" << shard_.to_str() << " reason=already-active";
+    refresh_force_good_peers_at_ = td::Timestamp::in(k_force_good_peers_active_retry_delay);
     return;
   }
   LOG(WARNING) << "force-good-peers refresh start shard=" << shard_.to_str()
                << " url=" << opts_.rebroadcast_from_custom_.force_good_peers_url_;
   force_good_peers_refresh_active_ = true;
+  refresh_force_good_peers_at_ = td::Timestamp::in(k_force_good_peers_active_retry_delay);
   td::actor::create_actor<ForceGoodPeersFetcher>("forcegoodpeers", opts_.rebroadcast_from_custom_.force_good_peers_url_,
                                                  adnl_id_, adnl_, actor_id(this))
       .release();
