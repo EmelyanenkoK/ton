@@ -3047,6 +3047,7 @@ void ValidatorEngine::register_shard_overlay_certificate_callback() {
     return;
   }
   if (!accept_shard_overlay_certificates_from_any_validator_ && accept_shard_overlay_certificates_from_.empty()) {
+    LOG(WARNING) << "public rebroadcast cert callback disabled: no --accept-certs-from configured";
     return;
   }
   class Callback : public ton::adnl::Adnl::Callback {

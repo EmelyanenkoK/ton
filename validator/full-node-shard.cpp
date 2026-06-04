@@ -170,9 +170,10 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
           : fetcher_(fetcher), payload_(std::move(payload)) {
       }
       void run(size_t ready_bytes) override {
+        td::actor::send_closure(fetcher_, &ForceGoodPeersFetcher::got_payload_progress, payload_, false);
       }
       void completed() override {
-        td::actor::send_closure(fetcher_, &ForceGoodPeersFetcher::got_payload, payload_);
+        td::actor::send_closure(fetcher_, &ForceGoodPeersFetcher::got_payload_progress, payload_, true);
       }
 
      private:
@@ -183,6 +184,8 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
     payload->add_callback(std::make_unique<PayloadCallback>(actor_id(this), std::move(payload)));
     if (raw_payload->parse_completed()) {
       got_payload(std::move(raw_payload));
+    } else if (raw_payload->ready_bytes() > 0) {
+      got_payload_progress(std::move(raw_payload), false);
     }
   }
 
@@ -190,26 +193,45 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
     if (finished_) {
       return;
     }
-    auto R = parse_payload(std::move(payload));
+    auto S = append_payload(*payload);
+    if (S.is_error()) {
+      finish(S.move_as_error());
+      return;
+    }
+    auto R = parse_payload();
     finish(std::move(R));
   }
 
+  void got_payload_progress(std::shared_ptr<http::HttpPayload> payload, bool completed) {
+    if (finished_) {
+      return;
+    }
+    auto S = append_payload(*payload);
+    if (S.is_error()) {
+      finish(S.move_as_error());
+      return;
+    }
+    if (completed || payload->parse_completed()) {
+      auto R = parse_payload();
+      finish(std::move(R));
+    }
+  }
+
  private:
-  td::Result<std::string> read_payload(http::HttpPayload &payload) {
+  td::Status append_payload(http::HttpPayload &payload) {
     static constexpr size_t max_body_size = 1 << 20;
-    std::string body;
     while (true) {
       auto chunk = payload.get_slice(max_body_size);
       if (chunk.empty()) {
         break;
       }
-      if (body.size() + chunk.size() > max_body_size) {
+      if (body_.size() + chunk.size() > max_body_size) {
         return td::Status::Error("force-good-peers response is too large");
       }
       auto slice = chunk.as_slice();
-      body.append(slice.begin(), slice.size());
+      body_.append(slice.begin(), slice.size());
     }
-    return body;
+    return td::Status::OK();
   }
 
   td::Result<adnl::AdnlNodeIdShort> parse_peer(td::Slice declared_name, const td::JsonValue &value) {
@@ -261,9 +283,8 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
     return short_id;
   }
 
-  td::Result<std::vector<adnl::AdnlNodeIdShort>> parse_payload(std::shared_ptr<http::HttpPayload> payload) {
-    TRY_RESULT(body, read_payload(*payload));
-    auto json = td::json_decode(td::MutableSlice(body.data(), body.size()));
+  td::Result<std::vector<adnl::AdnlNodeIdShort>> parse_payload() {
+    auto json = td::json_decode(td::MutableSlice(body_.data(), body_.size()));
     if (json.is_error()) {
       return json.move_as_error_prefix("failed to parse force-good-peers JSON: ");
     }
@@ -310,6 +331,7 @@ class ForceGoodPeersFetcher : public td::actor::Actor {
   td::actor::ActorId<adnl::Adnl> adnl_;
   td::actor::ActorId<FullNodeShardImpl> parent_;
   td::actor::ActorOwn<http::HttpClient> client_;
+  std::string body_;
   bool finished_ = false;
 };
 
