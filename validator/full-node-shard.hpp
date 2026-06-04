@@ -19,6 +19,8 @@
 #pragma once
 
 #include <set>
+#include <string>
+#include <vector>
 
 #include "auto/tl/ton_api.h"
 #include "td/actor/PromiseFuture.h"
@@ -72,7 +74,7 @@ class FullNodeShardImpl : public FullNodeShard {
     return 3;
   }
   static constexpr td::uint32 proto_version_minor() {
-    return 0;
+    return 1;
   }
   static constexpr td::uint32 max_neighbours() {
     return 16;
@@ -227,6 +229,11 @@ class FullNodeShardImpl : public FullNodeShard {
   bool uses_force_download_peers() const;
   std::vector<adnl::AdnlNodeIdShort> choose_force_download_peers() const;
   void finish_download_block(DownloadedBlock block, td::Promise<ReceivedBlock> promise);
+  PublicKeyHash choose_outbound_source(td::uint32 payload_size, bool is_fec) const;
+  bool has_valid_certificate_for_source(const PublicKeyHash &source,
+                                        const std::shared_ptr<ton::overlay::Certificate> &cert, td::uint32 payload_size,
+                                        bool is_fec) const;
+  PublicKeyHash full_node_adnl_source() const;
 
   void ping_neighbours();
   void reload_neighbours();
@@ -251,8 +258,7 @@ class FullNodeShardImpl : public FullNodeShard {
   FullNodeShardImpl(ShardIdFull shard, PublicKeyHash local_id, adnl::AdnlNodeIdShort adnl_id,
                     FileHash zero_state_file_hash, FullNodeOptions opts, std::shared_ptr<RateLimiter<>> limiter,
                     td::actor::ActorId<keyring::Keyring> keyring, td::actor::ActorId<adnl::Adnl> adnl,
-                    td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<rldp2::Rldp> rldp2,
-                    td::actor::ActorId<overlay::Overlays> overlays,
+                    td::actor::ActorId<rldp2::Rldp> rldp2, td::actor::ActorId<overlay::Overlays> overlays,
                     td::actor::ActorId<ValidatorManagerInterface> validator_manager,
                     td::actor::ActorId<adnl::AdnlExtClient> client, td::actor::ActorId<FullNode> full_node,
                     bool active);
@@ -272,7 +278,6 @@ class FullNodeShardImpl : public FullNodeShard {
 
   td::actor::ActorId<keyring::Keyring> keyring_;
   td::actor::ActorId<adnl::Adnl> adnl_;
-  td::actor::ActorId<rldp::Rldp> rldp_;
   td::actor::ActorId<rldp2::Rldp> rldp2_;
   td::actor::ActorId<overlay::Overlays> overlays_;
   td::actor::ActorId<ValidatorManagerInterface> validator_manager_;
@@ -288,6 +293,7 @@ class FullNodeShardImpl : public FullNodeShard {
   td::Timestamp sync_completed_at_;
 
   std::shared_ptr<ton::overlay::Certificate> cert_;
+  std::shared_ptr<ton::overlay::Certificate> adnl_source_cert_;
   overlay::OverlayPrivacyRules rules_;
 
   std::map<adnl::AdnlNodeIdShort, Neighbour> neighbours_;

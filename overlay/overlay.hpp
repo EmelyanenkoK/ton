@@ -72,25 +72,6 @@ struct TrafficStats {
   tl_object_ptr<ton_api::engine_validator_overlayStatsTraffic> tl() const;
 };
 
-// Same shape as TrafficStats but never reset; used as the source of monotonic Prometheus counters.
-// (TrafficStats above is repurposed by alarm() to hold a 50s rate, which is unsuitable for `rate()` queries.)
-struct AccTrafficStats {
-  td::uint64 out_bytes = 0;
-  td::uint64 in_bytes = 0;
-  td::uint64 out_packets = 0;
-  td::uint64 in_packets = 0;
-
-  void add_packet(td::uint64 size, bool in) {
-    if (in) {
-      in_bytes += size;
-      in_packets++;
-    } else {
-      out_bytes += size;
-      out_packets++;
-    }
-  }
-};
-
 class OverlayPeer {
  public:
   adnl::AdnlNodeIdShort get_id() const {
@@ -190,10 +171,16 @@ struct BroadcastsLimiter {
 
     static constexpr double WINDOW = 60.0;
   };
+  PublicKeyHash key = PublicKeyHash::zero();
   Stats stats_prev, stats_current;
   bool stats_inited = false;
 
+  td::RateLimiterWindow broadcast_rate_limiter_;
+  td::RateLimiterWindow broadcast_size_rate_limiter_;
+
   void init_stats(double now = td::Clocks::system());
+  td::Status precheck_new_broadcast(td::uint64 total_size);
+  td::Status try_register_broadcast(td::uint64 total_size);
   void register_broadcast(td::uint64 total_size);
   void register_out_traffic(td::uint64 size);
   tl_object_ptr<ton_api::engine_validator_overlayStatsBroadcasts> tl(PublicKeyHash src,
@@ -205,6 +192,7 @@ struct AuthorizedKeyLimiter {
   td::LRUCache<std::pair<PublicKeyHash, td::Bits256>, td::Unit> checked_certificates_lru_{100};
   td::LRUCache<std::pair<adnl::AdnlNodeIdShort, td::Bits256>, td::Unit> checked_member_certificates_lru_{100};
   BroadcastsLimiter broadcasts_;
+  bool broadcasts_inited_ = false;
 };
 
 class OverlayImpl : public Overlay {
@@ -273,9 +261,10 @@ class OverlayImpl : public Overlay {
 
   td::Status check_date(td::uint32 date);
   BroadcastCheckResult check_source_eligible(PublicKey source, const Certificate *cert, td::uint32 size, bool is_fec,
+                                             bool is_any_sender,
                                              adnl::AdnlNodeIdShort message_from = adnl::AdnlNodeIdShort::zero());
   BroadcastCheckResult check_source_eligible(const PublicKeyHash &source, const Certificate *cert, td::uint32 size,
-                                             bool is_fec,
+                                             bool is_fec, bool is_any_sender,
                                              adnl::AdnlNodeIdShort message_from = adnl::AdnlNodeIdShort::zero());
 
   void deliver_broadcast(PublicKeyHash source, td::BufferSlice data, td::BufferSlice extra);
@@ -328,10 +317,6 @@ class OverlayImpl : public Overlay {
   td::Result<Encryptor *> get_encryptor(PublicKey source);
 
   void get_stats(td::Promise<tl_object_ptr<ton_api::engine_validator_overlayStats>> promise) override;
-  void get_acc_stats(td::Promise<AccStatsSnapshot> promise) override;
-  void note_outbound_message_tl(td::int32 magic, td::uint64 size) override {
-    messages_sent_by_tl_.account_with_magic(magic, size);
-  }
 
   void update_throughput_out_ctr(adnl::AdnlNodeIdShort peer_id, td::uint64 msg_size, bool is_query,
                                  bool is_response) override;
@@ -379,7 +364,7 @@ class OverlayImpl : public Overlay {
   }
 
   bool has_valid_membership_certificate();
-  bool has_valid_broadcast_certificate(const PublicKeyHash &source, size_t size, bool is_fec);
+  bool has_valid_broadcast_certificate(const PublicKeyHash &source, size_t size, bool is_fec, bool is_any_sender);
 
   void forget_peer(adnl::AdnlNodeIdShort peer_id) override {
     del_peer(peer_id);
@@ -430,10 +415,12 @@ class OverlayImpl : public Overlay {
                                        bool received_from_node = false);
   td::Status validate_peer_certificate(const adnl::AdnlNodeIdShort &node, const OverlayMemberCertificate *cert);
   td::Status validate_peer_certificate(const adnl::AdnlNodeIdShort &node, ton_api::overlay_MemberCertificate *cert);
-  void add_peer(OverlayNode node, bool received_from_peer = false);
-  void add_peers(std::vector<OverlayNode> nodes, bool received_from_peer = false);
-  void add_peers(const tl_object_ptr<ton_api::overlay_nodes> &nodes, bool received_from_peer = false);
-  void add_peers(const tl_object_ptr<ton_api::overlay_nodesV2> &nodes, bool received_from_peer = false);
+  void add_peer(OverlayNode node, bool verified, bool checked_signature = false);
+  void add_peers(std::vector<OverlayNode> nodes, bool verified, bool checked_signature = false);
+  void add_peers(const tl_object_ptr<ton_api::overlay_nodes> &nodes, bool verified, bool checked_signature = false);
+  void add_peers(const tl_object_ptr<ton_api::overlay_nodesV2> &nodes, bool verified, bool checked_signature = false);
+  void process_pending_peers();
+  td::actor::Task<> process_pending_peer(OverlayNode node);
   void del_some_peers();
   void del_peer(const adnl::AdnlNodeIdShort &id);
   void del_from_neighbour_list(OverlayPeer *P);
@@ -534,20 +521,13 @@ class OverlayImpl : public Overlay {
     td::DecTree<adnl::AdnlNodeIdShort, OverlayPeer> peers_;
     size_t persistent_node_count_ = 0;
     std::vector<adnl::AdnlNodeIdShort> neighbours_;
+    td::DecTree<adnl::AdnlNodeIdShort, OverlayNode> pending_peers_;
 
     td::Timestamp local_cert_is_valid_until_;
     td::uint32 local_member_flags_{0};
   } peer_list_;
   TrafficStats total_traffic, total_traffic_ctr;
   TrafficStats total_traffic_responses, total_traffic_responses_ctr;
-  AccTrafficStats total_traffic_acc;
-  AccTrafficStats total_traffic_responses_acc;
-  td::uint64 broadcast_errors_acc_ = 0;
-  td::uint64 fec_broadcast_errors_acc_ = 0;
-  metrics::TlTrafficBucket messages_sent_by_tl_;
-  metrics::TlTrafficBucket messages_received_by_tl_;
-  metrics::TlTrafficBucket broadcasts_sent_by_tl_;
-  metrics::TlTrafficBucket broadcasts_received_by_tl_;
 
   OverlayOptions opts_;
   adnl::PeersMtuGuard peers_mtu_guard_;
@@ -558,6 +538,8 @@ class OverlayImpl : public Overlay {
 
   std::set<adnl::AdnlNodeIdShort> reject_signatures_from_;
   td::RateLimiterWindow receive_peers_rate_limiter_;
+  td::RateLimiterWindow process_pending_peers_rate_limiter_{60.0, 60};
+  std::set<adnl::AdnlNodeIdShort> processing_pending_peers_;
 
   void cleanup_authorized_key_limiters();
 

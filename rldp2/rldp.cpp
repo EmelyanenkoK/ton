@@ -19,9 +19,6 @@
 #include "auto/tl/ton_api.h"
 #include "auto/tl/ton_api.hpp"
 #include "fec/fec.h"
-#include "metrics/metrics-types.h"
-#include "metrics/prometheus-exporter.h"
-#include "metrics/tl-traffic-bucket.h"
 #include "td/utils/Random.h"
 
 #include "RldpConnection.h"
@@ -31,11 +28,16 @@ namespace ton {
 
 namespace rldp2 {
 
+struct RldpIn::Connection {
+  td::actor::ActorOwn<RldpConnectionActor> actor;
+  td::Timestamp remove_at;
+};
+
 class RldpConnectionActor : public td::actor::Actor, private ConnectionCallback {
  public:
   RldpConnectionActor(td::actor::ActorId<RldpIn> rldp, adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst,
-                      td::actor::ActorId<adnl::Adnl> adnl, std::shared_ptr<Rldp2Metrics> metrics)
-      : rldp_(std::move(rldp)), src_(src), dst_(dst), adnl_(std::move(adnl)), metrics_(std::move(metrics)) {};
+                      td::actor::ActorId<adnl::Adnl> adnl)
+      : rldp_(std::move(rldp)), src_(src), dst_(dst), adnl_(std::move(adnl)) {};
 
   void send(TransferId transfer_id, td::BufferSlice query, td::Timestamp timeout = td::Timestamp::never()) {
     connection_.send(transfer_id, std::move(query), timeout);
@@ -45,7 +47,6 @@ class RldpConnectionActor : public td::actor::Actor, private ConnectionCallback 
     connection_.set_receive_limits(transfer_id, timeout, max_size);
   }
   void receive_raw(td::BufferSlice data) {
-    metrics_->received_from_adnl.record(data.size());
     connection_.receive_raw(std::move(data));
     yield();
   }
@@ -58,7 +59,6 @@ class RldpConnectionActor : public td::actor::Actor, private ConnectionCallback 
   adnl::AdnlNodeIdShort src_;
   adnl::AdnlNodeIdShort dst_;
   td::actor::ActorId<adnl::Adnl> adnl_;
-  std::shared_ptr<Rldp2Metrics> metrics_;
   RldpConnection connection_;
 
   void loop() override {
@@ -66,7 +66,6 @@ class RldpConnectionActor : public td::actor::Actor, private ConnectionCallback 
   }
 
   void send_raw(td::BufferSlice data) override {
-    metrics_->sent_to_adnl.record(data.size());
     send_closure(adnl_, &adnl::Adnl::send_message, src_, dst_, std::move(data));
   }
   void receive(TransferId transfer_id, td::Result<td::BufferSlice> data) override {
@@ -97,12 +96,11 @@ void RldpIn::send_message_ex(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort ds
   td::Bits256 id;
   td::Random::secure_bytes(id.as_slice());
 
-  metrics_->app_send_message.record(data.size());
-  app_send_by_tl_message_.account(data.as_slice());
   auto B = serialize_tl_object(create_tl_object<ton_api::rldp_message>(id, std::move(data)), true);
 
   auto transfer_id = get_random_transfer_id();
-  send_closure(create_connection(src, dst, false), &RldpConnectionActor::send, transfer_id, std::move(B), timeout);
+  send_closure(get_or_create_connection(src, dst, false, timeout), &RldpConnectionActor::send, transfer_id,
+               std::move(B), timeout);
 }
 
 void RldpIn::send_query_ex(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst, std::string name,
@@ -111,12 +109,10 @@ void RldpIn::send_query_ex(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst,
   auto query_id = adnl::AdnlQuery::random_query_id();
 
   auto date = static_cast<td::uint32>(timeout.at_unix()) + 1;
-  metrics_->app_send_query.record(data.size());
-  app_send_by_tl_query_.account(data.as_slice());
   auto B = serialize_tl_object(create_tl_object<ton_api::rldp_query>(query_id, max_answer_size, date, std::move(data)),
                                true);
 
-  auto connection = create_connection(src, dst, false);
+  auto connection = get_or_create_connection(src, dst, false, timeout);
   auto transfer_id = get_random_transfer_id();
   auto response_transfer_id = get_responce_transfer_id(transfer_id);
   send_closure(connection, &RldpConnectionActor::set_receive_limits, response_transfer_id, timeout, max_answer_size);
@@ -127,46 +123,56 @@ void RldpIn::send_query_ex(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst,
 
 void RldpIn::answer_query(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst, td::Timestamp timeout,
                           adnl::AdnlQueryId query_id, TransferId transfer_id, td::BufferSlice data) {
-  metrics_->app_send_answer.record(data.size());
-  app_send_by_tl_answer_.account(data.as_slice());
   auto B = serialize_tl_object(create_tl_object<ton_api::rldp_answer>(query_id, std::move(data)), true);
 
-  send_closure(create_connection(src, dst, false), &RldpConnectionActor::send, transfer_id, std::move(B), timeout);
+  send_closure(get_or_create_connection(src, dst, false, timeout), &RldpConnectionActor::send, transfer_id,
+               std::move(B), timeout);
 }
 
 void RldpIn::receive_message_part(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort local_id, td::BufferSlice data) {
-  auto connection = create_connection(local_id, source, true);
+  auto connection = get_or_create_connection(local_id, source, true);
   if (connection.empty()) {
     return;
   }
   send_closure(connection, &RldpConnectionActor::receive_raw, std::move(data));
 }
 
-td::actor::ActorId<RldpConnectionActor> RldpIn::create_connection(adnl::AdnlNodeIdShort local_id,
-                                                                  adnl::AdnlNodeIdShort peer_id, bool incoming) {
+td::actor::ActorId<RldpConnectionActor> RldpIn::get_or_create_connection(adnl::AdnlNodeIdShort local_id,
+                                                                         adnl::AdnlNodeIdShort peer_id, bool incoming,
+                                                                         td::Timestamp timeout) {
+  if (!timeout) {
+    timeout = td::Timestamp::now();
+  }
+  timeout += CONNECTION_TIMEOUT;
   auto it = connections_.find(std::make_pair(local_id, peer_id));
   if (it != connections_.end()) {
-    return it->second.get();
+    timeout_set_.erase({it->second.remove_at, local_id, peer_id});
+    it->second.remove_at = std::max(it->second.remove_at, timeout);
+    timeout_set_.emplace(it->second.remove_at, local_id, peer_id);
+    alarm_timestamp().relax(timeout);
+    return it->second.actor.get();
   }
   td::uint64 mtu = get_peer_mtu(local_id, peer_id);
   if (mtu == 0 && incoming) {
     VLOG(RLDP_INFO) << "dropping incoming packet " << local_id << " <- " << peer_id << " : peer not allowed";
     return {};
   }
-  auto connection = td::actor::create_actor<RldpConnectionActor>("RldpConnection", actor_id(this), local_id, peer_id,
-                                                                 adnl_, metrics_);
+  auto connection =
+      td::actor::create_actor<RldpConnectionActor>("RldpConnection", actor_id(this), local_id, peer_id, adnl_);
   td::actor::send_closure(connection, &RldpConnectionActor::set_default_mtu, mtu);
   auto res = connection.get();
-  connections_[std::make_pair(local_id, peer_id)] = std::move(connection);
+  connections_[std::make_pair(local_id, peer_id)] = {std::move(connection), timeout};
+  timeout_set_.emplace(timeout, local_id, peer_id);
+  alarm_timestamp().relax(timeout);
+  VLOG(RLDP_INFO) << "creating connection " << local_id << " , " << peer_id << " ("
+                  << (incoming ? "inbound" : "outbound") << ")";
   return res;
 }
 
 void RldpIn::receive_message(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort local_id, TransferId transfer_id,
                              td::Result<td::BufferSlice> r_data) {
   if (r_data.is_error()) {
-    metrics_->transfers_received_err.fetch_add(1, std::memory_order_relaxed);
-    auto it = queries_.find(transfer_id);
-    if (it != queries_.end()) {
+    if (auto it = queries_.find(transfer_id); it != queries_.end()) {
       it->second.set_error(r_data.move_as_error());
       queries_.erase(it);
     } else {
@@ -174,32 +180,34 @@ void RldpIn::receive_message(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort
     }
     return;
   }
-  metrics_->transfers_received_ok.fetch_add(1, std::memory_order_relaxed);
 
   auto data = r_data.move_as_ok();
-  //LOG(ERROR) << "RECEIVE MESSAGE " << data.size();
   auto F = fetch_tl_object<ton_api::rldp_Message>(std::move(data), true);
   if (F.is_error()) {
-    metrics_->parse_errors.fetch_add(1, std::memory_order_relaxed);
-    VLOG(RLDP_INFO) << "failed to parse rldp packet [" << source << "->" << local_id << "]: " << F.move_as_error();
+    VLOG(RLDP_INFO) << "failed to parse rldp packet [" << source << "->" << local_id << "]: " << F.error();
+    if (auto it = queries_.find(transfer_id); it != queries_.end()) {
+      it->second.set_error(F.move_as_error_prefix("received invalid rldp query answer: "));
+      queries_.erase(it);
+    }
     return;
   }
 
   ton_api::downcast_call(*F.move_as_ok().get(),
                          [&](auto &obj) { this->process_message(source, local_id, transfer_id, obj); });
+
+  if (auto it = queries_.find(transfer_id); it != queries_.end()) {
+    it->second.set_error(td::Status::Error("received invalid rldp query answer"));
+    queries_.erase(it);
+  }
 }
 
 void RldpIn::process_message(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort local_id, TransferId transfer_id,
                              ton_api::rldp_message &message) {
-  metrics_->app_deliver_message.record(message.data_.size());
-  app_deliver_by_tl_message_.account(message.data_.as_slice());
   td::actor::send_closure(adnl_, &adnl::AdnlPeerTable::deliver, source, local_id, std::move(message.data_));
 }
 
 void RldpIn::process_message(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort local_id, TransferId transfer_id,
                              ton_api::rldp_query &message) {
-  metrics_->app_deliver_query.record(message.data_.size());
-  app_deliver_by_tl_query_.account(message.data_.as_slice());
   auto P = td::PromiseCreator::lambda([SelfId = actor_id(this), source, local_id,
                                        timeout = td::Timestamp::at_unix(message.timeout_), query_id = message.query_id_,
                                        max_answer_size = static_cast<td::uint64>(message.max_answer_size_),
@@ -228,8 +236,6 @@ void RldpIn::process_message(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort
                              ton_api::rldp_answer &message) {
   auto it = queries_.find(transfer_id);
   if (it != queries_.end()) {
-    metrics_->app_deliver_answer.record(message.data_.size());
-    app_deliver_by_tl_answer_.account(message.data_.as_slice());
     it->second.set_value(std::move(message.data_));
     queries_.erase(it);
   } else {
@@ -238,11 +244,7 @@ void RldpIn::process_message(adnl::AdnlNodeIdShort source, adnl::AdnlNodeIdShort
 }
 
 void RldpIn::on_sent(TransferId transfer_id, td::Result<td::Unit> state) {
-  if (state.is_ok()) {
-    metrics_->transfers_sent_ok.fetch_add(1, std::memory_order_relaxed);
-  } else {
-    metrics_->transfers_sent_err.fetch_add(1, std::memory_order_relaxed);
-  }
+  //TODO: completed transfer
 }
 
 void RldpIn::add_id(adnl::AdnlNodeIdShort local_id) {
@@ -267,7 +269,7 @@ void RldpIn::get_conn_ip_str(adnl::AdnlNodeIdShort l_id, adnl::AdnlNodeIdShort p
 void RldpIn::on_mtu_updated(td::optional<adnl::AdnlNodeIdShort> local_id, td::optional<adnl::AdnlNodeIdShort> peer_id) {
   auto update_mtu = [&](const auto &it) {
     auto &[p, connection] = *it;
-    td::actor::send_closure(connection, &RldpConnectionActor::set_default_mtu, get_peer_mtu(p.first, p.second));
+    td::actor::send_closure(connection.actor, &RldpConnectionActor::set_default_mtu, get_peer_mtu(p.first, p.second));
   };
   if (local_id && peer_id) {
     auto it = connections_.find({local_id.value(), peer_id.value()});
@@ -284,6 +286,20 @@ void RldpIn::on_mtu_updated(td::optional<adnl::AdnlNodeIdShort> local_id, td::op
     }
     update_mtu(it);
     ++it;
+  }
+}
+
+void RldpIn::alarm() {
+  for (auto it = timeout_set_.begin(); it != timeout_set_.end();) {
+    auto &[timeout, local_id, peer_id] = *it;
+    if (timeout.is_in_past()) {
+      VLOG(RLDP_INFO) << "removing old connection " << local_id << " , " << peer_id;
+      connections_.erase({local_id, peer_id});
+      it = timeout_set_.erase(it);
+    } else {
+      alarm_timestamp() = timeout;
+      break;
+    }
   }
 }
 
@@ -307,71 +323,8 @@ std::unique_ptr<adnl::Adnl::Callback> RldpIn::make_adnl_callback() {
   return std::make_unique<Callback>(actor_id(this));
 }
 
-void RldpIn::collect(metrics::MetricsPromise P) {
-  metrics::MetricSet set;
-  auto load = [](const std::atomic<td::uint64> &a) { return a.load(std::memory_order_relaxed); };
-  const auto &m = *metrics_;
-  set.push_labeled_scalar("app_send_bytes_total", "counter", "kind",
-                          {{"message", m.app_send_message.bytes_load()},
-                           {"query", m.app_send_query.bytes_load()},
-                           {"answer", m.app_send_answer.bytes_load()}},
-                          "Bytes the application asked RLDP2 to send (raw payload, by kind).");
-  set.push_labeled_scalar("app_send_messages_total", "counter", "kind",
-                          {{"message", m.app_send_message.msgs_load()},
-                           {"query", m.app_send_query.msgs_load()},
-                           {"answer", m.app_send_answer.msgs_load()}},
-                          "Messages the application asked RLDP2 to send.");
-  set.push_labeled_scalar("app_deliver_bytes_total", "counter", "kind",
-                          {{"message", m.app_deliver_message.bytes_load()},
-                           {"query", m.app_deliver_query.bytes_load()},
-                           {"answer", m.app_deliver_answer.bytes_load()}},
-                          "Bytes RLDP2 delivered to the application.");
-  set.push_labeled_scalar("app_deliver_messages_total", "counter", "kind",
-                          {{"message", m.app_deliver_message.msgs_load()},
-                           {"query", m.app_deliver_query.msgs_load()},
-                           {"answer", m.app_deliver_answer.msgs_load()}},
-                          "Messages RLDP2 delivered to the application.");
-  set.push_scalar("bytes_sent_to_adnl_total", "counter", m.sent_to_adnl.bytes_load(),
-                  "RLDP2 serialized bytes handed to ADNL.");
-  set.push_scalar("parts_sent_to_adnl_total", "counter", m.sent_to_adnl.msgs_load(), "RLDP2 messages handed to ADNL.");
-  set.push_scalar("bytes_received_from_adnl_total", "counter", m.received_from_adnl.bytes_load(),
-                  "RLDP2 serialized bytes received from ADNL.");
-  set.push_scalar("parts_received_from_adnl_total", "counter", m.received_from_adnl.msgs_load(),
-                  "RLDP2 messages received from ADNL.");
-  set.push_scalar("parse_errors_total", "counter", load(metrics_->parse_errors), "RLDP2 message TL parse failures.");
-  set.push_labeled_scalar(
-      "transfers_received_total", "counter", "result",
-      {{"ok", load(metrics_->transfers_received_ok)}, {"error", load(metrics_->transfers_received_err)}},
-      "Inbound RLDP2 transfers concluded (success or error).");
-  set.push_labeled_scalar("transfers_sent_total", "counter", "result",
-                          {{"ok", load(metrics_->transfers_sent_ok)}, {"error", load(metrics_->transfers_sent_err)}},
-                          "Outbound RLDP2 transfers concluded (success or error).");
-  set.push_scalar("connections_active", "gauge", connections_.size(), "Active RLDP2 connections.");
-  set.push_scalar("queries_pending", "gauge", queries_.size(), "Pending RLDP2 queries awaiting answers.");
-
-  metrics::render_tl_bucket(set, "app_send", "message", app_send_by_tl_message_,
-                            "Bytes the application sent via RLDP2 rldp.message wrappers, by inner TL.",
-                            "Messages the application sent via RLDP2 rldp.message wrappers, by inner TL.");
-  metrics::render_tl_bucket(set, "app_send", "query", app_send_by_tl_query_);
-  metrics::render_tl_bucket(set, "app_send", "answer", app_send_by_tl_answer_);
-  metrics::render_tl_bucket(set, "app_deliver", "message", app_deliver_by_tl_message_,
-                            "Bytes RLDP2 delivered to the application from rldp.message wrappers, by inner TL.",
-                            "Messages RLDP2 delivered to the application from rldp.message wrappers, by inner TL.");
-  metrics::render_tl_bucket(set, "app_deliver", "query", app_deliver_by_tl_query_);
-  metrics::render_tl_bucket(set, "app_deliver", "answer", app_deliver_by_tl_answer_);
-  P.set_value(std::move(set).wrap("rldp2"));
-}
-
 td::actor::ActorOwn<Rldp> Rldp::create(td::actor::ActorId<adnl::Adnl> adnl) {
   return td::actor::create_actor<RldpIn>("rldp", td::actor::actor_dynamic_cast<adnl::AdnlPeerTable>(adnl));
-}
-
-void Rldp::register_metrics(td::actor::ActorId<Rldp> rldp, td::actor::ActorId<PrometheusExporter> exporter) {
-  auto impl = td::actor::actor_dynamic_cast<RldpIn>(rldp);
-  if (impl.empty()) {
-    return;
-  }
-  td::actor::send_closure(exporter, &PrometheusExporter::register_collector<RldpIn>, impl);
 }
 
 }  // namespace rldp2

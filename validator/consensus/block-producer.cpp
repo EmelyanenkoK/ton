@@ -11,7 +11,6 @@
 
 #include "bus.h"
 #include "stats.h"
-#include "utils.h"
 
 namespace ton::validator::consensus {
 
@@ -26,13 +25,11 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     no_empty_blocks_on_error_timeout_ = owning_bus()->config.noncritical_params.no_empty_blocks_on_error_timeout;
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const NoncriticalParamsUpdated> event) {
     target_rate_ = event->params.target_rate;
     no_empty_blocks_on_error_timeout_ = event->params.no_empty_blocks_on_error_timeout;
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const Start> event) {
     td::uint32 seqno = event->state->next_seqno() - 1;
     last_mc_finalized_seqno_ = std::max(last_mc_finalized_seqno_, seqno);
@@ -40,14 +37,12 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     last_consensus_finalized_at_ = td::Timestamp::now();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     current_leader_window_ = std::nullopt;
     cancellation_source_.cancel();
     stop();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const FinalizeBlock> event) {
     if (event->signatures->is_final()) {
       last_consensus_finalized_seqno_ = std::max(last_consensus_finalized_seqno_, event->candidate->block_id().seqno());
@@ -55,7 +50,6 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     }
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const OurLeaderWindowStarted> event) {
     CHECK(current_leader_window_ < event->start_slot);
 
@@ -64,7 +58,6 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     generate_candidates(event).start().detach();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const BlockFinalizedInMasterchain> event) {
     last_mc_finalized_seqno_ = std::max(event->block.seqno(), last_mc_finalized_seqno_);
     last_consensus_finalized_seqno_ = std::max(last_mc_finalized_seqno_, last_consensus_finalized_seqno_);
@@ -113,12 +106,10 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
             .min_masterchain_block_id = state->min_mc_block_id(),
             .prev = state->block_ids(),
             .creator = Ed25519_PublicKey{bus.local_id.key.ed25519_value().raw()},
-            .skip_store_candidate = true,
             .utime = slot_start.at_unix(),
             .hard_timeout = slot_start + hard_timeout,
             .prev_block_data = state->block_data(),
             .prev_block_state_roots = state->state(),
-            .is_new_consensus = true,
         };
         if (bus.shard.is_masterchain()) {
           params.soft_timeout = slot_start + target_rate_;

@@ -29,9 +29,9 @@
 #include "impl/ext-message-pool.hpp"
 #include "interfaces/db.h"
 #include "interfaces/validator-manager.h"
-#include "rldp/rldp.h"
 #include "rldp2/rldp.h"
 #include "td/actor/ActorStats.h"
+#include "td/actor/MultiPromise.h"
 #include "td/actor/PromiseFuture.h"
 #include "td/actor/coro_task.h"
 #include "td/utils/LRUCache.h"
@@ -39,6 +39,7 @@
 #include "td/utils/buffer.h"
 #include "td/utils/port/Poll.h"
 #include "td/utils/port/StdStreams.h"
+#include "ton/ton-io.hpp"
 
 #include "manager-init.h"
 #include "queue-size-counter.hpp"
@@ -75,7 +76,7 @@ class BlockHandleLru : public td::ListNode {
   BlockHandle handle_;
 };
 
-class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::CollectorWrapper {
+class ValidatorManagerImpl : public ValidatorManager {
  private:
   // WAITERS
   //
@@ -164,6 +165,7 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
 
   struct WaitBlockHandle {
     std::vector<td::Promise<BlockHandle>> waiting_;
+    bool force_ = false;
   };
   std::map<BlockIdExt, WaitBlockHandle> wait_block_handle_;
 
@@ -214,16 +216,15 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   ValidatorSessionId get_validator_set_id(ShardIdFull shard, td::Ref<block::ValidatorSet> val_set,
                                           td::Bits256 opts_hash, BlockSeqno last_key_block_seqno,
                                           const validatorsession::ValidatorSessionOptions &opts);
-  td::actor::ActorOwn<IValidatorGroup> create_validator_group(ValidatorSessionId session_id, ShardIdFull shard,
-                                                              td::Ref<block::ValidatorSet> validator_set,
-                                                              BlockSeqno key_seqno,
-                                                              validatorsession::ValidatorSessionOptions opts,
-                                                              bool create_catchain);
+  td::actor::ActorOwn<IValidatorGroup> create_validator_group(
+      ValidatorSessionId session_id, ShardIdFull shard, td::Ref<block::ValidatorSet> validator_set,
+      BlockSeqno key_seqno, validatorsession::ValidatorSessionOptions opts, bool create_catchain, bool is_validator,
+      adnl::AdnlNodeIdShort local_adnl_id_override, std::vector<adnl::AdnlNodeIdShort> overlay_members);
   td::actor::ActorId<CollationManager> get_collation_manager(adnl::AdnlNodeIdShort adnl_id);
 
   struct ValidatorGroupEntry {
     std::string name() const {
-      return PSTRING() << "validator group " << shard.to_str() << "." << cc_seqno;
+      return PSTRING() << "validator group " << shard << "." << cc_seqno;
     }
 
     td::actor::ActorOwn<IValidatorGroup> actor;
@@ -323,6 +324,7 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
 
   //void create_validate_block(BlockId block, td::BufferSlice data, td::Promise<Block> promise) = 0;
   void sync_complete(td::Promise<td::Unit> promise) override;
+  void wait_initial_sync(td::Promise<td::Unit> promise) override;
 
   void get_next_block(BlockIdExt block_id, td::Promise<BlockHandle> promise) override;
   void get_next_key_blocks(BlockIdExt block_id, td::uint32 cnt, td::Promise<std::vector<BlockIdExt>> promise) override;
@@ -338,6 +340,7 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
                                   td::Promise<td::BufferSlice> promise) override;
   void get_previous_persistent_state_files(
       BlockSeqno cur_mc_seqno, td::Promise<std::vector<std::pair<std::string, ShardIdFull>>> promise) override;
+  void get_cached_candidate_data(BlockIdExt id, td::Promise<td::BufferSlice> promise) override;
   void get_block_proof(BlockHandle handle, td::Promise<td::BufferSlice> promise) override;
   void get_block_proof_link(BlockHandle block_id, td::Promise<td::BufferSlice> promise) override;
   void get_key_block_proof(BlockIdExt block_id, td::Promise<td::BufferSlice> promise) override;
@@ -352,14 +355,18 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   void new_ihr_message(td::BufferSlice data) override;
   void new_shard_block_description_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
                                              td::BufferSlice data) override;
-  td::actor::Task<> new_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno, td::BufferSlice data,
-                                                  BroadcastSource source) override;
+  td::actor::Task<> new_block_candidate_broadcast(BlockIdExt block_id, CatchainSeqno cc_seqno,
+                                                  td::BufferSlice data, BroadcastSource source) override;
 
   void add_ext_server_id(adnl::AdnlNodeIdShort id) override;
   void add_ext_server_port(td::uint16 port) override;
+  void notify_added_initial_liteservers() override;
+  void wait_liteserver_ready(td::Promise<td::Unit> promise) override;
+
   void run_ext_query(td::BufferSlice data, td::Promise<td::BufferSlice> promise) override;
 
   void get_block_handle(BlockIdExt id, bool force, td::Promise<BlockHandle> promise) override;
+  void get_block_handle_cont(BlockIdExt id, td::Result<BlockHandle> R);
 
   void set_block_state(BlockHandle handle, td::Ref<ShardState> state, vm::StoreCellHint hint,
                        td::Promise<td::Ref<ShardState>> promise) override;
@@ -405,8 +412,7 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   void wait_block_signatures_short(BlockIdExt id, td::Timestamp timeout,
                                    td::Promise<td::Ref<block::BlockSignatureSet>> promise) override;
 
-  void set_block_candidate(BlockIdExt id, BlockCandidate candidate, CatchainSeqno cc_seqno,
-                           td::uint32 validator_set_hash, bool cache_only, td::Promise<td::Unit> promise) override;
+  void cache_block_candidate(BlockCandidate candidate, td::Promise<td::Unit> promise) override;
   void send_block_candidate_broadcast(BlockIdExt id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
                                       td::BufferSlice data, int mode) override;
 
@@ -436,9 +442,6 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   void get_block_data_from_db_short(BlockIdExt block_id, td::Promise<td::Ref<BlockData>> promise) override;
   void get_shard_state_from_db(ConstBlockHandle handle, td::Promise<td::Ref<ShardState>> promise) override;
   void get_shard_state_from_db_short(BlockIdExt block_id, td::Promise<td::Ref<ShardState>> promise) override;
-  void get_block_candidate_from_db(PublicKey source, BlockIdExt id, FileHash collated_data_file_hash,
-                                   td::Promise<BlockCandidate> promise) override;
-  void get_candidate_data_by_block_id_from_db(BlockIdExt id, td::Promise<td::BufferSlice> promise) override;
   void get_block_proof_from_db(ConstBlockHandle handle, td::Promise<td::Ref<Proof>> promise) override;
   void get_block_proof_from_db_short(BlockIdExt id, td::Promise<td::Ref<Proof>> promise) override;
   void get_block_proof_link_from_db(ConstBlockHandle handle, td::Promise<td::Ref<ProofLink>> promise) override;
@@ -457,11 +460,11 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
 
   void new_block(BlockHandle handle, td::Ref<ShardState> state, td::Promise<td::Unit> promise) override;
   void new_block_cont(BlockHandle handle, td::Ref<ShardState> state, td::Promise<td::Unit> promise);
-  void on_block_accepted(BlockIdExt block_id) override;
   void get_top_masterchain_state(td::Promise<td::Ref<MasterchainState>> promise) override;
   void get_top_masterchain_block(td::Promise<BlockIdExt> promise) override;
   void get_top_masterchain_state_block(td::Promise<std::pair<td::Ref<MasterchainState>, BlockIdExt>> promise) override;
   void get_last_liteserver_state_block(td::Promise<std::pair<td::Ref<MasterchainState>, BlockIdExt>> promise) override;
+  void get_shard_client_state_block(td::Promise<std::pair<td::Ref<MasterchainState>, BlockIdExt>> promise) override;
 
   td::actor::Task<ReceivedBlock> send_get_block_request(BlockIdExt id, td::uint32 priority) override;
   void send_get_zero_state_request(BlockIdExt id, td::uint32 priority, td::Promise<td::BufferSlice> promise) override;
@@ -518,8 +521,6 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
                                        td::Promise<td::Unit> promise);
   void set_shard_block_description_ready(td::Ref<ShardTopBlockDescription> desc);
 
-  void register_block_handle(BlockHandle handle);
-
   void finished_wait_state(BlockHandle handle, td::Result<td::Ref<ShardState>> R, bool preliminary);
   void finished_wait_data(BlockHandle handle, td::Result<td::Ref<BlockData>> R);
 
@@ -536,18 +537,15 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
 
   ValidatorManagerImpl(td::Ref<ValidatorManagerOptions> opts, std::string db_root,
                        td::actor::ActorId<keyring::Keyring> keyring, td::actor::ActorId<adnl::Adnl> adnl,
-                       td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<rldp2::Rldp> rldp2,
-                       td::actor::ActorId<quic::QuicSender> quic, td::actor::ActorId<overlay::Overlays> overlays,
-                       td::actor::ActorId<PrometheusExporter> exporter)
+                       td::actor::ActorId<rldp2::Rldp> rldp2, td::actor::ActorId<quic::QuicSender> quic,
+                       td::actor::ActorId<overlay::Overlays> overlays)
       : opts_(std::move(opts))
       , db_root_(db_root)
       , keyring_(keyring)
       , adnl_(adnl)
-      , rldp_(rldp)
       , rldp2_(rldp2)
       , quic_(quic)
-      , overlays_(overlays)
-      , exporter_(exporter) {
+      , overlays_(overlays) {
   }
 
  public:
@@ -571,9 +569,6 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
 
   void wait_shard_client_state(BlockSeqno seqno, td::Timestamp timeout, td::Promise<td::Unit> promise) override;
 
-  void log_validator_session_stats(validatorsession::ValidatorSessionStats stats) override;
-  void log_new_validator_group_stats(validatorsession::NewValidatorGroupStats stats) override;
-  void log_end_validator_group_stats(validatorsession::EndValidatorGroupStats stats) override;
   void log_stats(std::string);
 
   void update_options(td::Ref<ValidatorManagerOptions> opts) override;
@@ -597,8 +592,7 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
           td::actor::create_actor<QueueSizeCounter>("queuesizecounter", last_masterchain_state_, opts_, actor_id(this));
     }
     if (!opts_->need_monitor(block_id.shard_full(), last_masterchain_state_)) {
-      return promise.set_error(
-          td::Status::Error(PSTRING() << "not monitoring shard " << block_id.shard_full().to_str()));
+      return promise.set_error(td::Status::Error(PSTRING() << "not monitoring shard " << block_id.shard_full()));
     }
     td::actor::send_closure(queue_size_counter_, &QueueSizeCounter::get_queue_size, block_id, std::move(promise));
   }
@@ -617,11 +611,6 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   void process_lookup_block_for_litequery_error(AccountIdPrefixFull account, int type, td::uint64 value,
                                                 td::Result<ConstBlockHandle> r_handle,
                                                 td::Promise<ConstBlockHandle> promise);
-  void get_block_candidate_for_litequery(PublicKey source, BlockIdExt block_id, FileHash collated_data_hash,
-                                         td::Promise<BlockCandidate> promise) override;
-  void get_validator_groups_info_for_litequery(
-      td::optional<ShardIdFull> shard,
-      td::Promise<tl_object_ptr<lite_api::liteServer_nonfinal_validatorGroups>> promise) override;
   void get_pending_shard_blocks_for_litequery(
       td::optional<ShardIdFull> shard,
       td::Promise<tl_object_ptr<lite_api::liteServer_nonfinal_pendingShardBlocks>> promise) override;
@@ -659,10 +648,15 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
  private:
   td::actor::ActorOwn<adnl::AdnlExtServer> lite_server_;
   td::actor::ActorOwn<LiteServerCache> lite_server_cache_;
-  std::vector<td::uint16> pending_ext_ports_;
+  std::vector<std::pair<td::uint16, td::Promise<td::Unit>>> pending_ext_ports_;
   std::vector<adnl::AdnlNodeIdShort> pending_ext_ids_;
+  bool liteserver_ready_ = false;
+  td::MultiPromise::InitGuard initial_liteservers_guard_;
+  std::vector<td::Promise<td::Unit>> pending_liteserver_promises_;
+  std::vector<td::Promise<td::Unit>> pending_sync_promises_;
 
   void created_ext_server(td::actor::ActorOwn<adnl::AdnlExtServer> lite_server);
+  void liteserver_ports_bound();
 
  private:
   td::actor::ActorOwn<ShardClient> shard_client_;
@@ -675,11 +669,9 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   std::string db_root_;
   td::actor::ActorId<keyring::Keyring> keyring_;
   td::actor::ActorId<adnl::Adnl> adnl_;
-  td::actor::ActorId<rldp::Rldp> rldp_;
   td::actor::ActorId<rldp2::Rldp> rldp2_;
   td::actor::ActorId<quic::QuicSender> quic_;
   td::actor::ActorId<overlay::Overlays> overlays_;
-  td::actor::ActorId<PrometheusExporter> exporter_;
 
   td::actor::ActorOwn<AsyncStateSerializer> serializer_;
 
@@ -774,53 +766,6 @@ class ValidatorManagerImpl : public ValidatorManager, public virtual metrics::Co
   bool is_valid_nonfinal_group(ShardIdFull shard, CatchainSeqno cc_seqno);
   void process_accepted_nonfinal_block(BlockIdExt block_id, CatchainSeqno cc_seqno);
   void cleanup_nonfinal_groups();
-
-  struct BlockReceiveStats {
-    enum Type {
-      block_broadcast_public = 0,
-      block_broadcast_fast_sync = 1,
-      block_broadcast_custom = 2,
-      block_download = 3,
-      candidate_broadcast_public = 4,
-      candidate_broadcast_fast_sync = 5,
-      candidate_broadcast_custom = 6,
-      candidate_stored = 7,
-      block_accepted = 8,
-      unknown = 9
-    };
-    static constexpr size_t N_TYPES = 10;
-    td::Timestamp received_at[N_TYPES];
-    bool applied = false;
-
-    Type get_earliest_type() const {
-      Type result = unknown;
-      td::Timestamp result_ts;
-      for (size_t i = 0; i < N_TYPES; i++) {
-        if (received_at[i] && (!result_ts || received_at[i] < result_ts)) {
-          result = (Type)i;
-          result_ts = received_at[i];
-        }
-      }
-      return result;
-    }
-  };
-  td::LRUCache<BlockIdExt, BlockReceiveStats> block_receive_stats_{1000};
-
-  struct BlockReceiveTotalStats {
-    size_t first_received_from[BlockReceiveStats::N_TYPES] = {};
-    size_t received_from[BlockReceiveStats::N_TYPES] = {};
-    size_t applied = 0;
-  };
-  BlockReceiveTotalStats block_receive_total_stats_[2];  // 0 - basechain, 1 - masterchain
-
-  void update_block_receive_stats(BlockIdExt block_id, BlockReceiveStats::Type type);
-
- public:
-  void collect(metrics::MetricsPromise P) override {
-    td::actor::send_closure(actor_id(this), &ValidatorManagerImpl::collect_metrics, std::move(P));
-  }
-
-  void collect_metrics(metrics::MetricsPromise P);
 };
 
 }  // namespace validator

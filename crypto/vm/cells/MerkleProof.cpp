@@ -16,6 +16,8 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <map>
+
 #include "td/utils/HashMap.h"
 #include "td/utils/HashSet.h"
 #include "td/utils/Status.h"
@@ -49,7 +51,7 @@ class MerkleProofImpl {
   }
 
  private:
-  using Key = std::pair<Cell::Hash, int>;
+  using Key = std::pair<Cell::Hash, unsigned>;
   td::HashMap<Key, Ref<Cell>> cells_;
   td::HashSet<Cell::Hash> visited_cells_;
   CellUsageTree *usage_tree_{nullptr};
@@ -66,7 +68,7 @@ class MerkleProofImpl {
     }
   }
 
-  Ref<Cell> dfs(Ref<Cell> cell, int merkle_depth) {
+  Ref<Cell> dfs(Ref<Cell> cell, unsigned merkle_depth) {
     CHECK(cell.not_null());
     Key key{cell->get_hash(), merkle_depth};
     {
@@ -90,7 +92,14 @@ class MerkleProofImpl {
     for (unsigned i = 0; i < cs.size_refs(); i++) {
       cb.store_ref(dfs(cs.prefetch_ref(i), children_merkle_depth));
     }
-    auto res = cb.finalize(cs.is_special());
+    auto hash_hint = [&](unsigned level, const Cell::LevelMask &, CellHash &hash) {
+      if (level <= merkle_depth) {
+        hash = cell->get_hash(level);
+        return true;
+      }
+      return false;
+    };
+    auto res = cb.finalize(cs.is_special(), std::move(hash_hint));
     CHECK(res.not_null());
     cells_.emplace(key, res);
     return res;
@@ -178,6 +187,11 @@ class MerkleProofCombineFast {
  private:
   Ref<Cell> a_;
   Ref<Cell> b_;
+#if TD_HAVE_ABSL
+  td::HashMap<std::tuple<Cell::Hash, Cell::Hash, td::uint32>, Ref<Cell>> visited_;
+#else
+  std::map<std::tuple<Cell::Hash, Cell::Hash, td::uint32>, Ref<Cell>> visited_;
+#endif
 
   Ref<Cell> merge(Ref<Cell> a, Ref<Cell> b, td::uint32 merkle_depth) {
     if (a->get_hash() == b->get_hash()) {
@@ -199,6 +213,10 @@ class MerkleProofCombineFast {
     if (csb.is_special() && csb.special_type() == vm::Cell::SpecialType::PrunnedBranch) {
       return a;
     }
+    std::tuple key{a->get_hash(), b->get_hash(), merkle_depth};
+    if (auto it = visited_.find(key); it != visited_.end()) {
+      return it->second;
+    }
 
     CHECK(csa.size_refs() != 0);
 
@@ -209,7 +227,7 @@ class MerkleProofCombineFast {
     for (unsigned i = 0; i < csa.size_refs(); i++) {
       cb.store_ref(merge(csa.prefetch_ref(i), csb.prefetch_ref(i), child_merkle_depth));
     }
-    return cb.finalize(csa.is_special());
+    return visited_[key] = cb.finalize(csa.is_special());
   }
 };
 

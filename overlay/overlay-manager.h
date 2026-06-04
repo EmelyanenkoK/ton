@@ -24,7 +24,6 @@
 
 #include "adnl/adnl.h"
 #include "dht/dht.h"
-#include "metrics/metrics-collectors.h"
 #include "td/actor/actor.h"
 #include "td/db/KeyValueAsync.h"
 
@@ -32,8 +31,6 @@
 #include "overlays.h"
 
 namespace ton {
-
-class PrometheusExporter;
 
 namespace overlay {
 
@@ -45,13 +42,10 @@ constexpr int VERBOSITY_NAME(OVERLAY_EXTRA_DEBUG) = verbosity_DEBUG + 10;
 
 class Overlay;
 
-class OverlayManager : public Overlays, public virtual metrics::AsyncCollector {
+class OverlayManager : public Overlays {
  public:
   OverlayManager(std::string db_root, td::actor::ActorId<keyring::Keyring> keyring, td::actor::ActorId<adnl::Adnl> adnl,
                  td::actor::ActorId<dht::Dht> dht, OverlayManagerBufferLimits buffer_limits = {});
-
-  void collect(metrics::MetricsPromise P) override;
-  static void register_metrics(td::actor::ActorId<Overlays> overlays, td::actor::ActorId<PrometheusExporter> exporter);
   void start_up() override;
   void save_to_db(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id, std::vector<OverlayNode> nodes);
 
@@ -95,8 +89,7 @@ class OverlayManager : public Overlays, public virtual metrics::AsyncCollector {
   void send_broadcast_fec_ex(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id, PublicKeyHash send_as,
                              td::uint32 flags, td::BufferSlice object) override;
   void send_broadcast_fec_ex_with_fanout(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id, PublicKeyHash send_as,
-                                         td::uint32 flags, td::BufferSlice object,
-                                         td::uint32 fanout_override,
+                                         td::uint32 flags, td::BufferSlice object, td::uint32 fanout_override,
                                          std::vector<adnl::AdnlNodeIdShort> force_peers) override;
   void send_broadcast_fec_with_extra(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id, PublicKeyHash send_as,
                                      td::uint32 flags, td::BufferSlice object, td::BufferSlice extra) override;

@@ -16,8 +16,8 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "adnl/utils.hpp"
 #include "adnl/adnl-address-list.h"
+#include "adnl/utils.hpp"
 #include "auto/tl/ton_api.h"
 #include "auto/tl/ton_api_json.h"
 #include "common/delay.h"
@@ -60,6 +60,7 @@ namespace {
 
 constexpr const char *k_called_from_public = "public";
 constexpr td::uint32 k_heavy_request_cost_unit = 1 << 21;
+constexpr size_t k_ed25519_signature_size = 64;
 
 size_t heavy_request_cost(td::uint64 requested_max_size) {
   size_t cost = static_cast<size_t>((requested_max_size + k_heavy_request_cost_unit - 1) / k_heavy_request_cost_unit);
@@ -378,10 +379,16 @@ void FullNodeShardImpl::create_overlay() {
                                     << ", \"workchain_id\": " << get_workchain() << " }",
                           opts);
 
-  td::actor::send_closure(rldp_, &rldp::Rldp::add_id, adnl_id_);
+  // Do not register full-node shard ADNL IDs with legacy RLDP.
+  // RLDP2 remains the only inbound full-node transport.
   td::actor::send_closure(rldp2_, &rldp2::Rldp::add_id, adnl_id_);
   if (cert_) {
     td::actor::send_closure(overlays_, &overlay::Overlays::update_certificate, adnl_id_, overlay_id_, local_id_, cert_);
+  }
+  auto adnl_source = full_node_adnl_source();
+  if (!adnl_source.is_zero() && adnl_source != local_id_ && adnl_source_cert_) {
+    td::actor::send_closure(overlays_, &overlay::Overlays::update_certificate, adnl_id_, overlay_id_, adnl_source,
+                            adnl_source_cert_);
   }
 }
 
@@ -429,20 +436,20 @@ void FullNodeShardImpl::refresh_force_good_peers() {
   LOG(WARNING) << "force-good-peers refresh start shard=" << shard_.to_str()
                << " url=" << opts_.rebroadcast_from_custom_.force_good_peers_url_;
   force_good_peers_refresh_active_ = true;
-  refresh_force_good_peers_at_ = td::Timestamp::never();
   td::actor::create_actor<ForceGoodPeersFetcher>("forcegoodpeers", opts_.rebroadcast_from_custom_.force_good_peers_url_,
                                                  adnl_id_, adnl_, actor_id(this))
       .release();
 }
 
-void FullNodeShardImpl::got_force_good_peers(td::Result<std::vector<adnl::AdnlNodeIdShort>> peers) {
+void FullNodeShardImpl::got_force_good_peers(td::Result<std::vector<adnl::AdnlNodeIdShort>> R) {
   force_good_peers_refresh_active_ = false;
-  if (peers.is_error()) {
-    LOG(WARNING) << "failed to refresh force-good-peers shard=" << shard_.to_str() << ": " << peers.move_as_error();
+  if (R.is_error()) {
+    LOG(WARNING) << "failed to refresh force-good-peers shard=" << shard_.to_str() << ": " << R.move_as_error();
     refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(10.0, 20.0));
   } else {
-    force_good_peers_ = peers.move_as_ok();
-    LOG(WARNING) << "using force-good-peers shard=" << shard_.to_str() << " peers=" << force_good_peers_.size();
+    force_good_peers_ = R.move_as_ok();
+    LOG(WARNING) << "configured force-good-peers shard=" << shard_.to_str()
+                 << " peers=" << force_good_peers_.size();
     refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(50.0, 70.0));
   }
   alarm_timestamp().relax(refresh_force_good_peers_at_);
@@ -455,14 +462,13 @@ std::vector<adnl::AdnlNodeIdShort> FullNodeShardImpl::choose_force_good_peers(td
   if (force_good_peers_.size() <= fanout_override) {
     return force_good_peers_;
   }
-
   auto pool = force_good_peers_;
   std::vector<adnl::AdnlNodeIdShort> result;
   result.reserve(fanout_override);
-  while (result.size() < fanout_override && !pool.empty()) {
-    auto pos = static_cast<size_t>(td::Random::fast(0, static_cast<int>(pool.size() - 1)));
-    result.push_back(pool[pos]);
-    pool[pos] = pool.back();
+  for (td::uint32 i = 0; i < fanout_override; ++i) {
+    auto idx = static_cast<size_t>(td::Random::fast_uint64() % pool.size());
+    result.push_back(pool[idx]);
+    pool[idx] = pool.back();
     pool.pop_back();
   }
   return result;
@@ -480,17 +486,15 @@ std::vector<adnl::AdnlNodeIdShort> FullNodeShardImpl::choose_force_download_peer
       pool.push_back(peer);
     }
   }
-  if (pool.empty()) {
-    return {};
+  if (pool.size() <= opts_.force_download_.attempts_num_) {
+    return pool;
   }
-
-  size_t limit = std::min<size_t>(opts_.force_download_.attempts_num_, pool.size());
   std::vector<adnl::AdnlNodeIdShort> result;
-  result.reserve(limit);
-  while (result.size() < limit && !pool.empty()) {
-    auto pos = static_cast<size_t>(td::Random::fast(0, static_cast<int>(pool.size() - 1)));
-    result.push_back(pool[pos]);
-    pool[pos] = pool.back();
+  result.reserve(opts_.force_download_.attempts_num_);
+  for (td::uint32 i = 0; i < opts_.force_download_.attempts_num_; ++i) {
+    auto idx = static_cast<size_t>(td::Random::fast_uint64() % pool.size());
+    result.push_back(pool[idx]);
+    pool[idx] = pool.back();
     pool.pop_back();
   }
   return result;
@@ -544,7 +548,7 @@ void FullNodeShardImpl::remove_neighbour(adnl::AdnlNodeIdShort id) {
 void FullNodeShardImpl::update_adnl_id(adnl::AdnlNodeIdShort adnl_id, td::Promise<td::Unit> promise) {
   td::actor::send_closure(overlays_, &ton::overlay::Overlays::delete_overlay, adnl_id_, overlay_id_);
   adnl_id_ = adnl_id;
-  local_id_ = adnl_id_.pubkey_hash();
+  adnl_source_cert_.reset();
   create_overlay();
   promise.set_value(td::Unit{});
 }
@@ -584,7 +588,7 @@ void FullNodeShardImpl::try_get_next_block(td::Timestamp timeout, td::Promise<Re
                  << " attempts_target=" << opts_.force_download_.attempts_num_;
     td::actor::create_actor<DownloadBlockNewParallel>("downloadnext-forced", adnl_id_, overlay_id_, handle_->id(),
                                                       std::move(force_peers), download_next_priority(), timeout,
-                                                      validator_manager_, rldp_, overlays_, adnl_, client_,
+                                                      validator_manager_, rldp2_, overlays_, adnl_, client_,
                                                       std::move(P))
         .release();
     return;
@@ -592,7 +596,7 @@ void FullNodeShardImpl::try_get_next_block(td::Timestamp timeout, td::Promise<Re
 
   auto &b = choose_neighbour();
   td::actor::create_actor<DownloadBlockNew>("downloadnext", adnl_id_, overlay_id_, handle_->id(), b.adnl_id,
-                                            download_next_priority(), timeout, validator_manager_, rldp_, overlays_,
+                                            download_next_priority(), timeout, validator_manager_, rldp2_, overlays_,
                                             adnl_, client_, create_neighbour_promise(b, std::move(P)))
       .release();
 }
@@ -672,7 +676,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
     }
   });
   BlockIdExt block_id = create_block_id(query.prev_block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query getNextBlockDescription " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query getNextBlockDescription " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_next_block, block_id, std::move(P));
 }
 
@@ -694,7 +698,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
     }
   });
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query prepareBlock " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query prepareBlock " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_block_handle, block_id, false,
                           std::move(P));
 }
@@ -715,7 +719,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
     }
   });
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlock " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlock " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_block_handle, block_id, false,
                           std::move(P));
 }
@@ -723,14 +727,14 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
 void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNode_downloadBlockFull &query,
                                       td::Promise<td::BufferSlice> promise) {
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlockFull " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlockFull " << block_id << " from " << src;
   td::actor::create_actor<BlockFullSender>("sender", block_id, false, validator_manager_, std::move(promise)).release();
 }
 
 void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNode_downloadNextBlockFull &query,
                                       td::Promise<td::BufferSlice> promise) {
   BlockIdExt block_id = create_block_id(query.prev_block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadNextBlockFull " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadNextBlockFull " << block_id << " from " << src;
   td::actor::create_actor<BlockFullSender>("sender", block_id, true, validator_manager_, std::move(promise)).release();
 }
 
@@ -764,7 +768,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
   });
 
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query prepareBlockProof " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query prepareBlockProof " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_block_handle, block_id, false,
                           std::move(P));
 }
@@ -790,8 +794,8 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
       });
 
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query prepareKeyBlockProof " << block_id.to_str() << " " << query.allow_partial_
-                        << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query prepareKeyBlockProof " << block_id << " " << query.allow_partial_ << " from "
+                        << src;
   if (query.allow_partial_) {
     td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_key_block_proof_link, block_id,
                             std::move(P));
@@ -821,7 +825,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
       });
 
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlockProof " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlockProof " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_block_handle, block_id, false,
                           std::move(P));
 }
@@ -846,7 +850,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
       });
 
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlockProofLink " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadBlockProofLink " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_block_handle, block_id, false,
                           std::move(P));
 }
@@ -866,7 +870,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
   });
 
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadKeyBlockProof " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadKeyBlockProof " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_key_block_proof, block_id, std::move(P));
 }
 
@@ -885,7 +889,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
   });
 
   BlockIdExt block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadKeyBlockProofLink " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadKeyBlockProofLink " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_key_block_proof_link, block_id,
                           std::move(P));
 }
@@ -904,7 +908,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
         promise.set_value(std::move(x));
       });
   auto block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query prepareZeroState " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query prepareZeroState " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::check_zero_state_exists, block_id,
                           std::move(P));
 }
@@ -923,8 +927,8 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
       });
   auto block_id = create_block_id(query.block_);
   auto masterchain_block_id = create_block_id(query.masterchain_block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query preparePersistentState " << block_id.to_str() << " "
-                        << masterchain_block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query preparePersistentState " << block_id << " " << masterchain_block_id << " from "
+                        << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_persistent_state_size, block_id,
                           masterchain_block_id, UnsplitStateType{}, std::move(P));
 }
@@ -957,7 +961,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
         promise.set_value(std::move(x));
       });
   auto block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query getNextKeyBlockIds " << block_id.to_str() << " " << cnt << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query getNextKeyBlockIds " << block_id << " " << cnt << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_next_key_blocks, block_id, cnt,
                           std::move(P));
 }
@@ -974,7 +978,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
         promise.set_value(R.move_as_ok());
       });
   auto block_id = create_block_id(query.block_);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadZeroState " << block_id.to_str() << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadZeroState " << block_id << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_zero_state, block_id, std::move(P));
 }
 
@@ -1011,7 +1015,7 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
         }
       });
   ShardIdFull shard_prefix = create_shard_id(query.shard_prefix_);
-  VLOG(FULL_NODE_DEBUG) << "Got query getShardArchiveInfo " << query.masterchain_seqno_ << " " << shard_prefix.to_str()
+  VLOG(FULL_NODE_DEBUG) << "Got query getShardArchiveInfo " << query.masterchain_seqno_ << " " << shard_prefix
                         << " from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_archive_id, query.masterchain_seqno_,
                           shard_prefix, std::move(P));
@@ -1081,9 +1085,9 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
 void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNode_downloadPersistentStateSliceV2 &query,
                                       td::Promise<td::BufferSlice> promise) {
   auto [block_id, mc_block_id, state_type] = persistent_state_from_v2_query(query);
-  VLOG(FULL_NODE_DEBUG) << "Got query downloadPersistentStateSlice " << block_id.to_str() << " " << mc_block_id.to_str()
-                        << " (" << persistent_state_type_to_string(block_id.shard_full(), state_type) << ") "
-                        << query.offset_ << " " << query.max_size_ << " from " << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query downloadPersistentStateSlice " << block_id << " " << mc_block_id << " ("
+                        << persistent_state_type_to_string(block_id.shard_full(), state_type) << ") " << query.offset_
+                        << " " << query.max_size_ << " from " << src;
   if (query.max_size_ < 0 || query.max_size_ > (1 << 24)) {
     promise.set_error(td::Status::Error(ErrorCode::protoviolation, "invalid max_size"));
     return;
@@ -1112,9 +1116,8 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
         }
       });
   auto [block_id, mc_block_id, state_type] = persistent_state_from_v2_query(query);
-  VLOG(FULL_NODE_DEBUG) << "Got query getPersistentStateSize " << block_id.to_str() << " " << mc_block_id.to_str()
-                        << " (" << persistent_state_type_to_string(block_id.shard_full(), state_type) << ") from "
-                        << src;
+  VLOG(FULL_NODE_DEBUG) << "Got query getPersistentStateSize " << block_id << " " << mc_block_id << " ("
+                        << persistent_state_type_to_string(block_id.shard_full(), state_type) << ") from " << src;
   td::actor::send_closure(validator_manager_, &ValidatorManagerInterface::get_persistent_state_size, block_id,
                           mc_block_id, state_type, std::move(P));
 }
@@ -1161,7 +1164,7 @@ void FullNodeShardImpl::process_broadcast(PublicKeyHash src, ton_api::tonNode_ex
 
 void FullNodeShardImpl::process_broadcast(PublicKeyHash src, ton_api::tonNode_newShardBlockBroadcast &query) {
   BlockIdExt block_id = create_block_id(query.block_->block_);
-  VLOG(FULL_NODE_DEBUG) << "Received newShardBlockBroadcast from " << src << ": " << block_id.to_str();
+  VLOG(FULL_NODE_DEBUG) << "Received newShardBlockBroadcast from " << src << ": " << block_id;
   td::actor::send_closure(full_node_, &FullNode::process_shard_block_info_broadcast, block_id, query.block_->cc_seqno_,
                           std::move(query.block_->data_));
 }
@@ -1199,7 +1202,7 @@ void FullNodeShardImpl::process_block_candidate_broadcast(PublicKeyHash src, ton
     VLOG(FULL_NODE_WARNING) << "received block candidate with incorrect file hash from " << src;
     return;
   }
-  VLOG(FULL_NODE_DEBUG) << "Received newBlockCandidate from " << src << ": " << block_id.to_str();
+  VLOG(FULL_NODE_DEBUG) << "Received newBlockCandidate from " << src << ": " << block_id;
   td::actor::send_closure(full_node_, &FullNode::process_block_candidate_broadcast, block_id, cc_seqno,
                           validator_set_hash, std::move(data), BroadcastSource::public_overlay);
 }
@@ -1250,7 +1253,7 @@ void FullNodeShardImpl::process_block_broadcast(PublicKeyHash src, ton_api::tonN
   //  return;
   //}
   VLOG(FULL_NODE_DEBUG) << "Received block broadcast " << (B.ok().sig_set->is_final() ? "" : "(approve signatures) ")
-                        << "from " << src << ": " << B.ok().block_id.to_str();
+                        << "from " << src << ": " << B.ok().block_id;
   td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), false,
                           BroadcastSource::public_overlay);
 }
@@ -1287,7 +1290,7 @@ void FullNodeShardImpl::process_block_broadcast_with_state(PublicKeyHash src,
     LOG(DEBUG) << "Failed to deserialize block broadcast: " << B.move_as_error();
     return;
   }
-  VLOG(FULL_NODE_DEBUG) << "Received block broadcast from " << src << ": " << B.ok().block_id.to_str();
+  VLOG(FULL_NODE_DEBUG) << "Received block broadcast from " << src << ": " << B.ok().block_id;
   td::actor::send_closure(full_node_, &FullNode::process_block_broadcast, B.move_as_ok(), true,
                           BroadcastSource::public_overlay);
 }
@@ -1311,11 +1314,13 @@ void FullNodeShardImpl::send_ihr_message(td::BufferSlice data) {
   }
   auto B = create_serialize_tl_object<ton_api::tonNode_ihrMessageBroadcast>(
       create_tl_object<ton_api::tonNode_ihrMessage>(std::move(data)));
+  auto source = choose_outbound_source(static_cast<td::uint32>(B.size()),
+                                       B.size() > overlay::Overlays::max_simple_broadcast_size());
   if (B.size() <= overlay::Overlays::max_simple_broadcast_size()) {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, adnl_id_, overlay_id_, local_id_, 0,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, adnl_id_, overlay_id_, source, 0,
                             std::move(B));
   } else {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_, 0,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, source, 0,
                             std::move(B));
   }
 }
@@ -1343,11 +1348,13 @@ void FullNodeShardImpl::send_external_message(td::BufferSlice data) {
   my_ext_msg_broadcasts_.insert(hash);
   auto B = create_serialize_tl_object<ton_api::tonNode_externalMessageBroadcast>(
       create_tl_object<ton_api::tonNode_externalMessage>(std::move(data)));
+  auto source = choose_outbound_source(static_cast<td::uint32>(B.size()),
+                                       B.size() > overlay::Overlays::max_simple_broadcast_size());
   if (B.size() <= overlay::Overlays::max_simple_broadcast_size()) {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, adnl_id_, overlay_id_, local_id_, 0,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, adnl_id_, overlay_id_, source, 0,
                             std::move(B));
   } else {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_, 0,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, source, 0,
                             std::move(B));
   }
 }
@@ -1357,14 +1364,16 @@ void FullNodeShardImpl::send_shard_block_info(BlockIdExt block_id, CatchainSeqno
     UNREACHABLE();
     return;
   }
-  VLOG(FULL_NODE_DEBUG) << "Sending newShardBlockBroadcast: " << block_id.to_str();
+  VLOG(FULL_NODE_DEBUG) << "Sending newShardBlockBroadcast: " << block_id;
   auto B = create_serialize_tl_object<ton_api::tonNode_newShardBlockBroadcast>(
       create_tl_object<ton_api::tonNode_newShardBlock>(create_tl_block_id(block_id), cc_seqno, std::move(data)));
+  auto source = choose_outbound_source(static_cast<td::uint32>(B.size()),
+                                       B.size() > overlay::Overlays::max_simple_broadcast_size());
   if (B.size() <= overlay::Overlays::max_simple_broadcast_size()) {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, adnl_id_, overlay_id_, local_id_, 0,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_ex, adnl_id_, overlay_id_, source, 0,
                             std::move(B));
   } else {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, source,
                             overlay::Overlays::BroadcastFlagAnySender(), std::move(B));
   }
 }
@@ -1387,33 +1396,36 @@ void FullNodeShardImpl::send_block_candidate_with_fanout(BlockIdExt block_id, Ca
     VLOG(FULL_NODE_WARNING) << "failed to serialize block candidate broadcast: " << B.move_as_error();
     return;
   }
-  VLOG(FULL_NODE_DEBUG) << "Sending newBlockCandidate: " << block_id.to_str();
+  VLOG(FULL_NODE_DEBUG) << "Sending newBlockCandidate: " << block_id;
   auto payload = B.move_as_ok();
   auto payload_size = payload.size();
+  auto source = choose_outbound_source(static_cast<td::uint32>(payload.size()), true);
   if (fanout_override == 0) {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, source,
                             overlay::Overlays::BroadcastFlagAnySender(), std::move(payload));
-  } else {
-    auto force_good_available = force_good_peers_.size();
-    auto force_peers = choose_force_good_peers(fanout_override);
-    auto force_good_selected = force_peers.size();
-    auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
-    bool cert_attached = cert_ && payload_size <= std::numeric_limits<td::uint32>::max() &&
-                         cert_->check(local_id_, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
-                                      static_cast<td::uint32>(payload_size), true,
-                                      /* skip_check_signature = */ true) != overlay::BroadcastCheckResult::Forbidden;
-    LOG(WARNING) << "public rebroadcast dispatch type=candidate block=" << block_id.to_str()
-                 << " shard=" << shard_.to_str() << " fanout_target=" << fanout_override
-                 << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
-                 << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size
-                 << " cert_attached=" << cert_attached
-                 << " cert_issuer=" << (cert_ ? cert_->issuer_hash() : PublicKeyHash::zero())
-                 << " cert_expire_at=" << (cert_ ? cert_->expire_at() : 0)
-                 << " cert_flags=" << (cert_ ? cert_->flags() : 0);
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
-                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
-                            fanout_override, std::move(force_peers));
+    return;
   }
+
+  auto cert = source == full_node_adnl_source() ? adnl_source_cert_ : cert_;
+  auto force_good_available = force_good_peers_.size();
+  auto force_peers = choose_force_good_peers(fanout_override);
+  auto force_good_selected = force_peers.size();
+  auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
+  bool cert_attached = cert && payload_size <= std::numeric_limits<td::uint32>::max() &&
+                       cert->check(source, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
+                                   static_cast<td::uint32>(payload_size), true,
+                                   /* skip_check_signature = */ true) != overlay::BroadcastCheckResult::Forbidden;
+  LOG(WARNING) << "public rebroadcast dispatch type=candidate block=" << block_id.to_str()
+               << " shard=" << shard_.to_str() << " source=" << source << " fanout_target=" << fanout_override
+               << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
+               << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size
+               << " cert_attached=" << cert_attached
+               << " cert_issuer=" << (cert ? cert->issuer_hash() : PublicKeyHash::zero())
+               << " cert_expire_at=" << (cert ? cert->expire_at() : 0)
+               << " cert_flags=" << (cert ? cert->flags() : 0);
+  td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
+                          source, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
+                          fanout_override, std::move(force_peers));
 }
 
 void FullNodeShardImpl::send_broadcast(BlockBroadcast broadcast) {
@@ -1425,7 +1437,7 @@ void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td:
     UNREACHABLE();
     return;
   }
-  VLOG(FULL_NODE_DEBUG) << "Sending block broadcast in private overlay: " << broadcast.block_id.to_str();
+  VLOG(FULL_NODE_DEBUG) << "Sending block broadcast in private overlay: " << broadcast.block_id;
   auto B = serialize_block_broadcast(broadcast, k_called_from_public);
   if (B.is_error()) {
     VLOG(FULL_NODE_WARNING) << "failed to serialize block broadcast: " << B.move_as_error();
@@ -1433,30 +1445,33 @@ void FullNodeShardImpl::send_broadcast_with_fanout(BlockBroadcast broadcast, td:
   }
   auto payload = B.move_as_ok();
   auto payload_size = payload.size();
+  auto source = choose_outbound_source(static_cast<td::uint32>(payload_size), true);
   if (fanout_override == 0) {
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, local_id_,
+    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex, adnl_id_, overlay_id_, source,
                             overlay::Overlays::BroadcastFlagAnySender(), std::move(payload));
-  } else {
-    auto force_good_available = force_good_peers_.size();
-    auto force_peers = choose_force_good_peers(fanout_override);
-    auto force_good_selected = force_peers.size();
-    auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
-    bool cert_attached = cert_ && payload_size <= std::numeric_limits<td::uint32>::max() &&
-                         cert_->check(local_id_, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
-                                      static_cast<td::uint32>(payload_size), true,
-                                      /* skip_check_signature = */ true) != overlay::BroadcastCheckResult::Forbidden;
-    LOG(WARNING) << "public rebroadcast dispatch type=block block=" << broadcast.block_id.to_str()
-                 << " shard=" << shard_.to_str() << " fanout_target=" << fanout_override
-                 << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
-                 << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size
-                 << " cert_attached=" << cert_attached
-                 << " cert_issuer=" << (cert_ ? cert_->issuer_hash() : PublicKeyHash::zero())
-                 << " cert_expire_at=" << (cert_ ? cert_->expire_at() : 0)
-                 << " cert_flags=" << (cert_ ? cert_->flags() : 0);
-    td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
-                            local_id_, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
-                            fanout_override, std::move(force_peers));
+    return;
   }
+
+  auto cert = source == full_node_adnl_source() ? adnl_source_cert_ : cert_;
+  auto force_good_available = force_good_peers_.size();
+  auto force_peers = choose_force_good_peers(fanout_override);
+  auto force_good_selected = force_peers.size();
+  auto discovered_peer_target = fanout_override > force_good_selected ? fanout_override - force_good_selected : 0;
+  bool cert_attached = cert && payload_size <= std::numeric_limits<td::uint32>::max() &&
+                       cert->check(source, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
+                                   static_cast<td::uint32>(payload_size), true,
+                                   /* skip_check_signature = */ true) != overlay::BroadcastCheckResult::Forbidden;
+  LOG(WARNING) << "public rebroadcast dispatch type=block block=" << broadcast.block_id.to_str()
+               << " shard=" << shard_.to_str() << " source=" << source << " fanout_target=" << fanout_override
+               << " force_good_available=" << force_good_available << " force_good_selected=" << force_good_selected
+               << " discovered_peer_target=" << discovered_peer_target << " payload_bytes=" << payload_size
+               << " cert_attached=" << cert_attached
+               << " cert_issuer=" << (cert ? cert->issuer_hash() : PublicKeyHash::zero())
+               << " cert_expire_at=" << (cert ? cert->expire_at() : 0)
+               << " cert_flags=" << (cert ? cert->flags() : 0);
+  td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_ex_with_fanout, adnl_id_, overlay_id_,
+                          source, overlay::Overlays::BroadcastFlagAnySender(), std::move(payload),
+                          fanout_override, std::move(force_peers));
 }
 
 void FullNodeShardImpl::download_block(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,
@@ -1477,26 +1492,24 @@ void FullNodeShardImpl::download_block(BlockIdExt id, td::uint32 priority, td::T
                  << " configured_peers=" << opts_.force_download_.peers_.size()
                  << " attempts_target=" << opts_.force_download_.attempts_num_;
     td::actor::create_actor<DownloadBlockNewParallel>("downloadreq-forced", id, adnl_id_, overlay_id_,
-                                                      std::move(force_peers), priority, timeout,
-                                                      validator_manager_, rldp_, overlays_, adnl_, client_,
-                                                      std::move(P))
+                                                      std::move(force_peers), priority, timeout, validator_manager_,
+                                                      rldp2_, overlays_, adnl_, client_, std::move(P))
         .release();
     return;
   }
 
   auto &b = choose_neighbour();
   td::actor::create_actor<DownloadBlockNew>("downloadreq", id, adnl_id_, overlay_id_, b.adnl_id, priority, timeout,
-                                            validator_manager_, rldp_, overlays_, adnl_, client_,
+                                            validator_manager_, rldp2_, overlays_, adnl_, client_,
                                             create_neighbour_promise(b, std::move(P)))
       .release();
 }
 
 void FullNodeShardImpl::download_zero_state(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,
                                             td::Promise<td::BufferSlice> promise) {
-  td::actor::create_actor<DownloadState>(PSTRING() << "downloadstatereq" << id.id.to_str(), id, BlockIdExt{},
-                                         UnsplitStateType{}, adnl_id_, overlay_id_, adnl::AdnlNodeIdShort::zero(),
-                                         priority, timeout, validator_manager_, rldp_, overlays_, adnl_, client_,
-                                         std::move(promise))
+  td::actor::create_actor<DownloadState>(PSTRING() << "downloadstatereq" << id.id, id, BlockIdExt{}, UnsplitStateType{},
+                                         adnl_id_, overlay_id_, adnl::AdnlNodeIdShort::zero(), priority, timeout,
+                                         validator_manager_, rldp2_, overlays_, adnl_, client_, std::move(promise))
       .release();
 }
 
@@ -1504,8 +1517,8 @@ void FullNodeShardImpl::download_persistent_state(BlockIdExt id, BlockIdExt mast
                                                   PersistentStateType type, td::uint32 priority, td::Timestamp timeout,
                                                   td::Promise<td::BufferSlice> promise) {
   auto &b = choose_neighbour();
-  td::actor::create_actor<DownloadState>(PSTRING() << "downloadstatereq" << id.id.to_str(), id, masterchain_block_id,
-                                         type, adnl_id_, overlay_id_, b.adnl_id, priority, timeout, validator_manager_,
+  td::actor::create_actor<DownloadState>(PSTRING() << "downloadstatereq" << id.id, id, masterchain_block_id, type,
+                                         adnl_id_, overlay_id_, b.adnl_id, priority, timeout, validator_manager_,
                                          rldp2_, overlays_, adnl_, client_, std::move(promise))
       .release();
 }
@@ -1514,7 +1527,7 @@ void FullNodeShardImpl::download_block_proof(BlockIdExt block_id, td::uint32 pri
                                              td::Promise<td::BufferSlice> promise) {
   auto &b = choose_neighbour();
   td::actor::create_actor<DownloadProof>("downloadproofreq", block_id, false, false, adnl_id_, overlay_id_, b.adnl_id,
-                                         priority, timeout, validator_manager_, rldp_, overlays_, adnl_, client_,
+                                         priority, timeout, validator_manager_, rldp2_, overlays_, adnl_, client_,
                                          create_neighbour_promise(b, std::move(promise)))
       .release();
 }
@@ -1523,7 +1536,7 @@ void FullNodeShardImpl::download_block_proof_link(BlockIdExt block_id, td::uint3
                                                   td::Promise<td::BufferSlice> promise) {
   auto &b = choose_neighbour();
   td::actor::create_actor<DownloadProof>("downloadproofreq", block_id, true, false, adnl_id_, overlay_id_, b.adnl_id,
-                                         priority, timeout, validator_manager_, rldp_, overlays_, adnl_, client_,
+                                         priority, timeout, validator_manager_, rldp2_, overlays_, adnl_, client_,
                                          create_neighbour_promise(b, std::move(promise)))
       .release();
 }
@@ -1532,7 +1545,7 @@ void FullNodeShardImpl::get_next_key_blocks(BlockIdExt block_id, td::Timestamp t
                                             td::Promise<std::vector<BlockIdExt>> promise) {
   auto &b = choose_neighbour();
   td::actor::create_actor<GetNextKeyBlocks>("next", block_id, 16, adnl_id_, overlay_id_, b.adnl_id, 1, timeout,
-                                            validator_manager_, rldp_, overlays_, adnl_, client_,
+                                            validator_manager_, rldp2_, overlays_, adnl_, client_,
                                             create_neighbour_promise(b, std::move(promise)))
       .release();
 }
@@ -1584,7 +1597,7 @@ void FullNodeShardImpl::download_out_msg_queue_proof(ShardIdFull dst_shard, std:
                     }));
       });
   td::actor::send_closure(overlays_, &overlay::Overlays::send_query_via, b.adnl_id, adnl_id_, overlay_id_,
-                          "get_msg_queue", std::move(P), timeout, std::move(query), 1 << 22, rldp_);
+                          "get_msg_queue", std::move(P), timeout, std::move(query), 1 << 22, rldp2_);
 }
 
 void FullNodeShardImpl::set_handle(BlockHandle handle, td::Promise<td::Unit> promise) {
@@ -1627,6 +1640,9 @@ void FullNodeShardImpl::alarm() {
   }
   if (refresh_force_good_peers_at_ && refresh_force_good_peers_at_.is_in_past()) {
     refresh_force_good_peers();
+    if (!force_good_peers_refresh_active_) {
+      refresh_force_good_peers_at_ = td::Timestamp::in(td::Random::fast(50.0, 70.0));
+    }
   }
   alarm_timestamp().relax(sync_completed_at_);
   alarm_timestamp().relax(update_certificate_at_);
@@ -1704,6 +1720,30 @@ void FullNodeShardImpl::signed_new_certificate(overlay::Certificate cert, Public
   td::actor::send_closure(overlays_, &overlay::Overlays::update_certificate, adnl_id_, overlay_id_, local_id_, cert_);
 }
 
+PublicKeyHash FullNodeShardImpl::full_node_adnl_source() const {
+  return adnl_id_.is_zero() ? PublicKeyHash::zero() : adnl_id_.pubkey_hash();
+}
+
+bool FullNodeShardImpl::has_valid_certificate_for_source(const PublicKeyHash &source,
+                                                         const std::shared_ptr<ton::overlay::Certificate> &cert,
+                                                         td::uint32 payload_size, bool is_fec) const {
+  if (!cert) {
+    return false;
+  }
+  return cert->check(source, overlay_id_, static_cast<td::int32>(td::Clocks::system()), payload_size, is_fec) ==
+             overlay::BroadcastCheckResult::Allowed &&
+         rules_.is_authorized_key(cert->issuer_hash());
+}
+
+PublicKeyHash FullNodeShardImpl::choose_outbound_source(td::uint32 payload_size, bool is_fec) const {
+  auto adnl_source = full_node_adnl_source();
+  if (!adnl_source.is_zero() && adnl_source != local_id_ &&
+      has_valid_certificate_for_source(adnl_source, adnl_source_cert_, payload_size, is_fec)) {
+    return adnl_source;
+  }
+  return local_id_;
+}
+
 void FullNodeShardImpl::sign_overlay_certificate(PublicKeyHash signed_key, td::uint32 expire_at, td::uint32 max_size,
                                                  td::Promise<td::BufferSlice> promise) {
   auto sign_by = sign_cert_by_;
@@ -1740,18 +1780,35 @@ void FullNodeShardImpl::import_overlay_certificate(PublicKeyHash signed_key,
     promise.set_error(td::Status::Error("empty certificate"));
     return;
   }
+  if (cert->signature().size() != k_ed25519_signature_size) {
+    promise.set_error(td::Status::Error(PSTRING() << "bad certificate signature size: " << cert->signature().size()));
+    return;
+  }
   auto check = cert->check(signed_key, overlay_id_, static_cast<td::int32>(td::Clocks::system()),
-                           overlay::Overlays::max_fec_broadcast_size(), true);
-  if (check == overlay::BroadcastCheckResult::Forbidden) {
+                           overlay::Overlays::max_fec_broadcast_size(), true,
+                           /* skip_check_signature = */ false);
+  if (check != overlay::BroadcastCheckResult::Allowed) {
     promise.set_error(td::Status::Error("certificate is not valid for this shard overlay"));
     return;
   }
-  LOG(WARNING) << "public rebroadcast cert accepted shard=" << shard_.to_str() << " signed_key=" << signed_key
-               << " local_id=" << local_id_ << " issuer=" << cert->issuer_hash() << " expire_at=" << cert->expire_at()
-               << " max_size=" << cert->max_size() << " flags=" << cert->flags()
-               << " usable_for_local_source=" << (signed_key == local_id_);
-  if (signed_key == local_id_) {
+  if (!rules_.is_authorized_key(cert->issuer_hash())) {
+    promise.set_error(td::Status::Error(PSTRING() << "certificate issuer is not authorized for this shard overlay: "
+                                                  << cert->issuer_hash()));
+    return;
+  }
+  auto adnl_source = full_node_adnl_source();
+  bool usable_for_local_source = signed_key == local_id_;
+  bool usable_for_adnl_source = !adnl_source.is_zero() && signed_key == adnl_source;
+  LOG(WARNING) << "public rebroadcast cert accepted shard=" << shard_ << " signed_key=" << signed_key
+               << " local_id=" << local_id_ << " adnl_source=" << adnl_source << " issuer=" << cert->issuer_hash()
+               << " expire_at=" << cert->expire_at() << " max_size=" << cert->max_size()
+               << " flags=" << cert->flags() << " usable_for_local_source=" << usable_for_local_source
+               << " usable_for_adnl_source=" << usable_for_adnl_source;
+  if (usable_for_local_source) {
     cert_ = cert;
+  }
+  if (usable_for_adnl_source) {
+    adnl_source_cert_ = cert;
   }
   td::actor::send_closure(overlays_, &ton::overlay::Overlays::update_certificate, adnl_id_, overlay_id_, signed_key,
                           cert);
@@ -1965,7 +2022,7 @@ void FullNodeShardImpl::get_stats_extra(td::Promise<std::string> promise) {
 FullNodeShardImpl::FullNodeShardImpl(
     ShardIdFull shard, PublicKeyHash local_id, adnl::AdnlNodeIdShort adnl_id, FileHash zero_state_file_hash,
     FullNodeOptions opts, std::shared_ptr<RateLimiter<>> limiter, td::actor::ActorId<keyring::Keyring> keyring,
-    td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<rldp2::Rldp> rldp2,
+    td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<rldp2::Rldp> rldp2,
     td::actor::ActorId<overlay::Overlays> overlays, td::actor::ActorId<ValidatorManagerInterface> validator_manager,
     td::actor::ActorId<adnl::AdnlExtClient> client, td::actor::ActorId<FullNode> full_node, bool active)
     : shard_(shard)
@@ -1974,7 +2031,6 @@ FullNodeShardImpl::FullNodeShardImpl(
     , zero_state_file_hash_(zero_state_file_hash)
     , keyring_(keyring)
     , adnl_(adnl)
-    , rldp_(rldp)
     , rldp2_(rldp2)
     , overlays_(overlays)
     , validator_manager_(validator_manager)
@@ -1988,11 +2044,11 @@ FullNodeShardImpl::FullNodeShardImpl(
 td::actor::ActorOwn<FullNodeShard> FullNodeShard::create(
     ShardIdFull shard, PublicKeyHash local_id, adnl::AdnlNodeIdShort adnl_id, FileHash zero_state_file_hash,
     FullNodeOptions opts, std::shared_ptr<RateLimiter<>> limiter, td::actor::ActorId<keyring::Keyring> keyring,
-    td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<rldp::Rldp> rldp, td::actor::ActorId<rldp2::Rldp> rldp2,
+    td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<rldp2::Rldp> rldp2,
     td::actor::ActorId<overlay::Overlays> overlays, td::actor::ActorId<ValidatorManagerInterface> validator_manager,
     td::actor::ActorId<adnl::AdnlExtClient> client, td::actor::ActorId<FullNode> full_node, bool active) {
-  return td::actor::create_actor<FullNodeShardImpl>(PSTRING() << "tonnode" << shard.to_str(), shard, local_id, adnl_id,
-                                                    zero_state_file_hash, opts, std::move(limiter), keyring, adnl, rldp,
+  return td::actor::create_actor<FullNodeShardImpl>(PSTRING() << "tonnode" << shard, shard, local_id, adnl_id,
+                                                    zero_state_file_hash, opts, std::move(limiter), keyring, adnl,
                                                     rldp2, overlays, validator_manager, client, full_node, active);
 }
 

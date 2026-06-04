@@ -271,7 +271,8 @@ void BroadcastsTwostep::signed_fec(OverlayImpl *overlay, BroadcastTwostepDataFec
 static td::Result<BroadcastCheckResult> check_source(OverlayImpl *overlay, const PublicKeyHash &src_keyhash,
                                                      const Certificate *certificate, td::uint32 data_size,
                                                      adnl::AdnlNodeIdShort message_from) {
-  auto r = overlay->check_source_eligible(src_keyhash, certificate, data_size, true, message_from);
+  auto r = overlay->check_source_eligible(src_keyhash, certificate, data_size, /* is_fec = */ true,
+                                          /* is_any_sender = */ false, message_from);
   if (r == BroadcastCheckResult::Forbidden) {
     return td::Status::Error(ErrorCode::error, "broadcast is forbidden");
   }
@@ -328,6 +329,7 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(
   auto cert = CO_TRY(Certificate::create(broadcast->certificate_));
   auto check_result = CO_TRY(
       check_source(overlay, src_keyhash, cert.get(), static_cast<td::uint32>(broadcast->data_.size()), src_peer_id));
+  CO_TRY(overlay->get_broadcasts_limiter(src_keyhash, cert.get()).precheck_new_broadcast(broadcast->data_.size()));
   co_await overlay->precheck_broadcast(src_keyhash, broadcast_id, broadcast->extra_.clone(), false)
       .trace("precheck broadcast");
   {
@@ -342,7 +344,7 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(
     VLOG(TWOSTEP_DEBUG) << "twostep DUPLICATE receiver broadcast_id=" << broadcast_id.to_hex();
     co_return td::Status::Error(ErrorCode::notready, "duplicate broadcast");
   }
-  overlay->get_broadcasts_limiter(src_keyhash, cert.get()).register_broadcast(broadcast->data_.size());
+  CO_TRY(overlay->get_broadcasts_limiter(src_keyhash, cert.get()).try_register_broadcast(broadcast->data_.size()));
   if (will_rebroadcast) {
     td::uint64 total_size = rebroadcast(overlay, bcast_src_adnl_id, serialize_tl_object(broadcast, true));
     overlay->get_broadcasts_limiter(src_keyhash, cert.get()).register_out_traffic(total_size);
@@ -365,6 +367,9 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
   adnl::AdnlNodeIdShort bcast_src_adnl_id{broadcast->src_adnl_id_};
   size_t data_size = static_cast<td::uint32>(broadcast->data_size_);
   size_t part_size = broadcast->part_.size();
+  if (part_size >= data_size) {
+    co_return td::Status::Error(ErrorCode::protoviolation, "too big part size");
+  }
   td::uint32 seqno = static_cast<td::uint32>(broadcast->seqno_);
   if (seqno >= overlay->persistent_node_count()) {
     co_return td::Status::Error(ErrorCode::protoviolation, "too big seqno");
@@ -385,6 +390,7 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
   auto check_result =
       CO_TRY(check_source(overlay, src_keyhash, cert.get(), static_cast<td::uint32>(data_size), src_peer_id));
   if (it == broadcasts_.end()) {
+    CO_TRY(overlay->get_broadcasts_limiter(src_keyhash, cert.get()).precheck_new_broadcast(data_size));
     co_await overlay->precheck_broadcast(src_keyhash, broadcast_id, broadcast->extra_.clone(), false)
         .trace("precheck broadcast");
   }
@@ -404,6 +410,7 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
     }
   }
   if (it == broadcasts_.end()) {
+    CO_TRY(overlay->get_broadcasts_limiter(src_keyhash, cert.get()).try_register_broadcast(data_size));
     td::Result<std::unique_ptr<td::raptorq::Decoder>> R;
     if (part_size == 0 ||
         (R = td::raptorq::Decoder::create({(data_size + part_size - 1) / part_size, part_size, data_size}))
@@ -424,7 +431,6 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
                                        .chunk_senders = {}}});
     lru_.put(bcast.get());
     it = broadcasts_.emplace(broadcast_id, std::move(bcast)).first;
-    overlay->get_broadcasts_limiter(src_keyhash, cert.get()).register_broadcast(data_size);
     VLOG(TWOSTEP_INFO) << "twostep START receiver " << *it->second << " from=" << src_peer_id;
   }
   auto bcast = it->second.get();

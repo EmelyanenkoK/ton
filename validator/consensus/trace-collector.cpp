@@ -26,7 +26,6 @@ class TraceCollectorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
  public:
   TON_RUNTIME_DEFINE_EVENT_HANDLER();
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     stop();
   }
@@ -36,7 +35,6 @@ class TraceCollectorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     id = owning_bus()->session_id;
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const TraceEvent> event) {
     events.push_back(create_tl_object<stats::tl::timestampedEvent>(event->event->ts(), event->event->to_tl()));
     alarm_timestamp().relax(td::Timestamp::in(5));

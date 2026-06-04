@@ -4,6 +4,8 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
+#include "common/checksum.h"
+
 #include "bus.h"
 
 namespace ton::validator::consensus::simplex {
@@ -47,12 +49,10 @@ class DbImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo<B
     init_votes(bus);
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     stop();
   }
 
-  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<BroadcastVote> event) {
     auto vote = event->vote.to_tl();
     auto hash = sha256_bits256(serialize_tl_object(vote, true));
@@ -74,7 +74,6 @@ class DbImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo<B
     co_return result;
   }
 
-  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<SaveCertificate> event) {
     auto cert = event->cert->to_tl();
     auto hash = sha256_bits256(serialize_tl_object(cert, true));
@@ -91,7 +90,6 @@ class DbImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo<B
     co_return result;
   }
 
-  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<LeaderWindowObserved> event) {
     auto window = event->start_slot / owning_bus()->config.slots_per_leader_window;
     CHECK(first_nonannounced_window_ <= window);

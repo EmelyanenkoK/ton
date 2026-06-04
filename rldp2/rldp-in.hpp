@@ -19,13 +19,10 @@
 #pragma once
 
 #include <map>
-#include <memory>
 #include <set>
 
 #include "adnl/adnl-peer-table.h"
 #include "adnl/adnl-query.h"
-#include "metrics/metrics-collectors.h"
-#include "metrics/tl-traffic-bucket.h"
 #include "td/utils/List.h"
 #include "tl-utils/tl-utils.hpp"
 
@@ -55,7 +52,7 @@ class RldpLru : public td::ListNode {
 };
 
 class RldpConnectionActor;
-class RldpIn : public RldpImpl, public virtual metrics::AsyncCollector {
+class RldpIn : public RldpImpl {
  public:
   static constexpr td::uint64 mtu() {
     return (1ull << 37);
@@ -64,7 +61,6 @@ class RldpIn : public RldpImpl, public virtual metrics::AsyncCollector {
     return 128;
   }
   void on_sent(TransferId transfer_id, td::Result<td::Unit> state);
-  void collect(metrics::MetricsPromise P) override;
 
   void send_message(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst, td::BufferSlice data) override;
   void send_message_ex(adnl::AdnlNodeIdShort src, adnl::AdnlNodeIdShort dst, td::Timestamp timeout,
@@ -103,29 +99,26 @@ class RldpIn : public RldpImpl, public virtual metrics::AsyncCollector {
   void on_mtu_updated(td::optional<adnl::AdnlNodeIdShort> local_id,
                       td::optional<adnl::AdnlNodeIdShort> peer_id) override;
 
+  void alarm() override;
+
  private:
   std::unique_ptr<adnl::Adnl::Callback> make_adnl_callback();
 
   td::actor::ActorId<adnl::AdnlPeerTable> adnl_;
 
-  std::map<std::pair<adnl::AdnlNodeIdShort, adnl::AdnlNodeIdShort>, td::actor::ActorOwn<RldpConnectionActor>>
-      connections_;
+  struct Connection;
+  std::map<std::pair<adnl::AdnlNodeIdShort, adnl::AdnlNodeIdShort>, Connection> connections_;
+  std::set<std::tuple<td::Timestamp, adnl::AdnlNodeIdShort, adnl::AdnlNodeIdShort>> timeout_set_;
 
   std::map<TransferId, td::Promise<td::BufferSlice>> queries_;
 
   std::set<adnl::AdnlNodeIdShort> local_ids_;
 
-  std::shared_ptr<Rldp2Metrics> metrics_ = std::make_shared<Rldp2Metrics>();
+  td::actor::ActorId<RldpConnectionActor> get_or_create_connection(adnl::AdnlNodeIdShort local_id,
+                                                                   adnl::AdnlNodeIdShort peer_id, bool incoming,
+                                                                   td::Timestamp timeout = {});
 
-  metrics::TlTrafficBucket app_send_by_tl_message_;
-  metrics::TlTrafficBucket app_send_by_tl_query_;
-  metrics::TlTrafficBucket app_send_by_tl_answer_;
-  metrics::TlTrafficBucket app_deliver_by_tl_message_;
-  metrics::TlTrafficBucket app_deliver_by_tl_query_;
-  metrics::TlTrafficBucket app_deliver_by_tl_answer_;
-
-  td::actor::ActorId<RldpConnectionActor> create_connection(adnl::AdnlNodeIdShort local_id,
-                                                            adnl::AdnlNodeIdShort peer_id, bool incoming);
+  static constexpr double CONNECTION_TIMEOUT = 120.0;
 };
 
 }  // namespace rldp2

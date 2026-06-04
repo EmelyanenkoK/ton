@@ -6,7 +6,6 @@
 #include "adnl/adnl-sender-ex.h"
 #include "keyring/keyring.h"
 #include "metrics/metrics-collectors.h"
-#include "metrics/tl-traffic-bucket.h"
 #include "td/actor/coro_task.h"
 
 #include "quic-server.h"
@@ -42,14 +41,13 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
         return {.server_stats = server_stats + other.server_stats};
       }
 
-      [[nodiscard]] metrics::MetricSet dump() const;
-    } summary = {};
+      [[nodiscard]] std::vector<metrics::MetricFamily> dump() const;
+    };
+
+    Entry summary = {.server_stats = {.total_conns = 0}};
     std::map<AdnlPath, Entry> per_path;
 
-    // Server-level UDP wire counters aggregated across all QuicServers.
-    UdpCounters udp = {};
-
-    [[nodiscard]] metrics::MetricSet dump() const;
+    [[nodiscard]] std::vector<metrics::MetricFamily> dump() const;
   };
 
   td::actor::Task<Stats> collect_stats();
@@ -86,29 +84,9 @@ class QuicSender : public adnl::AdnlSenderEx, public virtual metrics::AsyncColle
   std::map<AdnlPath, std::shared_ptr<Connection>> inbound_;
   std::map<QuicConnectionId, std::shared_ptr<Connection>> by_cid_;
 
-  std::map<adnl::AdnlNodeIdShort, td::actor::ActorOwn<QuicServer>> servers_;
+  std::map<int, td::actor::ActorOwn<QuicServer>> servers_by_port_;
+  std::map<adnl::AdnlNodeIdShort, td::actor::ActorId<QuicServer>> servers_by_id_;
   std::map<adnl::AdnlNodeIdShort, td::Ed25519::PrivateKey> local_keys_;
-
-  // Application-level traffic counters (raw payload bytes, before TL wrapping).
-  // Accessed from within the QuicSender actor only.
-  struct KindCounter {
-    td::uint64 bytes = 0;
-    td::uint64 msgs = 0;
-    void record(td::uint64 size) {
-      bytes += size;
-      msgs++;
-    }
-  };
-  struct AppMetrics {
-    KindCounter send_message, send_query;
-    KindCounter deliver_message, deliver_query, deliver_answer;
-  };
-  AppMetrics app_metrics_;
-  metrics::TlTrafficBucket app_send_by_tl_message_;
-  metrics::TlTrafficBucket app_send_by_tl_query_;
-  metrics::TlTrafficBucket app_deliver_by_tl_message_;
-  metrics::TlTrafficBucket app_deliver_by_tl_query_;
-  metrics::TlTrafficBucket app_deliver_by_tl_answer_;
 
   void start_up() override;
 

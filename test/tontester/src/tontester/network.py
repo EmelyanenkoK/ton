@@ -1,20 +1,21 @@
 import asyncio
+import functools
 import logging
 import os
 import shlex
 import signal
 import subprocess
 import types
-import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Collection, Iterator, Mapping
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from ipaddress import IPv4Address
+from itertools import chain
 from pathlib import Path
 from typing import Literal, final, override
 
-from daemon.ipc import IPCClient, RegisterResponse
-from daemon.storage import NodeTarget, TestMetadata
 from tonapi import ton_api
 
 from tl import TLObject
@@ -52,21 +53,74 @@ type DebugType = None | Literal["rr"]
 
 
 @final
+class _ChainedCollection[T](Collection[T]):
+    def __init__(self, *collections: Collection[T]):
+        self._collections = collections
+
+    @override
+    def __iter__(self) -> Iterator[T]:
+        return chain.from_iterable(self._collections)
+
+    @override
+    def __len__(self):
+        return sum(len(c) for c in self._collections)
+
+    @override
+    def __contains__(self, item: object):
+        return any(item in c for c in self._collections)
+
+
+@dataclass(frozen=True)
+class StartOptions:
+    install: Install | None = None
+    debug: DebugType = None
+    env: Mapping[str, str] = types.MappingProxyType(
+        {}
+    )  # FIXME: Replace with frozendict once we are on Python 3.15
+    args: Collection[str] = ()
+    threads: int = 0
+    verbosity: int = 3
+    console_verbosity: int = 3
+    pass_fds: Collection[int] = ()
+
+
+def _get_install_and_options(
+    options: StartOptions | None,
+    install: Install,
+    additional_args: Collection[str],
+    pass_fds: Collection[int],
+) -> tuple[StartOptions, Install]:
+    if options is None:
+        options = StartOptions()
+
+    if options.install is not None:
+        install = options.install
+
+    return (
+        StartOptions(
+            install=install,
+            debug=options.debug,
+            env=options.env,
+            args=_ChainedCollection(additional_args, options.args),
+            threads=options.threads,
+            verbosity=options.verbosity,
+            console_verbosity=options.console_verbosity,
+            pass_fds=_ChainedCollection(pass_fds, options.pass_fds),
+        ),
+        install,
+    )
+
+
+@final
 class Network:
     class Node(ABC):
         def __init__(
             self,
             network: Network,
             name: str,
-            install: Install | None = None,
-            env: dict[str, str] | None = None,
-            threads: int | None = None,
         ):
             self._network: Network = network
             self.name: str = name
-            self._install_override: Install | None = install
-            self._extra_env: dict[str, str] = dict(env or {})
-            self._threads: int | None = threads
 
             self._directory: Path = self._network._directory / (
                 "node" + str(self._network._node_idx)
@@ -82,10 +136,6 @@ class Network:
             self.__process_watcher: asyncio.Task[None] | None = None
             self.__log_streamer: LogStreamer | None = None
 
-        @property
-        def _install(self):
-            return self._install_override or self._network._install
-
         def _new_network_address(self) -> _IPv4AddressAndPort:
             self._network._port += 1
             return _IPv4AddressAndPort(
@@ -93,10 +143,10 @@ class Network:
                 self._network._port,
             )
 
-        def _new_key(self) -> tuple[Key, Path]:
-            key = Key.new(self._install)
-            pk_file = key.add_to_keyring(self._keyring)
-            return (key, pk_file)
+        def _new_keyring_key(self) -> tuple[Key, Path]:
+            key = Key()
+            path = key.add_to_keyring(self._keyring)
+            return key, path
 
         def _ensure_no_zerostate_yet(self):
             assert self._network._status < _Status.ZEROSTATE_GENERATED
@@ -125,9 +175,7 @@ class Network:
             executable: Path,
             local_config: ton_api.Engine_validator_config,
             validator_config: ton_api.Validator_config_global | None,
-            additional_args: list[str],
-            *,
-            debug: DebugType = None,
+            start_options: StartOptions,
         ):
             async def process_watcher():
                 assert self.__process is not None
@@ -167,26 +215,27 @@ class Network:
                 local_config_file,
                 "--db",
                 ".",
-                *additional_args,
+                "-v" + str(start_options.verbosity),
             ]
-            if self._threads is not None:
-                cmd_flags += ["--threads", str(self._threads)]
+            if start_options.threads != 0:
+                cmd_flags += ["--threads", str(start_options.threads)]
+            cmd_flags += start_options.args
 
-            match debug:
+            process_env = os.environ.copy()
+            process_env.update(start_options.env)
+
+            match start_options.debug:
                 case None:
-                    process_env = os.environ.copy()
-                    process_env.update(self._extra_env)
                     self.__process = await asyncio.create_subprocess_exec(
                         executable,
                         *cmd_flags,
                         cwd=self._directory,
                         env=process_env,
                         stderr=asyncio.subprocess.PIPE,
+                        pass_fds=start_options.pass_fds,
                     )
                 case "rr":
                     l.info(f"Recording {self.name} with rr")
-                    process_env = os.environ.copy()
-                    process_env.update(self._extra_env)
                     self.__process = await asyncio.create_subprocess_exec(
                         "rr",
                         "record",
@@ -195,6 +244,7 @@ class Network:
                         cwd=self._directory,
                         env=process_env,
                         stderr=asyncio.subprocess.PIPE,
+                        pass_fds=start_options.pass_fds,
                     )
 
             assert self.__process.stderr is not None  # to placate pyright
@@ -204,13 +254,14 @@ class Network:
                 open(self.log_path, "wb"),
                 self.name,
                 self.__process.stderr,
+                start_options.console_verbosity,
             )
 
         def announce_to(self, dht: DHTNode):
             self._static_nodes.append(dht)
 
         @abstractmethod
-        async def run(self, *, debug: DebugType = None):
+        async def run(self, options: StartOptions | None = None):
             pass
 
         async def stop(self):
@@ -240,11 +291,6 @@ class Network:
         install: Install,
         directory: Path,
         event_loop: asyncio.AbstractEventLoop | None = None,
-        *,
-        enable_dashboard: bool = False,
-        dashboard_socket: Path | None = None,
-        description: str = "",
-        run_id: str | None = None,
     ):
         self._install = install
         self._directory = directory.absolute()
@@ -260,16 +306,6 @@ class Network:
         self.__network_config: NetworkConfig = NetworkConfig()
         self.__zerostate: Zerostate | None = None
 
-        self._enable_dashboard: bool = enable_dashboard
-        self._dashboard_socket: Path = (
-            dashboard_socket
-            or Path(__file__).resolve().parents[3] / "integration/.dashboard/daemon.sock"
-        )
-        self._dashboard_description: str = description
-        self._dashboard_run_id: str = run_id or uuid.uuid4().hex[:12]
-        self._dashboard_client: IPCClient | None = None
-        self._dashboard_response: RegisterResponse | None = None
-
     @property
     def zerostate(self) -> Zerostate:
         assert self.__zerostate is not None
@@ -280,24 +316,21 @@ class Network:
         assert self._status < _Status.ZEROSTATE_GENERATED
         return self.__network_config
 
-    def create_dht_node(self, threads: int | None = None) -> DHTNode:
+    @property
+    def install(self):
+        return self._install
+
+    def create_dht_node(self) -> DHTNode:
         assert self._status < _Status.CLOSED
 
-        node = DHTNode(self, f"dht-{len(self.__nodes)}", threads=threads)
+        node = DHTNode(self, f"dht-{len(self.__nodes)}")
         self.__nodes.append(node)
         return node
 
-    def create_full_node(
-        self,
-        install: Install | None = None,
-        env: dict[str, str] | None = None,
-        threads: int | None = None,
-    ) -> FullNode:
+    def create_full_node(self) -> FullNode:
         assert self._status < _Status.CLOSED
 
-        node = FullNode(
-            self, f"node-{len(self.__nodes)}", install=install, env=env, threads=threads
-        )
+        node = FullNode(self, f"node-{len(self.__nodes)}")
         self.__nodes.append(node)
         self.__full_nodes.append(node)
         return node
@@ -332,77 +365,12 @@ class Network:
     async def __aenter__(self):
         return self
 
-    async def _git_metadata(self) -> tuple[str, str]:
-        async def run(args: list[str]) -> str:
-            process = await asyncio.create_subprocess_exec(
-                *args,
-                cwd=self._directory,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            stdout, _ = await process.communicate()
-            if process.returncode != 0:
-                return ""
-            return stdout.decode().strip()
-
-        branch = await run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
-        commit = await run(["git", "rev-parse", "HEAD"])
-        return branch, commit
-
-    async def register_with_dashboard(self) -> RegisterResponse | None:
-        """Register the currently-started full nodes with the tontester daemon.
-
-        Safe to call once after all nodes are launched. Returns the daemon response (with Grafana
-        and Prometheus URLs) or ``None`` if the daemon is not reachable.
-        """
-        if not self._enable_dashboard:
-            return None
-        if self._dashboard_client is not None:
-            return self._dashboard_response
-        if not self._dashboard_socket.exists():
-            l.warning(
-                (
-                    f"Dashboard enabled but no daemon socket at {self._dashboard_socket}; "
-                    "skipping registration"
-                )
-            )
-            return None
-
-        branch, commit = await self._git_metadata()
-        metadata = TestMetadata(
-            description=self._dashboard_description,
-            git_branch=branch,
-            git_commit_id=commit,
-            nodes=[
-                NodeTarget(name=node.name, address=node.metrics_address_for_scraping)
-                for node in self.__full_nodes
-            ],
-        )
-
-        client = IPCClient(self._dashboard_socket)
-        response = await client.connect_and_register(self._dashboard_run_id, metadata)
-        self._dashboard_client = client
-        self._dashboard_response = response
-        l.info(
-            (
-                f"Registered run {response.run_id} with tontester daemon "
-                f"(prometheus={response.prometheus_url}, grafana={response.grafana_url})"
-            )
-        )
-        return response
-
     async def __aexit__(
         self,
         exc_type: type[BaseException] | None,
         exc_value: BaseException | None,
         traceback: types.TracebackType | None,
     ) -> bool | None:
-        if self._dashboard_client is not None:
-            try:
-                await self._dashboard_client.disconnect()
-            except Exception:
-                pass
-            self._dashboard_client = None
         await asyncio.shield(self.aclose())
 
     async def wait_mc_block(self, seqno: int):
@@ -464,12 +432,12 @@ def _ip_to_tl(ip: IPv4Address) -> int:
 
 @final
 class DHTNode(Network.Node):
-    def __init__(self, network: "Network", name: str, threads: int | None = None):
-        super().__init__(network, name, threads=threads)
+    def __init__(self, network: "Network", name: str):
+        super().__init__(network, name)
 
         self._addr = self._new_network_address()
 
-        key, pk_file = self._new_key()
+        key, pk_file = self._new_keyring_key()
 
         address_list_to_sign = ton_api.Adnl_addressList(
             addrs=[
@@ -478,7 +446,7 @@ class DHTNode(Network.Node):
         )
         signed_address = subprocess.run(
             (
-                self._install.key_helper_exe,
+                self._network.install.key_helper_exe,
                 "-m",
                 "dht",
                 "-k",
@@ -499,8 +467,8 @@ class DHTNode(Network.Node):
                     categories=[0],
                 )
             ],
-            adnl=[ton_api.Engine_adnl(id=key.id(), category=0)],
-            dht=[ton_api.Engine_dht(id=key.id())],
+            adnl=[ton_api.Engine_adnl(id=key.id, category=0)],
+            dht=[ton_api.Engine_dht(id=key.id)],
         )
 
     @property
@@ -508,39 +476,32 @@ class DHTNode(Network.Node):
         return self._signed_address
 
     @override
-    async def run(self, *, debug: DebugType = None):
-        await self._run(self._install.dht_server_exe, self._local_config, None, [], debug=debug)
+    async def run(self, options: StartOptions | None = None):
+        options, install = _get_install_and_options(options, self._network.install, (), ())
+        await self._run(
+            install.dht_server_exe,
+            self._local_config,
+            None,
+            options,
+        )
 
 
 @final
 class FullNode(Network.Node):
-    def __init__(
-        self,
-        network: "Network",
-        name: str,
-        install: Install | None = None,
-        env: dict[str, str] | None = None,
-        threads: int | None = None,
-    ):
-        super().__init__(network, name, install=install, env=env, threads=threads)
+    def __init__(self, network: "Network", name: str):
+        super().__init__(network, name)
 
         KEY_EXPIRATION = (1 << 31) - 1
 
         self._addr = self._new_network_address()
         self._liteserver_addr = self._new_network_address()
         self._engine_console_addr = self._new_network_address()
-        # Bind exporter on all interfaces so prometheus running in a container can reach it via
-        # host.containers.internal.
-        self._exporter_addr = _IPv4AddressAndPort(
-            IPv4Address("0.0.0.0"), self._new_network_address().port
-        )
 
-        self._fullnode_key, _ = self._new_key()
-        self._validator_key, _ = self._new_key()
-        self._liteserver_key, _ = self._new_key()
-        self._engine_console_server_key, _ = self._new_key()
-        self._engine_console_client_key, self._engine_console_client_key_file = self._new_key()
-        self._engine_console_server_pub_file = None
+        self._fullnode_key, _ = self._new_keyring_key()
+        self._validator_key, _ = self._new_keyring_key()
+        self._liteserver_key, _ = self._new_keyring_key()
+        self._engine_console_server_key, _ = self._new_keyring_key()
+        self._engine_console_client_key = Key()
 
         self._local_config = ton_api.Engine_validator_config(
             addrs=[
@@ -551,46 +512,46 @@ class FullNode(Network.Node):
                 )
             ],
             adnl=[
-                ton_api.Engine_adnl(id=self._fullnode_key.id(), category=0),
-                ton_api.Engine_adnl(id=self._validator_key.id(), category=0),
+                ton_api.Engine_adnl(id=self._fullnode_key.id, category=0),
+                ton_api.Engine_adnl(id=self._validator_key.id, category=0),
             ],
             dht=[
-                ton_api.Engine_dht(id=self._fullnode_key.id()),
+                ton_api.Engine_dht(id=self._fullnode_key.id),
             ],
             validators=[
                 ton_api.Engine_validator(
-                    id=self._validator_key.id(),
+                    id=self._validator_key.id,
                     temp_keys=[
                         ton_api.Engine_validatorTempKey(
-                            key=self._validator_key.id(),
+                            key=self._validator_key.id,
                             expire_at=KEY_EXPIRATION,
                         )
                     ],
                     adnl_addrs=[
                         ton_api.Engine_validatorAdnlAddress(
-                            id=self._validator_key.id(),
+                            id=self._validator_key.id,
                             expire_at=KEY_EXPIRATION,
                         )
                     ],
                     expire_at=KEY_EXPIRATION,
                 )
             ],
-            fullnode=self._fullnode_key.id(),
+            fullnode=self._fullnode_key.id,
             liteservers=[
                 ton_api.Engine_liteServer(
-                    id=self._liteserver_key.id(),
+                    id=self._liteserver_key.id,
                     # FIXME: IP?
                     port=self._liteserver_addr.port,
                 )
             ],
             control=[
                 ton_api.Engine_controlInterface(
-                    id=self._engine_console_server_key.id(),
+                    id=self._engine_console_server_key.id,
                     # FIXME: IP?
                     port=self._engine_console_addr.port,
                     allowed=[
                         ton_api.Engine_controlProcess(
-                            id=self._engine_console_client_key.id(),
+                            id=self._engine_console_client_key.id,
                             permissions=15,
                         )
                     ],
@@ -614,20 +575,35 @@ class FullNode(Network.Node):
         return self._is_initial_validator
 
     @property
-    def metrics_port(self) -> int:
-        return self._exporter_addr.port
-
-    @property
-    def metrics_address_for_scraping(self) -> str:
-        """Reachable from a prometheus container via podman's host-gateway alias."""
-        return f"host.containers.internal:{self._exporter_addr.port}"
-
-    @property
     def validator_key(self):
         return self._validator_key
 
+    @property
+    def fullnode_key(self):
+        return self._fullnode_key
+
+    async def _wait_console_ready(self, fd: int):
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[None] = loop.create_future()
+
+        def on_readable():
+            data = os.read(fd, 1)
+            if not future.done():
+                if data == b"1":
+                    future.set_result(None)
+                else:
+                    future.set_exception(
+                        RuntimeError(
+                            f"validator-engine console of {self.name} did not start successfully"
+                        )
+                    )
+
+        loop.add_reader(fd, on_readable)
+        future.add_done_callback(lambda f: loop.remove_reader(fd))
+        await future
+
     @override
-    async def run(self, *, debug: DebugType = None):
+    async def run(self, options: StartOptions | None = None):
         zerostate = self._get_or_generate_zerostate()
 
         if not self._static_populated:
@@ -637,22 +613,39 @@ class FullNode(Network.Node):
                 (static_dir / state.file_hash.hex().upper()).symlink_to(state.file)
             self._static_populated = True
 
-        await self._run(
-            self._install.validator_engine_exe,
-            self._local_config,
-            zerostate.as_validator_config(),
-            [
-                "--initial-sync-delay",
-                "5",
-                "--session-logs",
-                str(self.session_log_path),
-                "--quic-flood-control",
-                "-1",
-                "--exporter-address",
-                self._exporter_addr.address,
-            ],
-            debug=debug,
-        )
+        async with AsyncExitStack() as stack:
+            ready_r, ready_w = os.pipe()
+            closed = False
+            _ = stack.callback(lambda: os.close(ready_r))
+            _ = stack.callback(lambda: os.close(ready_w) if not closed else None)
+
+            options, install = _get_install_and_options(
+                options,
+                self._network.install,
+                (
+                    "--initial-sync-delay",
+                    "5",
+                    "--session-logs",
+                    str(self.session_log_path),
+                    "--quic-flood-control",
+                    "-1",
+                    "--console-ready-fd",
+                    str(ready_w),
+                ),
+                (ready_w,),
+            )
+
+            await self._run(
+                install.validator_engine_exe,
+                self._local_config,
+                zerostate.as_validator_config(),
+                options,
+            )
+
+            closed = True
+            os.close(ready_w)
+
+            await self._wait_console_ready(ready_r)
 
     @property
     def _liteserver_config(self):
@@ -690,23 +683,22 @@ class FullNode(Network.Node):
             )
         return self._engine_console
 
-    @property
+    @functools.cached_property
     def engine_console_cmd(self) -> str:
-        if self._engine_console_server_pub_file is None:
-            self._engine_console_server_pub_file = (
-                self._engine_console_server_key.write_pub_key_file(
-                    self._directory / "engine_console_server.pub"
-                )
-            )
+        server_pub = self._directory / "engine_console_server.pub"
+        self._engine_console_server_key.write_pub_key_file(server_pub)
+        client_pk = self._directory / "engine_console_client.key"
+        self._engine_console_client_key.write_pk_key_file(client_pk)
+
         return shlex.join(
             [
-                str(self._install.validator_engine_console_exe),
+                str(self._network.install.validator_engine_console_exe),
                 "-a",
                 self._engine_console_addr.address,
                 "-k",
-                str(self._engine_console_client_key_file),
+                str(client_pk),
                 "-p",
-                str(self._engine_console_server_pub_file),
+                str(server_pub),
             ]
         )
 
@@ -720,7 +712,7 @@ class FullNode(Network.Node):
 
         async def explorer():
             cmd = [
-                str(self._install.blockchain_explorer_exe),
+                str(self._network.install.blockchain_explorer_exe),
                 "-C",
                 str(config_file),
                 # FIXME: IP?

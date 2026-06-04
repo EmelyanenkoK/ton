@@ -17,12 +17,10 @@ class BlockAccepterImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
  public:
   TON_RUNTIME_DEFINE_EVENT_HANDLER();
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     stop();
   }
 
-  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<FinalizeBlock> event) {
     const auto& block = std::get<BlockCandidate>(event->candidate->block);
     auto block_data = create_block(block.id, block.data.clone()).move_as_ok();
@@ -43,12 +41,10 @@ class BlockAccepterImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     co_return {};
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const BlockFinalizedInMasterchain> event) {
     last_mc_finalized_seqno_ = std::max(event->block.seqno(), last_mc_finalized_seqno_);
   }
 
-  template <>
   void handle(BusHandle bus, std::shared_ptr<const CandidateGenerated> event) {
     if (bus->shard.is_masterchain() || event->candidate->is_empty()) {
       return;

@@ -54,22 +54,18 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     }
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const Start> event) {
     genesis_promise_.set_value(std::move(event));
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     stop();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const FinalizationObserved> event) {
     finalize_blocks(event->id, event->certificate, std::nullopt).start().detach();
   }
 
-  template <>
   td::actor::Task<ResolvedState> process(BusHandle, std::shared_ptr<ResolveState> request) {
     co_return co_await resolve_state(request->id);
   }

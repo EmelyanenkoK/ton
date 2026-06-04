@@ -36,22 +36,18 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     }
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     stop();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const Start> event) {
     on_new_accepted_block(event->state->as_normal());
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const FinalizeBlock> event) {
     on_new_accepted_block(event->candidate->block_id());
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const BlockFinalizedInMasterchain> event) {
     if (event->block.shard_full() != owning_bus()->shard || event->block.seqno() == 0) {
       return;
@@ -59,7 +55,6 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     on_new_accepted_block(event->block);
   }
 
-  template <>
   td::actor::Task<ValidateCandidateResult> process(BusHandle, std::shared_ptr<ValidationRequest> event) {
     auto& bus = *owning_bus();
 
@@ -94,8 +89,6 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
           .min_masterchain_block_id = event->state->min_mc_block_id(),
           .prev = event->state->block_ids(),
           .local_validator_id = bus.local_id.short_id,
-          .skip_store_candidate = true,
-          .is_new_consensus = true,
           .prev_block_state_roots = event->state->state(),
       };
       auto result = co_await td::actor::ask(bus.manager, &ManagerFacade::validate_block_candidate, block.clone(),

@@ -361,9 +361,9 @@ class BusListeningActor : public td::actor::Actor {
     log_event(false, bus._node(td::Badge<BusListeningActor>{}), *event);
     if constexpr (!std::same_as<B, BOrigin>) {
       // When we install listeners, we guarantee that the actual bus type is at most B.
-      static_cast<A*>(this)->template handle<B, E>(bus.template unsafe_static_downcast_to<B>(), std::move(event));
+      static_cast<A*>(this)->handle(bus.template unsafe_static_downcast_to<B>(), std::move(event));
     } else {
-      static_cast<A*>(this)->template handle<B, E>(std::move(bus), std::move(event));
+      static_cast<A*>(this)->handle(std::move(bus), std::move(event));
     }
   }
 
@@ -371,10 +371,9 @@ class BusListeningActor : public td::actor::Actor {
   auto process_event(BusHandle<BOrigin> bus, std::shared_ptr<E> event) {
     log_event(false, bus._node(td::Badge<BusListeningActor>{}), *event);
     if constexpr (!std::same_as<B, BOrigin>) {
-      return static_cast<A*>(this)->template process<B, E>(bus.template unsafe_static_downcast_to<B>(),
-                                                           std::move(event));
+      return static_cast<A*>(this)->process(bus.template unsafe_static_downcast_to<B>(), std::move(event));
     } else {
-      return static_cast<A*>(this)->template process<B, E>(std::move(bus), std::move(event));
+      return static_cast<A*>(this)->process(std::move(bus), std::move(event));
     }
   }
 
@@ -413,11 +412,11 @@ concept ActorType = std::derived_from<T, SpawnsWith<typename T::SpawnWithBus>> &
 
 template <typename A, typename B, typename E>
 concept CanActorHandleEvent =
-    requires(A& actor, BusHandle<B> bus, std::shared_ptr<const E> event) { actor.template handle<B, E>(bus, event); };
+    requires(A& actor, BusHandle<B> bus, std::shared_ptr<const E> event) { actor.handle(bus, event); };
 
 template <typename A, typename B, typename E>
 concept CanActorProcessEvent =
-    requires(A& actor, BusHandle<B> bus, std::shared_ptr<E> event) { actor.template process<B, E>(bus, event); };
+    requires(A& actor, BusHandle<B> bus, std::shared_ptr<E> event) { actor.process(bus, event); };
 
 class Runtime : public std::enable_shared_from_this<Runtime> {
  public:

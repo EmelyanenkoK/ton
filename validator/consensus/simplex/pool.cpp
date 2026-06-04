@@ -338,6 +338,7 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     slots_per_leader_window_ = bus.config.slots_per_leader_window;
     params_ = bus.config.noncritical_params;
 
+    // bus.total_weight is capped at 2^61, so multiplying by 2 cannot overflow uint64.
     weight_threshold_ = (bus.total_weight * 2) / 3 + 1;
 
     state_.emplace(State(bus));
@@ -381,7 +382,6 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     standstill_resolution_notification_.set_error(td::Status::Error(ErrorCode::cancelled, "cancelled"));
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     auto &bus = *owning_bus();
     auto [_, end] = state_->tracked_slots_interval();
@@ -417,12 +417,10 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     stop();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const NoncriticalParamsUpdated> event) {
     params_ = event->params;
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const Start>) {
     auto &bus = *owning_bus();
     owning_bus().publish<TraceEvent>(
@@ -434,7 +432,6 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     advance_present();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const IncomingProtocolMessage> message) {
     if (is_banned(message->source)) {
       LOG(WARNING) << "Dropping message from temporarily banned misbehaving " << message->source;
@@ -517,12 +514,10 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     }
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const BroadcastVote> event) {
     handle_our_vote(event->vote).start().detach();
   }
 
-  template <>
   td::actor::Task<std::optional<MisbehaviorRef>> process(BusHandle, std::shared_ptr<WaitForParent> request) {
     const auto &candidate = request->candidate;
     CHECK(!candidate->parent_id.has_value() || candidate->parent_id->slot < candidate->id.slot);
@@ -588,7 +583,6 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
   }
 
   // FIXME: This should probably live in another actor.
-  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<PrecheckCandidateBroadcast> query) {
     if (query->slot < first_nonfinalized_slot_) {
       co_return td::Status::Error("Slot is already finalized");
@@ -726,6 +720,7 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     return std::move(vote).consume_and_downcast(vote_fn);
   }
 
+  // Applied votes count each validator once, so accumulated weights are bounded by the 2^61-capped total weight.
   void handle_typed_vote(const PeerValidator &validator, Signed<NotarizeVote> vote, State::SlotRef &slot) {
     auto new_weight = (slot.state->notarize_weight[vote.vote.id] += validator.weight);
     if (!slot.state->will_be_notarized() && new_weight >= weight_threshold_) {

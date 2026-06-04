@@ -124,12 +124,10 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     }
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     stop();
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const NoncriticalParamsUpdated> event) {
     if (params_.candidate_resolve_rate_limit != event->params.candidate_resolve_rate_limit) {
       rate_limiter_.clear();
@@ -137,7 +135,6 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     params_ = event->params;
   }
 
-  template <>
   td::actor::Task<ProtocolMessage> process(BusHandle, std::shared_ptr<IncomingOverlayRequest> event) {
     auto request = co_await fetch_tl_object<tl::requestCandidate>(event->request.data, true);
     auto id = CandidateId::from_tl(request->id_);
@@ -154,7 +151,6 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     co_return ProtocolMessage{it->second.candidate_and_cert.to_tl(*request)};
   }
 
-  template <>
   td::actor::Task<ResolveCandidate::Result> process(BusHandle bus, std::shared_ptr<ResolveCandidate> request) {
     CandidateState &state = state_[request->id];
 
@@ -173,7 +169,6 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     co_return state.candidate_and_cert.as_resolution_result();
   }
 
-  template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<StoreCandidate> request) {
     auto &state = state_[request->candidate->id];
 
@@ -200,7 +195,6 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     co_return {};
   }
 
-  template <>
   void handle(BusHandle, std::shared_ptr<const NotarizationObserved> event) {
     auto &state = state_[event->id];
     state.candidate_and_cert.notar_cert = event->certificate;
@@ -333,9 +327,9 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
       }
       PeerValidatorId peer{peer_idx};
 
-      auto maybe_response = co_await owning_bus()
-                                .publish<OutgoingOverlayRequest>(peer, td::Timestamp::in(timeout), std::move(request))
-                                .wrap();
+      auto timeout_ts = td::Timestamp::in(std::chrono::round<std::chrono::nanoseconds>(timeout));
+      auto maybe_response =
+          co_await owning_bus().publish<OutgoingOverlayRequest>(peer, timeout_ts, std::move(request)).wrap();
 
       if (maybe_response.is_ok()) {
         auto response = maybe_response.move_as_ok();
